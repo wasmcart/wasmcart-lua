@@ -424,17 +424,47 @@ about 27% of its perimeter**. The gate budgets that at 0.05% of the frame; a
 control that mirrors the sprite UVs fails it at 20.7%, so the budget is far
 too small to hide a real bug.
 
-**The CPU fallback is whole-frame and sticky.** Anything GL2D still does not
-implement -- canvas render targets, additive blending, TTF text, polygons,
-circles, the Lua error screen -- calls `wcl_r2d_disable()`,
+Render targets are FBOs. A canvas gets its own texture with a framebuffer
+attached rather than an atlas slot -- the atlas is one shared texture, so
+rendering into a sub-rect of it would let one canvas's draws land on
+another's pixels. Drawing a canvas afterwards samples that texture, keyed on
+the same RGBA pointer sprites use.
+
+Text is on GL too. `stb_truetype` already bakes every glyph into one 8-bit
+coverage bitmap at font-load time, so nothing needs CPU rasterizing: the
+bitmap uploads once as a single-channel texture and each glyph is a quad in
+the shared batch. The shader has a third mode that multiplies only *alpha* by
+the texture's red channel, matching `blend_px(cov * a / 255)`. `TEXTURE_SWIZZLE`
+would have been neater but it is GL ES 3.0 only and **not** part of WebGL2,
+which is the surface wasmcart specifies -- relying on it made glyphs read
+`(cov, 0, 0, 1)` and text came out red. Bitfont text needs nothing special:
+its pixels are `fill_rect`s that already batch.
+
+**The CPU fallback is whole-frame and sticky.** What GL2D still does not
+implement -- additive blending, polygons, circles, the Lua error screen --
+calls `wcl_r2d_disable()`,
 and from then on every frame is rasterized in software and presented with one
 `wc_gl_blit`. Reconciling per draw would cost ~0.19 ms each way, which a real
 frame pays dozens of times. Cavern uses canvases, so it takes this path and
 is bit-identical to the CPU build.
 
-Measured on `test/gl2d` (600 frames): **GL2D 0.074 ms vs software 1.332 ms,
-18x**. Rotated sprites are the software rasterizer's worst case (14.6 ms per
-2000 in `test/bench.js`) and free on a GPU, which is most of that ratio.
+Measured (400-600 frames each):
+
+| cart | speedup |
+|---|---|
+| `test/gl2dcanvas` (render targets) | **113x** |
+| **the Cavern port** | **49.5x** |
+| `test/gl2d` (sprites, rotation, scissor) | **18x** |
+| `test/gl2dtext` (text-only) | **2.9x** |
+
+Cavern is the one that matters: it was the motivating case, it uses canvases
+*and* TTF, and it ran entirely on the software rasterizer until both landed.
+The text-only cart is lowest because a frame of nothing but text is cheap in
+software too, so the fixed per-frame GL cost is a larger share.
+
+Circles are still a deliberate fallback rather than an approximation: a GL
+triangle fan does not reproduce the software span fill, and a circle is
+nearly all boundary at small radii.
 
 Sloped lines stay a known gap. GL rasterizes lines by its own
 implementation-defined diamond-exit rule, which does not have to match

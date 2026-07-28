@@ -276,11 +276,13 @@ async function main() {
   // primitives the GL path implements, because a cart that trips the sticky
   // CPU fallback measures the software path on both engines and would
   // report a perfect match while proving nothing.
-  if (fs.existsSync(glEngine) && fs.existsSync(path.join(ROOT, 'test', 'gl2d', 'main.lua'))) {
+  for (const cart of ['gl2d', 'gl2dcanvas', 'gl2dtext']) {
+    if (!fs.existsSync(glEngine)) break;
+    if (!fs.existsSync(path.join(ROOT, 'test', cart, 'main.lua'))) continue;
     const { execFileSync } = require('child_process');
     try {
       const out = execFileSync(process.execPath,
-        [path.join(ROOT, 'tools', 'gl2d-compare.mjs'), path.join(ROOT, 'test', 'gl2d'), '3', '2'],
+        [path.join(ROOT, 'tools', 'gl2d-compare.mjs'), path.join(ROOT, 'test', cart), '3', '2'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       // Report the two budgets separately. "max delta" alone is misleading:
       // it is dominated by a handful of rotated-sprite EDGE pixels, which
@@ -288,14 +290,14 @@ async function main() {
       // value while being visually correct.
       const edge = out.match(/(\d+) pixels \(([\d.]+)%\) exceed/);
       console.log(edge
-        ? `\nok    gl2d         within tolerance (${edge[2]}% edge pixels, budget 0.05%)`
-        : `\nok    gl2d         within tolerance (every pixel +/-2)`);
+        ? `\nok    ${cart.padEnd(12)} within tolerance (${edge[2]}% edge pixels, budget 0.05%)`
+        : `\nok    ${cart.padEnd(12)} within tolerance (every pixel +/-2)`);
     } catch (err) {
       const txt = (err.stdout || '') + (err.stderr || '');
       if (/Cannot find|ERR_MODULE_NOT_FOUND|createWebGL2Context/.test(txt)) {
-        console.log('\nskip  gl2d         no GL context available on this machine');
+        console.log(`\nskip  ${cart.padEnd(12)} no GL context available on this machine`);
       } else {
-        console.log('\nFAIL  gl2d  GL2D output drifted beyond tolerance');
+        console.log(`\nFAIL  ${cart}  GL2D output drifted beyond tolerance`);
         for (const l of txt.trim().split('\n').slice(-6)) console.log(`      ${l}`);
         failed++;
       }

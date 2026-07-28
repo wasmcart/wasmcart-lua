@@ -44,9 +44,19 @@
 #define GL_NEAREST 0x2600
 #define GL_UNSIGNED_BYTE 0x1401
 #define GL_RGBA 0x1908
+#define GL_R8 0x8229
+#define GL_RED 0x1903
+#define GL_TEXTURE_SWIZZLE_R 0x8E42
+#define GL_TEXTURE_SWIZZLE_G 0x8E43
+#define GL_TEXTURE_SWIZZLE_B 0x8E44
+#define GL_TEXTURE_SWIZZLE_A 0x8E45
+#define GL_ONE 1
+#define GL_UNPACK_ALIGNMENT 0x0CF5
 #define GL_BLEND 0x0BE2
 #define GL_SRC_ALPHA 0x0302
 #define GL_ONE_MINUS_SRC_ALPHA 0x0303
+#define GL_ONE 1
+#define GL_ZERO 0
 #define GL_ARRAY_BUFFER 0x8892
 #define GL_ELEMENT_ARRAY_BUFFER 0x8893
 #define GL_DYNAMIC_DRAW 0x88E8
@@ -57,6 +67,9 @@
 #define GL_LINES 0x0001
 #define GL_COLOR_BUFFER_BIT 0x00004000
 #define GL_SCISSOR_TEST 0x0C11
+#define GL_FRAMEBUFFER 0x8D40
+#define GL_COLOR_ATTACHMENT0 0x8CE0
+#define GL_FRAMEBUFFER_COMPLETE 0x8CD5
 
 typedef struct { float x, y, u, v, r, g, b, a; } vertex_t;
 typedef struct {
@@ -65,6 +78,21 @@ typedef struct {
     int atlas_x, atlas_y;
     int used;
 } texture_t;
+
+/* A render target is its own texture with an FBO attached, NOT an atlas
+ * slot: the atlas is one shared texture, so rendering into a sub-rect of it
+ * would let one canvas's draws land on another's pixels. Keyed by the same
+ * RGBA payload pointer sprites use, so drawing the canvas later finds it. */
+typedef struct {
+    const void *key;
+    GLuint tex, fbo;
+    int w, h;
+    int used;
+} target_t;
+#define MAX_TARGETS 16
+static target_t targets[MAX_TARGETS];
+static target_t *target_find(const void *key);
+static target_t *current_target;   /* NULL = the screen */
 
 wcl_r2d_stats_t wcl_r2d_stats;
 
@@ -93,6 +121,10 @@ static int solid_batch_count;
 static int solid_batch_has_alpha;
 static vertex_t textured_batch[BATCH_MAX * 4];
 static int textured_batch_count;
+/* Which texture the open textured batch is for. Sprites share the atlas, but
+ * a canvas is its own texture, so a batch cannot span the two. */
+static GLuint textured_batch_tex;
+static int textured_batch_mode = 1;   /* 1 = RGBA texture, 2 = glyph coverage */
 static uint16_t indices[BATCH_MAX * 6];
 
 static int scissor_on;
@@ -121,7 +153,12 @@ static const char *FRAGMENT_SHADER =
     "uniform int u_textured;\n"
     "void main() {\n"
     "  frag_color = v_color;\n"
-    "  if (u_textured != 0) frag_color *= texture(u_tex, v_uv);\n"
+    /* u_textured: 0 = solid, 1 = RGBA sprite/canvas, 2 = single-channel
+     * glyph coverage. Mode 2 exists because TEXTURE_SWIZZLE is GL ES 3.0
+     * only and NOT part of WebGL2, which is the surface wasmcart specifies;
+     * relying on it left glyphs reading (cov,0,0,1) and text came out red. */
+    "  if (u_textured == 1) frag_color *= texture(u_tex, v_uv);\n"
+    "  else if (u_textured == 2) frag_color.a *= texture(u_tex, v_uv).r;\n"
     "}\n";
 
 /* Set when a shader or the program reports failure.
@@ -211,14 +248,16 @@ static void flush_textured_batch(void) {
     glBindBuffer(GL_ARRAY_BUFFER, buffer);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(vertex_t) * textured_batch_count),
                  textured_batch, GL_DYNAMIC_DRAW);
-    set_textured(1);
-    bind_texture(atlas_texture);
+    set_textured(textured_batch_mode);
+    bind_texture(textured_batch_tex ? textured_batch_tex : atlas_texture);
     glDrawElements(GL_TRIANGLES, (GLsizei)((textured_batch_count / 4) * 6),
                    GL_UNSIGNED_SHORT, (const void *)0);
     frame_stats.draws++;
     frame_stats.tex_flushes++;
     frame_stats.upload_bytes += (uint32_t)(sizeof(vertex_t) * textured_batch_count);
     textured_batch_count = 0;
+    textured_batch_tex = 0;
+    textured_batch_mode = 1;
 }
 
 /* Solids and sprites share one vertex buffer, so whichever batch is open has
@@ -284,7 +323,22 @@ int wcl_r2d_init(int w, int h) {
     bound_texture = atlas_texture;
     glUniform1i(tex_uniform, 0);
 
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    /* Separate alpha blending, which matters for render targets.
+     *
+     * A single glBlendFunc(SRC_ALPHA, ONE_MINUS_SRC_ALPHA) applies to the
+     * ALPHA channel as well, so drawing at alpha 0.6 into an opaque canvas
+     * leaves 0.6 + 1*0.4 = 0.76 there rather than 1.0. Drawing that canvas
+     * back to the screen then multiplies by 0.76 a second time and the
+     * result is visibly darker -- which is exactly what the canvas
+     * conformance cart showed, as a delta of 4 across all three channels
+     * with the geometry perfectly aligned.
+     *
+     * The software rasterizer has no such problem: blend_px only ever writes
+     * colour and canvases stay opaque. GL_ONE / GL_ONE_MINUS_SRC_ALPHA for
+     * the alpha channel reproduces that -- destination alpha saturates at 1
+     * instead of being scaled down. */
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+                        GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     blend_enabled = -1;
     textured_enabled = -1;
 
@@ -340,6 +394,8 @@ static uint32_t blit_rgba[1280 * 720];
 void wcl_r2d_end(const uint32_t *fb) {
     if (wcl_r2d_active()) {
         flush_batches();
+        /* leave the screen bound for the next frame */
+        if (current_target) wcl_r2d_target(NULL, 0, 0);
     } else if (ready && frame_disabled && fb) {
         int n = width * height;
         for (int i = 0; i < n; i++) {
@@ -458,25 +514,128 @@ static texture_t *get_texture(const void *pixels, int w, int h) {
     return NULL;
 }
 
+/* A font's baked coverage bitmap, uploaded once as a single-channel texture.
+ * The shared shader's mode 2 multiplies only ALPHA by the texture's red
+ * channel, which is the same thing blend_px(cov * a / 255) does on the
+ * software path. (Doing it with TEXTURE_SWIZZLE would be neater but that is
+ * GL ES 3.0 only, not WebGL2, so it silently failed and text came out red.) */
+typedef struct {
+    const unsigned char *key;
+    GLuint tex;
+    int w, h;
+    int used;
+} glyphtex_t;
+#define MAX_GLYPHTEX 8
+static glyphtex_t glyphtexes[MAX_GLYPHTEX];
+
+static glyphtex_t *glyphtex_get(const unsigned char *atlas, int aw, int ah) {
+    for (int i = 0; i < MAX_GLYPHTEX; i++)
+        if (glyphtexes[i].used && glyphtexes[i].key == atlas) return &glyphtexes[i];
+    for (int i = 0; i < MAX_GLYPHTEX; i++) {
+        if (glyphtexes[i].used) continue;
+        glyphtex_t *g = &glyphtexes[i];
+        flush_batches();
+        glGenTextures(1, &g->tex);
+        glBindTexture(GL_TEXTURE_2D, g->tex);
+        /* rows are byte-packed, not word-aligned */
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, aw, ah, 0,
+                     GL_RED, GL_UNSIGNED_BYTE, atlas);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        bound_texture = g->tex;
+        g->key = atlas; g->w = aw; g->h = ah; g->used = 1;
+        return g;
+    }
+    return NULL;
+}
+
+int wcl_r2d_glyph(const unsigned char *atlas, int aw, int ah,
+                  int dx, int dy, int dw, int dh,
+                  int sx, int sy, int srcw, int srch,
+                  uint32_t color, int alpha) {
+    if (!wcl_r2d_active() || !atlas || dw <= 0 || dh <= 0) return 0;
+    glyphtex_t *g = glyphtex_get(atlas, aw, ah);
+    if (!g) return 0;
+    if (solid_batch_count) flush_solid_batch();
+    if (textured_batch_tex && textured_batch_tex != g->tex) flush_textured_batch();
+    if (textured_batch_mode != 2 && textured_batch_count) flush_textured_batch();
+    if (textured_batch_count + 4 > BATCH_MAX * 4) flush_textured_batch();
+    textured_batch_tex = g->tex;
+    textured_batch_mode = 2;
+
+    vertex_t *v = &textured_batch[textured_batch_count];
+    float x0, y0, x1, y1;
+    ndc((float)dx, (float)dy, &x0, &y0);
+    ndc((float)(dx + dw), (float)(dy + dh), &x1, &y1);
+    float u0 = (float)sx / (float)g->w, u1 = (float)(sx + srcw) / (float)g->w;
+    float v0 = (float)sy / (float)g->h, v1 = (float)(sy + srch) / (float)g->h;
+    float r = (float)((color >> 16) & 255) / 255.0f;
+    float gg = (float)((color >> 8) & 255) / 255.0f;
+    float b = (float)(color & 255) / 255.0f;
+    float a = (float)alpha / 255.0f;
+    const float us[4] = { u0, u1, u1, u0 };
+    const float vs[4] = { v0, v0, v1, v1 };
+    const float xs[4] = { x0, x1, x1, x0 };
+    const float ys[4] = { y0, y0, y1, y1 };
+    for (int i = 0; i < 4; i++) {
+        v[i].x = xs[i]; v[i].y = ys[i]; v[i].u = us[i]; v[i].v = vs[i];
+        v[i].r = r; v[i].g = gg; v[i].b = b; v[i].a = a;
+    }
+    textured_batch_count += 4;
+    frame_stats.quads++;
+    return 1;
+}
+
 int wcl_r2d_sprite(const void *pixels, int sw, int sh,
                    const double *cx, const double *cy,
                    int sx, int sy, int srcw, int srch,
                    uint32_t tint, int alpha) {
     if (!wcl_r2d_active() || !pixels || !cx || !cy) return 0;
-    texture_t *t = get_texture(pixels, sw, sh);
-    if (!t) return 0;                 /* atlas full: caller falls back */
+
+    /* A canvas already lives on the GPU in its own texture; anything else
+     * goes through the shared atlas. */
+    target_t *tgt = target_find(pixels);
+    if (tgt && tgt == current_target) return 0;   /* cannot sample the target
+                                                     it is drawing into */
+    GLuint want = tgt ? tgt->tex : atlas_texture;
+    float u0, v0, u1, v1;
+    if (tgt) {
+        u0 = (float)sx / (float)tgt->w;
+        u1 = (float)(sx + srcw) / (float)tgt->w;
+        /* An FBO texture has GL's bottom-left origin while the cart's
+         * coordinates are top-left, so sampling flips V.
+         *
+         * Flip the ROWS, not the edges. Texture coordinates address texel
+         * boundaries, so swapping v0/v1 moves every sample one texel earlier
+         * under NEAREST -- which showed up as GL reading a neighbouring
+         * source texel (0 where the software path read 4, on a sprite whose
+         * channels step by 4). Measuring from the far edge keeps the sample
+         * on the same texel. */
+        v0 = (float)(tgt->h - sy) / (float)tgt->h;
+        v1 = (float)(tgt->h - (sy + srch)) / (float)tgt->h;
+    } else {
+        texture_t *t = get_texture(pixels, sw, sh);
+        if (!t) return 0;             /* atlas full: caller falls back */
+        /* Source rect in atlas UV. The atlas is NEAREST-filtered, so an
+         * axis-aligned quad at an integer scale samples the same texels the
+         * software path indexes; rotation and fractional scales can differ
+         * by a texel at boundaries, inside the accepted tolerance. */
+        u0 = (float)(t->atlas_x + sx) / (float)ATLAS_SIZE;
+        v0 = (float)(t->atlas_y + sy) / (float)ATLAS_SIZE;
+        u1 = (float)(t->atlas_x + sx + srcw) / (float)ATLAS_SIZE;
+        v1 = (float)(t->atlas_y + sy + srch) / (float)ATLAS_SIZE;
+    }
     if (solid_batch_count) flush_solid_batch();
+    if (textured_batch_tex && textured_batch_tex != want) flush_textured_batch();
+    if (textured_batch_mode != 1 && textured_batch_count) flush_textured_batch();
     if (textured_batch_count + 4 > BATCH_MAX * 4) flush_textured_batch();
+    textured_batch_tex = want;
+    textured_batch_mode = 1;
 
     vertex_t *v = &textured_batch[textured_batch_count];
-    /* Source rect in atlas UV. The atlas is NEAREST-filtered, so an
-     * axis-aligned quad at an integer scale samples the same texels the
-     * software path indexes; rotation and fractional scales can differ by a
-     * texel at boundaries, which is inside the accepted tolerance. */
-    float u0 = (float)(t->atlas_x + sx) / (float)ATLAS_SIZE;
-    float v0 = (float)(t->atlas_y + sy) / (float)ATLAS_SIZE;
-    float u1 = (float)(t->atlas_x + sx + srcw) / (float)ATLAS_SIZE;
-    float v1 = (float)(t->atlas_y + sy + srch) / (float)ATLAS_SIZE;
     const float us[4] = { u0, u1, u1, u0 };
     const float vs[4] = { v0, v0, v1, v1 };
 
@@ -493,6 +652,80 @@ int wcl_r2d_sprite(const void *pixels, int sw, int sh,
     textured_batch_count += 4;
     frame_stats.quads++;
     return 1;
+}
+
+static target_t *target_find(const void *key) {
+    for (int i = 0; i < MAX_TARGETS; i++)
+        if (targets[i].used && targets[i].key == key) return &targets[i];
+    return NULL;
+}
+
+int wcl_r2d_target(const void *key, int w, int h) {
+    if (!ready) return 0;
+    flush_batches();
+
+    if (!key) {                       /* back to the screen */
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, width, height);
+        current_target = NULL;
+        ndc_scale_x = 2.0f / (float)width;
+        ndc_scale_y = 2.0f / (float)height;
+        return 1;
+    }
+
+    target_t *t = target_find(key);
+    if (!t) {
+        for (int i = 0; i < MAX_TARGETS && !t; i++) if (!targets[i].used) t = &targets[i];
+        if (!t) return 0;             /* out of targets: caller falls back */
+        glGenTextures(1, &t->tex);
+        glBindTexture(GL_TEXTURE_2D, t->tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, (const void *)0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        bound_texture = t->tex;
+        glGenFramebuffers(1, &t->fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, t->tex, 0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            return 0;                 /* incomplete: caller falls back */
+        }
+        t->key = key; t->w = w; t->h = h; t->used = 1;
+    } else {
+        glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
+    }
+
+    glViewport(0, 0, t->w, t->h);
+    current_target = t;
+    /* Draw coordinates are canvas-relative while a target is bound. The y
+     * flip in ndc() still applies: an FBO texture has the same bottom-left
+     * origin as the default framebuffer, and the cart's is top-left. */
+    ndc_scale_x = 2.0f / (float)t->w;
+    ndc_scale_y = 2.0f / (float)t->h;
+    return 1;
+}
+
+void wcl_r2d_clear(uint32_t color, int alpha) {
+    if (!wcl_r2d_active()) return;
+    flush_batches();
+    glClearColor((float)((color >> 16) & 255) / 255.0f,
+                 (float)((color >> 8) & 255) / 255.0f,
+                 (float)(color & 255) / 255.0f,
+                 (float)alpha / 255.0f);
+    /* the cached screen-clear colour no longer reflects GL state */
+    current_clear_color = 0xFFFFFFFFu;
+    glClear(GL_COLOR_BUFFER_BIT);
+}
+
+void wcl_r2d_forget(const void *key) {
+    target_t *t = target_find(key);
+    if (t) { t->used = 0; t->key = NULL; }
+    for (int i = 0; i < MAX_TEXTURES; i++)
+        if (textures[i].used && textures[i].pixels == key) textures[i].used = 0;
 }
 
 /* Scissor. glScissor's origin is bottom-left, the cart's is top-left, so the

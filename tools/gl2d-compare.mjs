@@ -141,6 +141,56 @@ if (over) {
       if(samples.length<6) samples.push(`(${x},${y}) d=${d} gl=[${a.rgb[i]},${a.rgb[i+1]},${a.rgb[i+2]}] cpu=[${b.rgb[i]},${b.rgb[i+1]},${b.rgb[i+2]}]`); }
   }
   console.log(`over-tolerance bbox: x ${x0}..${x1}  y ${y0}..${y1}`);
+  // Which channel is drifting? A single bad channel points at a format or
+  // alpha bug; all three point at geometry or blending.
+  let rBad = 0, gBad = 0, bBad = 0;
+  for (let i = 0; i < a.rgb.length; i += 3) {
+    if (Math.abs(a.rgb[i] - b.rgb[i]) > TOL) rBad++;
+    if (Math.abs(a.rgb[i + 1] - b.rgb[i + 1]) > TOL) gBad++;
+    if (Math.abs(a.rgb[i + 2] - b.rgb[i + 2]) > TOL) bBad++;
+  }
+  console.log(`channels over tolerance: R ${rBad}  G ${gBad}  B ${bBad}`);
+  // Bucket failures by where they are, so canvas CONTENT and the canvas
+  // drawn BACK are distinguishable instead of one lump.
+  const box = (name, bx, by, bw, bh) => {
+    let n = 0;
+    for (let y = by; y < by + bh && y < H; y++)
+      for (let x = bx; x < bx + bw && x < W; x++) {
+        const i = (y * W + x) * 3;
+        if (Math.max(Math.abs(a.rgb[i]-b.rgb[i]), Math.abs(a.rgb[i+1]-b.rgb[i+1]),
+                     Math.abs(a.rgb[i+2]-b.rgb[i+2])) > TOL) n++;
+      }
+    console.log(`  ${name.padEnd(26)} ${n}`);
+  };
+  // Sample the failing pixels: what colours are they, and is the delta a
+  // consistent offset (rounding) or scattered (geometry)?
+  {
+    const seen = new Map();
+    for (let i = 0; i < a.rgb.length; i += 3) {
+      const d = Math.max(Math.abs(a.rgb[i]-b.rgb[i]), Math.abs(a.rgb[i+1]-b.rgb[i+1]),
+                         Math.abs(a.rgb[i+2]-b.rgb[i+2]));
+      if (d <= TOL) continue;
+      const k = `gl=[${a.rgb[i]},${a.rgb[i+1]},${a.rgb[i+2]}] cpu=[${b.rgb[i]},${b.rgb[i+1]},${b.rgb[i+2]}]`;
+      seen.set(k, (seen.get(k) || 0) + 1);
+    }
+    // Where exactly are the delta-4 pixels? Bounding box of just those.
+    let fx0=1e9,fy0=1e9,fx1=-1,fy1=-1,n4=0;
+    for (let y=0;y<H;y++) for (let x=0;x<W;x++) {
+      const i=(y*W+x)*3;
+      const d=Math.max(Math.abs(a.rgb[i]-b.rgb[i]),Math.abs(a.rgb[i+1]-b.rgb[i+1]),Math.abs(a.rgb[i+2]-b.rgb[i+2]));
+      if (d===4){n4++; if(x<fx0)fx0=x; if(x>fx1)fx1=x; if(y<fy0)fy0=y; if(y>fy1)fy1=y;}
+    }
+    console.log(`delta-4 pixels: ${n4}, bbox x ${fx0}..${fx1} y ${fy0}..${fy1}`);
+    console.log('most common failing pixel values:');
+    for (const [k, n] of [...seen].sort((x, y) => y[1] - x[1]).slice(0, 5))
+      console.log(`  ${String(n).padStart(6)}x  ${k}`);
+  }
+  console.log('over-tolerance by region:');
+  box('cvA at (40,40) 1:1', 40, 40, 256, 192);
+  box('cvA at (340,40) 1.5x', 340, 40, 384, 288);
+  box('cvB at (40,280) 1:1', 40, 280, 160, 160);
+  box('screen rect (900,40)', 900, 40, 200, 120);
+  box('screen sprite (900,200)', 900, 200, 128, 128);
   console.log(`over-tolerance pixels: ${over} of ${tot} (${(over/tot*100).toFixed(4)}%)`);
   for (const s of samples) console.log('  ' + s);
   const pct = over / tot * 100;

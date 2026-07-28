@@ -44,6 +44,28 @@ int  wcl_r2d_sprite(const void *pixels, int sw, int sh,
 /* Scissor rect in cart pixels; w<0 disables. */
 void wcl_r2d_scissor(int x, int y, int w, int h);
 
+/* Render targets. A canvas is both a destination and, later, a source, so it
+ * lives in its own texture with an FBO attached rather than in the shared
+ * atlas. `key` is the canvas's RGBA payload pointer, the same identity
+ * wcl_r2d_sprite uses, so drawing a canvas afterwards finds this texture.
+ *
+ * wcl_r2d_target(NULL, 0, 0) restores the screen. Returns 0 if the target
+ * could not be set up, in which case the caller must use the software path. */
+int  wcl_r2d_target(const void *key, int w, int h);
+/* Clear the current target (screen or canvas) to an RGBA colour. */
+void wcl_r2d_clear(uint32_t color, int alpha);
+/* Forget a canvas's GPU texture, e.g. when the image slot is reused. */
+void wcl_r2d_forget(const void *key);
+
+/* Draw one baked TTF glyph. `atlas` is stb_truetype's 8-bit coverage bitmap
+ * and doubles as the cache key, so a font uploads once and every glyph after
+ * that is a quad in the same batch. Coverage modulates alpha, exactly as the
+ * software path's blend_px(cov * a / 255) does. */
+int  wcl_r2d_glyph(const unsigned char *atlas, int aw, int ah,
+                   int dx, int dy, int dw, int dh,
+                   int sx, int sy, int srcw, int srch,
+                   uint32_t color, int alpha);
+
 #else
 
 static inline int wcl_r2d_init(int width, int height) {
@@ -68,6 +90,18 @@ static inline int wcl_r2d_sprite(const void *pixels, int sw, int sh,
 }
 static inline void wcl_r2d_scissor(int x, int y, int w, int h) {
     (void)x; (void)y; (void)w; (void)h;
+}
+static inline int wcl_r2d_target(const void *key, int w, int h) {
+    (void)key; (void)w; (void)h; return 0;
+}
+static inline void wcl_r2d_clear(uint32_t color, int alpha) { (void)color; (void)alpha; }
+static inline void wcl_r2d_forget(const void *key) { (void)key; }
+static inline int wcl_r2d_glyph(const unsigned char *atlas, int aw, int ah,
+                                int dx, int dy, int dw, int dh,
+                                int sx, int sy, int srcw, int srch,
+                                uint32_t color, int alpha) {
+    (void)atlas; (void)aw; (void)ah; (void)dx; (void)dy; (void)dw; (void)dh;
+    (void)sx; (void)sy; (void)srcw; (void)srch; (void)color; (void)alpha; return 0;
 }
 
 #endif /* WCL_ENABLE_GL2D */

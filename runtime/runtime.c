@@ -309,7 +309,7 @@ static void fill_rect(int x, int y, int w, int h, uint32_t c, int a) {
     /* GL only owns the screen; a canvas target, scissor or additive blending
      * is not modelled here, so those keep the software path (and have
      * already forced cpu_mode via wcl_r2d_disable). */
-    if (!rt_buf && !blend_add && wcl_r2d_solid(x, y, w, h, c, a)) return;
+    if (!blend_add && wcl_r2d_solid(x, y, w, h, c, a)) return;
     int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
     int x1 = x + w > dest_w() ? dest_w() : x + w;
     int y1 = y + h > dest_h() ? dest_h() : y + h;
@@ -318,7 +318,7 @@ static void fill_rect(int x, int y, int w, int h, uint32_t c, int a) {
 
 static void raster_line(int x0, int y0, int x1, int y1, uint32_t c, int a) {
     if (a <= 0) return;
-    if (!rt_buf && !blend_add && wcl_r2d_line(x0, y0, x1, y1, c, a)) return;
+    if (!blend_add && wcl_r2d_line(x0, y0, x1, y1, c, a)) return;
     int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
     int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
     int err = dx + dy;
@@ -357,8 +357,11 @@ static void raster_line(int x0, int y0, int x1, int y1, uint32_t c, int a) {
 
 static void raster_circle(int cx, int cy, int r, uint32_t c, int a, int filled) {
     if (r <= 0) return;
-    /* Circles are span-filled in software. Rather than approximate them with
-     * a triangle fan (which would not match), drop to the CPU backend. */
+    /* A GL triangle fan does NOT reproduce the software span fill: the
+     * midpoint/sqrt spans and polygon coverage disagree on the boundary, and
+     * a circle is nearly all boundary at small radii. Circles therefore
+     * still drop the frame to the CPU backend, which is correct rather than
+     * approximate. Cavern hits this, which is why it stays on software. */
     wcl_r2d_disable();
     if (filled) {
         for (int yy = -r; yy <= r; yy++) {
@@ -491,6 +494,7 @@ static int canvas_new(int w, int h) {
     im->rgba = (uint8_t *)calloc((size_t)w * h * 4, 1);
     if (!im->rgba) return -1;
     im->w = w; im->h = h; im->active = 1; im->is_canvas = 1;
+    wcl_r2d_forget(im->rgba);   /* a recycled slot must not reuse a stale texture */
     snprintf(im->path, sizeof im->path, "@canvas:%d", slot);
     return slot;
 }
@@ -534,7 +538,7 @@ static void draw_image(image_t *im, double x, double y, double rot,
      * destination corners, so GL gets the same geometry the software path
      * scans, with no second implementation of the transform. Canvas targets
      * and additive still fall back (and have tripped cpu_mode). */
-    if (!rt_buf && !blend_add) {
+    if (!blend_add) {
         if (wcl_r2d_sprite(im->rgba, im->w, im->h, cxs, cys,
                            qx, qy, qw, qh,
                            (uint32_t)((tr << 16) | (tg << 8) | tb), ta)) {
@@ -737,10 +741,10 @@ static int glyph_index(char ch) {
 
 /* y is the TOP of the text box (LOVE convention) */
 static void draw_bitfont(int x, int y_top, const char *s, int scale, uint32_t c, int a) {
-    /* Glyphs are drawn as many tiny filled rects. They would batch fine, but
-     * the TTF path next to them rasterizes into the CPU target, so text as a
-     * whole stays on one backend for consistent output. */
-    wcl_r2d_disable();
+    /* Every glyph pixel is a fill_rect, which already routes to the GL solid
+     * batch, so bitfont text needs nothing special -- a whole string lands in
+     * one draw call. (This used to disable GL because the TTF path next to it
+     * was CPU-only; that is no longer true.) */
     if (scale < 1) scale = 1;
     int cx = x;
     for (; *s; s++) {
@@ -821,8 +825,11 @@ static int font_load(const char *path, int px) {
 
 /* y_top = top of the text box; baseline sits px*0.8 below (top-left origin) */
 static void draw_ttf(font_t *f, int x, int y_top, const char *s, uint32_t c, int a) {
-    /* stb_truetype rasterizes glyph coverage into the CPU target. */
-    wcl_r2d_disable();
+    /* GL path: stb_truetype already baked every glyph into f->atlas, so the
+     * font uploads once as a coverage texture and each glyph is a quad in
+     * the shared textured batch. Only the screen target is handled here;
+     * canvases and additive fall through to the CPU rasterizer below. */
+    const int gl_text = (!rt_buf && !blend_add && wcl_r2d_active());
     float pen_x = (float)x;
     float baseline = (float)y_top + f->px * 0.8f;
     for (; *s; s++) {
@@ -833,11 +840,26 @@ static void draw_ttf(font_t *f, int x, int y_top, const char *s, uint32_t c, int
         int gw = b->x1 - b->x0, gh = b->y1 - b->y0;
         int gx = (int)(pen_x + b->xoff);
         int gy = (int)(baseline + b->yoff);
-        for (int row = 0; row < gh; row++)
-            for (int col = 0; col < gw; col++) {
-                int cov = f->atlas[(b->y0 + row) * f->aw + (b->x0 + col)];
-                if (cov) blend_px(gx + col, gy + row, c, cov * a / 255);
+        if (gl_text) {
+            /* A space has no glyph box at all, which is not a failure --
+             * skip it and keep the pen advance below. Treating a zero-sized
+             * glyph as an error dropped every string containing a space onto
+             * the CPU backend, which is most of them. */
+            if (gw > 0 && gh > 0 &&
+                !wcl_r2d_glyph(f->atlas, f->aw, f->ah, gx, gy, gw, gh,
+                               b->x0, b->y0, gw, gh, c, a)) {
+                /* out of glyph textures: give up on GL for the run rather
+                 * than draw half the string on each backend */
+                wcl_r2d_disable();
+                return;
             }
+        } else {
+            for (int row = 0; row < gh; row++)
+                for (int col = 0; col < gw; col++) {
+                    int cov = f->atlas[(b->y0 + row) * f->aw + (b->x0 + col)];
+                    if (cov) blend_px(gx + col, gy + row, c, cov * a / 255);
+                }
+        }
         pen_x += b->xadvance;
     }
 }
@@ -971,6 +993,10 @@ static int l_clear(lua_State *S) {
         /* On the GL path wcl_r2d_begin already issued glClear for this
          * colour; writing the framebuffer too would just be wasted work. */
         if (wcl_r2d_active()) return 0;
+    } else if (wcl_r2d_active()) {
+        /* clearing a canvas clears its FBO */
+        wcl_r2d_clear(c, 255);
+        return 0;
     }
     if (rt_buf) {
         for (int i = 0; i < rt_w * rt_h; i++) {
@@ -1061,13 +1087,23 @@ static int l_image_draw(lua_State *S) {
 }
 
 static int l_set_canvas(lua_State *S) {
-    /* Render targets need an FBO the backend does not have yet, so a cart
-     * that uses one runs entirely on the software rasterizer. */
-    if (!lua_isnoneornil(S, 1)) wcl_r2d_disable();
-    if (lua_isnoneornil(S, 1)) { rt_buf = NULL; return 0; }
+    if (lua_isnoneornil(S, 1)) {
+        rt_buf = NULL;
+        wcl_r2d_target(NULL, 0, 0);          /* back to the screen */
+        return 0;
+    }
     image_t *im = image_by_id(ARGI(1));
-    if (!im || !im->is_canvas) { rt_buf = NULL; return 0; }
+    if (!im || !im->is_canvas) {
+        rt_buf = NULL;
+        wcl_r2d_target(NULL, 0, 0);
+        return 0;
+    }
     rt_buf = im->rgba; rt_w = im->w; rt_h = im->h;
+    /* An FBO keyed on the same pointer sprites use, so drawing this canvas
+     * later samples the texture that was just rendered into. If the backend
+     * cannot provide one, drop to software for the rest of the run rather
+     * than let GL and CPU each hold half the canvas. */
+    if (!wcl_r2d_target(im->rgba, im->w, im->h)) wcl_r2d_disable();
     return 0;
 }
 
