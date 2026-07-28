@@ -56,6 +56,7 @@
 #define GL_UNSIGNED_SHORT 0x1403
 #define GL_LINES 0x0001
 #define GL_COLOR_BUFFER_BIT 0x00004000
+#define GL_SCISSOR_TEST 0x0C11
 
 typedef struct { float x, y, u, v, r, g, b, a; } vertex_t;
 typedef struct {
@@ -94,6 +95,7 @@ static vertex_t textured_batch[BATCH_MAX * 4];
 static int textured_batch_count;
 static uint16_t indices[BATCH_MAX * 6];
 
+static int scissor_on;
 static int blend_enabled = -1;
 static int textured_enabled = -1;
 static GLuint bound_texture;
@@ -423,41 +425,54 @@ static texture_t *get_texture(const void *pixels, int w, int h) {
 }
 
 int wcl_r2d_sprite(const void *pixels, int sw, int sh,
-                   int dx, int dy, int dw, int dh,
+                   const double *cx, const double *cy,
                    int sx, int sy, int srcw, int srch,
                    uint32_t tint, int alpha) {
-    if (!wcl_r2d_active() || !pixels || dw <= 0 || dh <= 0) return 0;
+    if (!wcl_r2d_active() || !pixels || !cx || !cy) return 0;
     texture_t *t = get_texture(pixels, sw, sh);
     if (!t) return 0;                 /* atlas full: caller falls back */
     if (solid_batch_count) flush_solid_batch();
     if (textured_batch_count + 4 > BATCH_MAX * 4) flush_textured_batch();
 
     vertex_t *v = &textured_batch[textured_batch_count];
-    float x0, y0, x1, y1;
-    ndc((float)dx, (float)dy, &x0, &y0);
-    ndc((float)(dx + dw), (float)(dy + dh), &x1, &y1);
-    /* Source rect in atlas UV. The atlas is NEAREST-filtered and the quad is
-     * axis-aligned, so sampling lands on the same texels the software path
-     * indexes for integer scales; fractional scales can differ by a texel at
-     * boundaries, which is inside the accepted tolerance. */
+    /* Source rect in atlas UV. The atlas is NEAREST-filtered, so an
+     * axis-aligned quad at an integer scale samples the same texels the
+     * software path indexes; rotation and fractional scales can differ by a
+     * texel at boundaries, which is inside the accepted tolerance. */
     float u0 = (float)(t->atlas_x + sx) / (float)ATLAS_SIZE;
     float v0 = (float)(t->atlas_y + sy) / (float)ATLAS_SIZE;
     float u1 = (float)(t->atlas_x + sx + srcw) / (float)ATLAS_SIZE;
     float v1 = (float)(t->atlas_y + sy + srch) / (float)ATLAS_SIZE;
+    const float us[4] = { u0, u1, u1, u0 };
+    const float vs[4] = { v0, v0, v1, v1 };
 
     float r = (float)((tint >> 16) & 255) / 255.0f;
     float g = (float)((tint >> 8) & 255) / 255.0f;
     float b = (float)(tint & 255) / 255.0f;
     float a = (float)alpha / 255.0f;
 
-    v[0].x = x0; v[0].y = y0; v[0].u = u0; v[0].v = v0;
-    v[1].x = x1; v[1].y = y0; v[1].u = u1; v[1].v = v0;
-    v[2].x = x1; v[2].y = y1; v[2].u = u1; v[2].v = v1;
-    v[3].x = x0; v[3].y = y1; v[3].u = u0; v[3].v = v1;
-    for (int i = 0; i < 4; i++) { v[i].r = r; v[i].g = g; v[i].b = b; v[i].a = a; }
+    for (int i = 0; i < 4; i++) {
+        ndc((float)cx[i], (float)cy[i], &v[i].x, &v[i].y);
+        v[i].u = us[i]; v[i].v = vs[i];
+        v[i].r = r; v[i].g = g; v[i].b = b; v[i].a = a;
+    }
     textured_batch_count += 4;
     frame_stats.quads++;
     return 1;
+}
+
+/* Scissor. glScissor's origin is bottom-left, the cart's is top-left, so the
+ * y coordinate is flipped here rather than at every call site. A batch built
+ * under one scissor must not be drawn under another, so flush first. */
+void wcl_r2d_scissor(int x, int y, int w, int h) {
+    if (!wcl_r2d_active()) return;
+    flush_batches();
+    if (w < 0) {
+        if (scissor_on) { glDisable(GL_SCISSOR_TEST); scissor_on = 0; }
+        return;
+    }
+    if (!scissor_on) { glEnable(GL_SCISSOR_TEST); scissor_on = 1; }
+    glScissor(x, height - (y + h), w, h);
 }
 
 #endif /* WCL_ENABLE_GL2D */

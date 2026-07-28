@@ -408,16 +408,38 @@ equality. The software rasterizer stays the reference implementation and
 stays bit-exact; `test/blit` and `test/prims` are unchanged and still assert
 equality against it.
 
-**The CPU fallback is whole-frame and sticky.** Anything GL2D does not
-implement -- rotation, canvas render targets, scissor, additive blending, TTF
-text, polygons, circles, the Lua error screen -- calls `wcl_r2d_disable()`,
+Rotation, flips and scissor are on the GL path. Rotation costs nothing extra:
+`draw_image` already computes the four transformed destination corners, and
+those are handed straight to GL, so there is no second implementation of the
+transform to disagree with the first. Scissor is `glScissor`, which clips the
+same half-open rect the software path does.
+
+Rotation adds a THIRD kind of difference, budgeted separately from blend
+rounding. A GPU decides pixel coverage by rasterizing triangles; the software
+path inverse-transforms each pixel. Those agree on a quad's interior and
+disagree on its boundary, so a few edge pixels are not "off by 2" -- they are
+either the sprite or the background. Measured on `test/gl2d`, a 45-degree
+sprite differs on **102 pixels (0.011% of the frame), 0% of its interior and
+about 27% of its perimeter**. The gate budgets that at 0.05% of the frame; a
+control that mirrors the sprite UVs fails it at 20.7%, so the budget is far
+too small to hide a real bug.
+
+**The CPU fallback is whole-frame and sticky.** Anything GL2D still does not
+implement -- canvas render targets, additive blending, TTF text, polygons,
+circles, the Lua error screen -- calls `wcl_r2d_disable()`,
 and from then on every frame is rasterized in software and presented with one
 `wc_gl_blit`. Reconciling per draw would cost ~0.19 ms each way, which a real
 frame pays dozens of times. Cavern uses canvases, so it takes this path and
 is bit-identical to the CPU build.
 
-Measured on `test/gl2d` (600 frames): **GL2D 0.075 ms vs software 0.597 ms,
-8.0x**.
+Measured on `test/gl2d` (600 frames): **GL2D 0.074 ms vs software 1.332 ms,
+18x**. Rotated sprites are the software rasterizer's worst case (14.6 ms per
+2000 in `test/bench.js`) and free on a GPU, which is most of that ratio.
+
+Sloped lines stay a known gap. GL rasterizes lines by its own
+implementation-defined diamond-exit rule, which does not have to match
+Bresenham, and a shallow diagonal came out a row off. Axis-aligned lines are
+exact; if a cart needs Bresenham-exact diagonals it should not use GL2D.
 
 One consequence worth knowing: `setCanvas` trips the fallback the moment it
 is called, *including in `love.load`*. A cart that prepares its art in a

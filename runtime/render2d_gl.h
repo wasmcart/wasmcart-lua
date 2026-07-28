@@ -27,12 +27,22 @@ void wcl_r2d_disable(void);
 int  wcl_r2d_active(void);
 int  wcl_r2d_solid(int x, int y, int w, int h, uint32_t color, int alpha);
 int  wcl_r2d_line(int x0, int y0, int x1, int y1, uint32_t color, int alpha);
-/* Axis-aligned blit of an RGBA image. `pixels` doubles as the atlas cache
- * key, so a cart's image_t payload maps to one atlas entry for its life. */
+/* Blit an RGBA image onto an arbitrary destination parallelogram. `pixels`
+ * doubles as the atlas cache key, so a cart's image_t payload maps to one
+ * atlas entry for its life.
+ *
+ * cx/cy are the four destination corners in cart pixels, in the order
+ * top-left, top-right, bottom-right, bottom-left of the SOURCE rect. Passing
+ * corners rather than a rect and an angle means rotation, flips and origin
+ * offsets are all just the caller's existing corner math -- draw_image
+ * already computes exactly this, so nothing is recomputed or approximated. */
 int  wcl_r2d_sprite(const void *pixels, int sw, int sh,
-                    int dx, int dy, int dw, int dh,
+                    const double *cx, const double *cy,
                     int sx, int sy, int srcw, int srch,
                     uint32_t tint, int alpha);
+
+/* Scissor rect in cart pixels; w<0 disables. */
+void wcl_r2d_scissor(int x, int y, int w, int h);
 
 #else
 
@@ -50,11 +60,14 @@ static inline int wcl_r2d_line(int x0, int y0, int x1, int y1, uint32_t color, i
     (void)x0; (void)y0; (void)x1; (void)y1; (void)color; (void)alpha; return 0;
 }
 static inline int wcl_r2d_sprite(const void *pixels, int sw, int sh,
-                                 int dx, int dy, int dw, int dh,
+                                 const double *cx, const double *cy,
                                  int sx, int sy, int srcw, int srch,
                                  uint32_t tint, int alpha) {
-    (void)pixels; (void)sw; (void)sh; (void)dx; (void)dy; (void)dw; (void)dh;
+    (void)pixels; (void)sw; (void)sh; (void)cx; (void)cy;
     (void)sx; (void)sy; (void)srcw; (void)srch; (void)tint; (void)alpha; return 0;
+}
+static inline void wcl_r2d_scissor(int x, int y, int w, int h) {
+    (void)x; (void)y; (void)w; (void)h;
 }
 
 #endif /* WCL_ENABLE_GL2D */

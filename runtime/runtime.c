@@ -309,7 +309,7 @@ static void fill_rect(int x, int y, int w, int h, uint32_t c, int a) {
     /* GL only owns the screen; a canvas target, scissor or additive blending
      * is not modelled here, so those keep the software path (and have
      * already forced cpu_mode via wcl_r2d_disable). */
-    if (!rt_buf && !sc_on && !blend_add && wcl_r2d_solid(x, y, w, h, c, a)) return;
+    if (!rt_buf && !blend_add && wcl_r2d_solid(x, y, w, h, c, a)) return;
     int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
     int x1 = x + w > dest_w() ? dest_w() : x + w;
     int y1 = y + h > dest_h() ? dest_h() : y + h;
@@ -318,7 +318,7 @@ static void fill_rect(int x, int y, int w, int h, uint32_t c, int a) {
 
 static void raster_line(int x0, int y0, int x1, int y1, uint32_t c, int a) {
     if (a <= 0) return;
-    if (!rt_buf && !sc_on && !blend_add && wcl_r2d_line(x0, y0, x1, y1, c, a)) return;
+    if (!rt_buf && !blend_add && wcl_r2d_line(x0, y0, x1, y1, c, a)) return;
     int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
     int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
     int err = dx + dy;
@@ -529,13 +529,13 @@ static void draw_image(image_t *im, double x, double y, double rot,
 
     int tr = cur_r, tg = cur_g, tb = cur_b, ta = cur_a;
 
-    /* GL sprite path: axis-aligned, to the screen, ordinary alpha blending.
-     * Rotation, canvas targets, scissor and additive all stay on the
-     * software path (and have already tripped cpu_mode). */
-    if (sn == 0.0 && cs == 1.0 && !rt_buf && !sc_on && !blend_add) {
-        const int ddx = (int)(x - ox * sx), ddy = (int)(y - oy * sy);
-        if (wcl_r2d_sprite(im->rgba, im->w, im->h,
-                           ddx, ddy, (int)dw, (int)dh,
+    /* GL sprite path, to the screen with ordinary alpha blending. Rotation
+     * and flips come free: cxs/cys above are already the transformed
+     * destination corners, so GL gets the same geometry the software path
+     * scans, with no second implementation of the transform. Canvas targets
+     * and additive still fall back (and have tripped cpu_mode). */
+    if (!rt_buf && !blend_add) {
+        if (wcl_r2d_sprite(im->rgba, im->w, im->h, cxs, cys,
                            qx, qy, qw, qh,
                            (uint32_t)((tr << 16) | (tg << 8) | tb), ta)) {
             return;
@@ -1072,11 +1072,15 @@ static int l_set_canvas(lua_State *S) {
 }
 
 static int l_set_scissor(lua_State *S) {
-    /* glScissor exists, but the software path clips per span and the two
-     * would have to agree on edges; keep one backend per run instead. */
-    wcl_r2d_disable();
-    if (lua_isnoneornil(S, 1)) { sc_on = 0; return 0; }
+    if (lua_isnoneornil(S, 1)) {
+        sc_on = 0;
+        wcl_r2d_scissor(0, 0, -1, -1);
+        return 0;
+    }
     sc_on = 1; sc_x = ARGI(1); sc_y = ARGI(2); sc_w = ARGI(3); sc_h = ARGI(4);
+    /* glScissor clips the same half-open rect the software path does, so both
+     * backends agree on the edges without either changing. */
+    wcl_r2d_scissor(sc_x, sc_y, sc_w, sc_h);
     return 0;
 }
 
@@ -1395,7 +1399,11 @@ WC_EXPORT_RENDER void wc_render(void) {
     if (!gl2d_started) { gl2d_started = 1; wcl_r2d_init(DEFAULT_WIDTH, DEFAULT_HEIGHT); }
     /* Returns 0 in sticky cpu_mode, in which case every draw below takes the
      * software path and wcl_r2d_end blits the finished framebuffer. */
-    wcl_r2d_begin(frame_clear_color);
+    if (wcl_r2d_begin(frame_clear_color)) {
+        /* the prelude resets sc_on per frame; keep GL's state in step */
+        if (!sc_on) wcl_r2d_scissor(0, 0, -1, -1);
+        else wcl_r2d_scissor(sc_x, sc_y, sc_w, sc_h);
+    }
 #endif
 
     if (L && dbg_lua_ok) {

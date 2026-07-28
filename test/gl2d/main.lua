@@ -61,4 +61,29 @@ function love.draw()
     love.graphics.setColor(0.9, 0.2, 0.5, 0.3)
     love.graphics.rectangle("fill", 700 + i * 18, 460, 120, 80)
   end
+
+  -- ROTATION: the destination corners come from draw_image's own transform,
+  -- so GL gets the same parallelogram the software path scans.
+  love.graphics.setColor(1, 1, 1)
+  love.graphics.draw(img, 120, 560, 0.6, 2, 2, 32, 32)
+  love.graphics.draw(img, 260, 560, math.pi / 4, 1.5, 1.5, 32, 32)
+  love.graphics.draw(img, 380, 560, math.pi, 2, 2, 32, 32)
+  -- flips, which are negative scale rather than rotation
+  love.graphics.draw(img, 480, 530, 0, -2, 2)
+  love.graphics.draw(img, 620, 530, 0, 2, -2)
+  love.graphics.setColor(1, 1, 1, 0.6)
+  love.graphics.draw(img, 560, 620, 1.1, -1.5, 1.5, 32, 32)
+
+  -- SCISSOR: primitives that straddle the edge, so the clip is exercised
+  -- rather than a whole-primitive reject.
+  love.graphics.setScissor(1050, 400, 120, 200)
+  love.graphics.setColor(0.3, 1, 0.4)
+  love.graphics.rectangle("fill", 1000, 350, 250, 300)
+  love.graphics.setColor(1, 0.4, 0.9)
+  love.graphics.draw(img, 1020, 420, 0, 3, 3)
+  love.graphics.setScissor()
+
+  -- and an unclipped draw after, to prove the scissor was actually released
+  love.graphics.setColor(0.5, 0.6, 1)
+  love.graphics.rectangle("fill", 1180, 640, 80, 40)
 end

@@ -282,8 +282,14 @@ async function main() {
       const out = execFileSync(process.execPath,
         [path.join(ROOT, 'tools', 'gl2d-compare.mjs'), path.join(ROOT, 'test', 'gl2d'), '3', '2'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-      const m = out.match(/max delta (\d+)/);
-      console.log(`\nok    gl2d         within tolerance (max delta ${m ? m[1] : '?'})`);
+      // Report the two budgets separately. "max delta" alone is misleading:
+      // it is dominated by a handful of rotated-sprite EDGE pixels, which
+      // are either the sprite or the background and so differ hugely in
+      // value while being visually correct.
+      const edge = out.match(/(\d+) pixels \(([\d.]+)%\) exceed/);
+      console.log(edge
+        ? `\nok    gl2d         within tolerance (${edge[2]}% edge pixels, budget 0.05%)`
+        : `\nok    gl2d         within tolerance (every pixel +/-2)`);
     } catch (err) {
       const txt = (err.stdout || '') + (err.stderr || '');
       if (/Cannot find|ERR_MODULE_NOT_FOUND|createWebGL2Context/.test(txt)) {

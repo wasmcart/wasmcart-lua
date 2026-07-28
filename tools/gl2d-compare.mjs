@@ -7,7 +7,17 @@
  * both backends with the same seed and reports the FULL delta histogram, so
  * "within tolerance" is a measurement rather than an assertion.
  *
- *   node tools/gl2d-compare.mjs <cart-dir> [frames] [tolerance]
+ *   node tools/gl2d-compare.mjs <cart-dir> [frames] [tolerance] [maxEdgePct]
+
+ Two kinds of difference, with different budgets:
+   * per-pixel VALUE drift, from blend rounding: bounded by `tolerance`
+     (default 2 -- +/-1 per blended draw, compounding where draws overlap).
+   * EDGE COVERAGE on rotated quads: a GPU decides pixel coverage by
+     triangle rasterization, the software path by inverse-transforming each
+     pixel. Those disagree only on the boundary, never the interior, so a
+     small fraction of pixels can be arbitrarily different in value. That is
+     bounded by `maxEdgePct` (default 0.05% of the frame) rather than by
+     value, because an edge pixel is either the sprite or the background.
  */
 import fs from 'fs';
 import path from 'path';
@@ -21,7 +31,8 @@ const W = 1280, H = 720;
 
 const cartDir = process.argv[2] || path.join(ROOT, 'test', 'prims');
 const FRAMES = +(process.argv[3] || 60);
-const TOL = +(process.argv[4] || 1);
+const TOL = +(process.argv[4] || 2);
+const MAX_EDGE_PCT = +(process.argv[5] || 0.05);
 
 function loadAssets(dir, pre = '') {
   const out = {};
@@ -130,7 +141,16 @@ if (over) {
       if(samples.length<6) samples.push(`(${x},${y}) d=${d} gl=[${a.rgb[i]},${a.rgb[i+1]},${a.rgb[i+2]}] cpu=[${b.rgb[i]},${b.rgb[i+1]},${b.rgb[i+2]}]`); }
   }
   console.log(`over-tolerance bbox: x ${x0}..${x1}  y ${y0}..${y1}`);
+  console.log(`over-tolerance pixels: ${over} of ${tot} (${(over/tot*100).toFixed(4)}%)`);
   for (const s of samples) console.log('  ' + s);
-  console.log(`\nFAILED: ${over} pixels exceed +/-${TOL}`); process.exit(1);
+  const pct = over / tot * 100;
+  if (pct <= MAX_EDGE_PCT) {
+    console.log(`\nOK: ${over} pixels (${pct.toFixed(4)}%) exceed +/-${TOL},`);
+    console.log(`    within the ${MAX_EDGE_PCT}% edge-coverage budget.`);
+  } else {
+    console.log(`\nFAILED: ${over} pixels (${pct.toFixed(4)}%) exceed +/-${TOL},`);
+    console.log(`        over the ${MAX_EDGE_PCT}% edge-coverage budget.`);
+    process.exit(1);
+  }
 }
 console.log(`\nOK: every pixel within +/-${TOL}`);
