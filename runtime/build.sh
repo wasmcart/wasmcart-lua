@@ -82,6 +82,28 @@ emcc runtime.c vorbis.c cartconf.c physics.c \
   -o ../build/engine.wasm
 echo "built ../build/engine.wasm ($(wc -c < ../build/engine.wasm) bytes)"
 
+# ── optional GL-presenting variant ──────────────────────────────────
+# WCL_USE_GL builds the same engine but presents through wc_gl_blit: the
+# software rasterizer still produces every pixel, and one fullscreen quad
+# puts them on screen, which is the spec's standard display path.
+#
+# It is a SEPARATE artifact, not a replacement. A cart that imports the "gl"
+# module is a GL cart to every host, and a host handed a GL cart with no GL
+# context must fail the load rather than stub it -- so shipping this as the
+# default would break every 2D-only host for a change that moves no pixels.
+if [ "${WCL_GL:-0}" = "1" ]; then
+  emcc runtime.c vorbis.c cartconf.c physics.c \
+    vendor/liblua54.a vendor/libbox2d.a \
+    -O2 -msimd128 -msse2 -DWCL_USE_GL \
+    -I vendor/lua/src -I vendor/box2d/include -I "$WASMCART_REPO/include" -I . \
+    -s STANDALONE_WASM=1 --no-entry -sSUPPORT_LONGJMP=wasm \
+    -s EXPORTED_FUNCTIONS='["_wc_init","_wc_render","_wc_get_info","_wc_debug_state","_wc_set_seed"]' \
+    -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
+    -s ALLOW_MEMORY_GROWTH=1 -s INITIAL_MEMORY=67108864 -s STACK_SIZE=4194304 \
+    -o ../build/engine-gl.wasm
+  echo "built ../build/engine-gl.wasm ($(wc -c < ../build/engine-gl.wasm) bytes)"
+fi
+
 # the template ships the engine so `run.sh` works with no build step
 cp ../build/engine.wasm ../template/main.wasm
 

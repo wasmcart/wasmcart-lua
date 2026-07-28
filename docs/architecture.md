@@ -252,6 +252,43 @@ Every manifest here previously omitted the field, which silently defaults to
 booted to "missing asset: main.lua", the Cavern port included. Declaring
 `"assets": "app/"` fixes both modes.
 
+## GL display path (opt-in)
+
+`runtime/build.sh` with `WCL_GL=1` also produces `build/engine-gl.wasm`: the
+same engine, presenting through `wc_gl_blit` -- the spec's standard display
+path, where even a pure-2D cart uploads its finished pixels as a texture and
+draws one fullscreen quad.
+
+It is a **separate artifact, not a replacement**, and default OFF. A cart
+*is* a GL cart iff its wasm imports from the `gl` module, and a host handed a
+GL cart with no GL context must fail the load rather than stub it. Shipping
+this as the default would break every 2D-only host these carts run on today,
+for a change that moves no pixels. The default `engine.wasm` is byte-identical
+to one built before any of this existed, and makes zero `gl` calls.
+
+The software rasterizer remains the reference implementation. `wc_gl_blit`
+changes only *how* pixels reach the screen, so the `blit`/`prims` goldens stay
+valid, and `tools/gl-verify.mjs` asserts the stronger property: run the cart
+against a real WebGL2 context, read the GPU framebuffer back, and diff it
+against the cart's own software framebuffer. Verified pixel-identical (0 of
+921600 differing) on `blit`, `prims`, `kitchen-sink`, `shmup` and Cavern.
+`test/run.js` runs this as `gl-display` when the GL engine and a GL context
+are both present, and skips cleanly otherwise.
+
+One format detail worth keeping: the framebuffer is XRGB8888 (`0x00RRGGBB`),
+so its bytes run B,G,R,X in little-endian memory, while `wc_gl_blit` uploads
+`GL_RGBA` (R first). The engine repacks into a scratch buffer rather than
+changing the framebuffer format, which the rasterizer and every golden depend
+on. Swapping those two channels is caught by gl-verify as ~23% of pixels
+differing, which is how that path is known to be tested.
+
+Why bother, when this moves no pixels and costs a repack? Because it is the
+step that makes a GPU rasterizer possible later without a flag day. Measured
+on this machine (`tools/gl-probe.js`, AMD 890M via native-gles), 2000
+textured quads cost 0.62 ms batched against 7.45 ms for the software sprite
+path -- 12x, and more against rotated sprites, which are free on a GPU. That
+work is not done here; this commit only moves *presentation*.
+
 ## Input: gamepad first, always
 
 **wasmcart is a gamepad platform.** The host synthesizes a pad from the

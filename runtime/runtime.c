@@ -17,6 +17,9 @@
  * Determinism: fixed dt, host-seeded RNG, one pinned VM -> identical frames
  * on every host.
  */
+#ifdef WCL_USE_GL
+#define WC_USE_GL   /* must precede wasmcart.h: gates the "gl" import block */
+#endif
 #include "wasmcart.h"
 #include "wc_cart.h"
 
@@ -61,6 +64,47 @@ void wcl_open_physics(lua_State *L);
 #define AUDIO_CAP 4096
 
 WC_CART_BUFFERS;
+
+/* ── GL presentation (opt-in: -DWCL_USE_GL) ───────────────────────────
+ *
+ * wc_gl_blit.h is the spec's standard display path: even a pure-2D cart
+ * uploads its finished pixels as a texture and draws one fullscreen quad,
+ * so the host always presents through GL.
+ *
+ * OPT-IN and default OFF on purpose. A cart IS a GL cart iff its wasm
+ * imports from the "gl" module, and a host handed a GL cart with no GL
+ * context must fail the load rather than stub it. Making this unconditional
+ * would break every 2D-only host these carts run on today, for a change
+ * that moves no pixels.
+ *
+ * The software rasterizer stays the reference implementation either way --
+ * it produces exactly the same pixels, and this only changes how they reach
+ * the screen. That is what keeps the blit/prims goldens valid here.
+ */
+#ifdef WCL_USE_GL
+#define WC_GL_BLIT_IMPLEMENTATION
+#include "wc_gl_blit.h"
+
+/* The framebuffer is XRGB8888 (0x00RRGGBB), so in little-endian memory the
+ * bytes run B,G,R,X. wc_gl_blit uploads as GL_RGBA (R first), which would
+ * swap red and blue. Repack into scratch rather than changing the
+ * framebuffer format, which the rasterizer and every golden depend on. */
+static uint8_t gl_rgba[MAX_WIDTH * MAX_HEIGHT * 4];
+
+static void gl_present(void) {
+    const uint32_t *src = wc_framebuffer;
+    uint8_t *dst = gl_rgba;
+    for (int i = 0; i < DEFAULT_WIDTH * DEFAULT_HEIGHT; i++) {
+        const uint32_t px = src[i];
+        dst[0] = (uint8_t)(px >> 16);  /* R */
+        dst[1] = (uint8_t)(px >> 8);   /* G */
+        dst[2] = (uint8_t)px;          /* B */
+        dst[3] = 255;                  /* X is unused: present opaque */
+        dst += 4;
+    }
+    wc_gl_blit(gl_rgba, DEFAULT_WIDTH, DEFAULT_HEIGHT);
+}
+#endif
 
 WC_DETERMINISTIC_RNG
 
@@ -1251,6 +1295,9 @@ static int run_source(const char *name) {
 WC_EXPORT wc_info_t *wc_get_info(void) {
     WC_FILL_INFO(WC_FLAG_DEBUG | WC_FLAG_DETERMINISTIC | WC_FLAG_POINTER);
     wc_info.audio_sample_rate = 48000;
+#ifdef WCL_USE_GL
+    wc_info.gpu_api = 1;  /* WebGL2/GLES3: we present via wc_gl_blit */
+#endif
     wc_info.save_ptr  = (uint32_t)(uintptr_t)wc_save;
     wc_info.save_size = sizeof(wc_save);
     return &wc_info;
@@ -1340,4 +1387,10 @@ WC_EXPORT_RENDER void wc_render(void) {
 
     tick_n++;
     dbg_tick = tick_n;
+
+#ifdef WCL_USE_GL
+    /* Last thing in the frame: everything above has finished writing pixels,
+     * including the Lua-error screen. */
+    gl_present();
+#endif
 }

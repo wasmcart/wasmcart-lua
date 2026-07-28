@@ -242,6 +242,32 @@ async function main() {
     }
   }
 
+  // ── the GL display path must show what the cart drew ──────────────
+  // Only when build/engine-gl.wasm exists (runtime/build.sh WCL_GL=1) and a
+  // GL context is available. wc_gl_blit changes only HOW pixels reach the
+  // screen, so the GPU's output must equal the software framebuffer exactly;
+  // anything else means the display path is misreporting the cart.
+  const glEngine = path.join(ROOT, 'build', 'engine-gl.wasm');
+  if (fs.existsSync(glEngine)) {
+    const { execFileSync } = require('child_process');
+    try {
+      const out = execFileSync(process.execPath,
+        [path.join(ROOT, 'tools', 'gl-verify.mjs'), glEngine, path.join(ROOT, 'test', 'prims'), '3'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      const m = out.match(/(\d+) differing pixels/);
+      console.log(`\nok    gl-display   GPU output identical to software (${m ? m[1] : '0'} differing)`);
+    } catch (err) {
+      const txt = (err.stdout || '') + (err.stderr || '');
+      if (/Cannot find|ERR_MODULE_NOT_FOUND|createWebGL2Context/.test(txt)) {
+        console.log('\nskip  gl-display   no GL context available on this machine');
+      } else {
+        console.log('\nFAIL  gl-display  GPU output differs from the software framebuffer');
+        for (const l of txt.trim().split('\n').slice(-4)) console.log(`      ${l}`);
+        failed++;
+      }
+    }
+  }
+
   // ── documented examples must actually run ─────────────────────────
   // Docs rot silently: an API gets renamed and the README keeps promising
   // the old one. test/doccheck/ is every code block from README.md and
