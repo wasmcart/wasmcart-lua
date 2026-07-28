@@ -367,6 +367,32 @@ tolerance-based, ±1 per channel) or carrying a destination-read blending path
 on every platform. That is a product decision about what the engine promises,
 not a performance one.
 
+### Prior art: wasmcart-mruby's GL2D backend
+
+The sibling `wasmcart-mruby` runtime already shipped this (`runtime/
+render2d_gl.c`, ~500 lines), which settles both open questions empirically:
+
+**It took the tolerance route.** It uses ordinary fixed-function blending
+(`glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)`), and its A/B checker
+compares with a tolerance of 8/255. Re-running that comparison at ZERO
+tolerance on Tetris: **~19% of pixels differ by exactly 1**, max delta 3,
+nothing above 8. So "pixel-equivalent" there means visually identical, not
+bit-identical -- exactly the `div255`-vs-float-rounding gap measured above,
+confirmed on a shipping implementation rather than in a probe.
+
+**It solves the mixing problem by not mixing.** `wy_r2d_disable()` makes the
+CPU fallback **whole-frame and sticky**: any unsupported operation (a render
+target, a TTF label, an `@rt:` sprite, a Ruby error) drops that entire frame
+to the software rasterizer, which is then presented with `wc_gl_blit`. There
+is no per-draw reconciliation, so the ~0.19 ms readback/upload cost never
+lands in the inner loop. That is a much better answer than the per-draw
+synchronisation this project was sizing, and it is the design to copy.
+
+Measured here on Tetris (1500 frames, this machine): **GL 0.377 ms vs CPU
+1.157 ms, 3.1x** -- consistent with the 2-14x range that backend reports, and
+well short of the 49x an idealised probe suggests, because a real cart is not
+purely fill-bound.
+
 ## Input: gamepad first, always
 
 **wasmcart is a gamepad platform.** The host synthesizes a pad from the
