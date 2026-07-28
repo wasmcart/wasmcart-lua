@@ -289,6 +289,50 @@ textured quads cost 0.62 ms batched against 7.45 ms for the software sprite
 path -- 12x, and more against rotated sprites, which are free on a GPU. That
 work is not done here; this commit only moves *presentation*.
 
+### Can a GPU match the software rasterizer? Yes, with two corrections
+
+Step 2 (a GPU *rasterizer*, not just GL presentation) hinges on whether a GPU
+can reproduce `draw_image` bit-exactly. If it cannot, the `blit`/`prims`
+goldens stop being a shared contract and the GL path needs a weaker,
+tolerance-based one. `tools/gl-exactness.mjs` settles it by sweeping every
+destination size from 8 to 200 px against a model of the software sampling
+rule: **all 193 sizes bit-exact**, but only after two corrections.
+
+1. **Sample position.** A GPU interpolates UV and samples at the pixel
+   *centre*; `draw_image` indexes by destination pixel. Deriving the integer
+   index from `gl_FragCoord` and using `texelFetch` takes the interpolator
+   out of the sampling rule entirely.
+2. **`floor()` on an exact boundary.** At scales like 1.5x, `idx*qw/dw` lands
+   *exactly* on an integer for a third of the columns, and fp32 division
+   returns a hair under it, so `floor()` drops a whole texel. Without a small
+   epsilon, **30 of the 193 sizes differ, up to 55% of a sprite's pixels**.
+   Deleting the epsilon makes the sweep fail again, which is how it is known
+   to be doing something.
+
+This is the same family of bug as the reciprocal-multiply one in the software
+blitter: an arithmetically "equivalent" rewrite that selects a different
+texel. It is not driver flakiness -- run-to-run output on this driver is
+byte-identical.
+
+### Why step 2 is not just "put sprites on the GPU"
+
+The blocker is not exactness, it is **mixing**. The GPU path composites into
+the GL framebuffer while the software path writes `wc_framebuffer`, and
+software cannot see pixels the GPU drew. Any frame that uses both produces
+wrong output, and rotation, canvas targets, scissor and additive blending all
+have to fall back to software.
+
+Real carts mix constantly -- Cavern issues 34 `love.graphics.draw` calls
+against 36 rectangle/print/circle calls per frame, interleaved. Reconciling
+the two costs ~0.19 ms per switch (0.109 readback + 0.084 upload, measured),
+which is cheap once and ruinous seventy times.
+
+So step 2 is **the whole 2D pipeline on the GPU**, not a sprite fast path
+bolted onto a software rasterizer. That is a much larger change than step 1,
+and it is why step 1 shipped separately: presentation moved with zero pixel
+risk, and the exactness question above is now answered before committing to
+the rest.
+
 ## Input: gamepad first, always
 
 **wasmcart is a gamepad platform.** The host synthesizes a pad from the
