@@ -333,6 +333,40 @@ and it is why step 1 shipped separately: presentation moved with zero pixel
 risk, and the exactness question above is now answered before committing to
 the rest.
 
+### What a full 2D GPU pipeline would cost and buy
+
+The performance case is not in doubt. `tools/gl-pipeline-probe.mjs` models a
+Cavern-shaped frame (34 textured sprite quads + 36 vector draws, each with
+its own uniforms) fully on the GPU: **0.11 ms against 5.50 ms software, ~49x**.
+Per-draw overhead is not a blocker either -- gl calls issued from wasm cost
+about **0.002 ms** each and account for 12% of a GL frame; the other 88% is
+the software rasterizer that the rewrite would delete. (An earlier reading of
+"64 us per gl call" was an artifact of dividing whole-frame time by call
+count, and is wrong.)
+
+The blocker is **bit-exactness of blended primitives**, and it is specific:
+
+- **Sprites**: exact, over all 193 swept sizes (above).
+- **Opaque primitives**: exact, once colours are passed as 0..255 integers
+  rather than floats. A float uniform of `0.35` is not the same value as
+  `89/255`, which alone put every pixel off by one.
+- **Blended primitives**: **cannot** match with fixed-function blending. The
+  GPU computes `src*a + dst*(1-a)` in normalized floats and rounds at 8 bit;
+  `blend_span` uses the exact `div255` multiply-shift. Those disagree on
+  **39.7% of (alpha, src, dst) combinations**, always by exactly 1.
+
+A shader doing the integer math itself reproduces `div255` exactly (0
+disagreements over the same sweep), but that means no fixed-function blending
+and a **destination read per draw** -- `EXT_shader_framebuffer_fetch` where
+available, a ping-pong FBO where not. That is the real scope of step 2, and
+it is a substantially different engine, not a port of the existing one.
+
+So the honest trade is: ~49x on sprite-bound carts, in exchange for either
+giving up bit-exact blending as a contract (the `prims` golden becomes
+tolerance-based, ±1 per channel) or carrying a destination-read blending path
+on every platform. That is a product decision about what the engine promises,
+not a performance one.
+
 ## Input: gamepad first, always
 
 **wasmcart is a gamepad platform.** The host synthesizes a pad from the
