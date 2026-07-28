@@ -4,9 +4,14 @@
 
 A real Lua 5.4 game engine with a LÖVE-style API: `love.load`, `love.update(dt)`,
 `love.draw`. It compiles to a single reusable engine wasm; you write only Lua,
-the engine is prebuilt and ready. The same `.wasc` runs on every wasmcart host:
-Node, browser, RetroArch, native players, handhelds, and terminals. MIT, all
-layers open.
+the engine is prebuilt and ready. The same `.wasc` runs on every wasmcart host: Node, browser, RetroArch,
+native players, handhelds, and terminals. MIT, all layers open.
+
+Drawing goes through **GL2D**, a batched WebGL2 renderer: one atlas, one draw
+call for a whole frame of sprites, and coverage for circles computed in the
+fragment shader. A software rasterizer is built into the same binary and
+renders anything GL2D does not, so the engine never depends on a feature being
+implemented twice.
 
 wasmcart games are **gamepad games**: design for d-pad + face buttons + sticks
 and they'll feel right on every device (desktop testing maps arrows/z/x onto
@@ -213,7 +218,7 @@ rather than silently doing nothing:
 
 | Missing | Why / what to do |
 |---|---|
-| shaders, meshes | arriving with the GL renderer; use canvases and tinting |
+| custom shaders, meshes | GL2D owns the pipeline; use canvases and tinting |
 | threads | the engine is a single wasm instance |
 | video playback | out of scope |
 | real filesystem | carts have no files; use cart assets + the save region |
@@ -222,13 +227,13 @@ rather than silently doing nothing:
 ## Layout
 
 ```
-runtime/     the engine: runtime.c, physics.c, prelude.lua, build.sh
+runtime/     the engine: runtime.c, render2d_gl.c, physics.c, prelude.lua
 ports/       real third-party games ported to the engine (Cavern)
 template/    copy this to start a game
 examples/    six complete games, all verified rendering
-test/        headless harness + 278 in-engine assertions
+test/        headless harness, 278 in-engine assertions, GL conformance carts
 docs/        porting guide, API reference, architecture
-build/       engine.wasm + packed .wasc carts
+build/       engine.wasm (GL2D) + engine-cpu.wasm (comparator) + .wasc carts
 ```
 
 ## Building the engine
@@ -240,8 +245,32 @@ cd runtime && ./build.sh      # needs emcc + a wasmcart checkout
 ```
 
 The build fetches and pins Lua 5.4.7, applies two small source guards
-(documented in `patch-lua.py`), builds Box2D 3.2.0 with wasm SIMD, and
-links a ~596 KB engine.
+(documented in `patch-lua.py`), builds Box2D 3.2.0 with wasm SIMD, and links
+two artifacts:
+
+| artifact | what it is |
+|---|---|
+| `build/engine.wasm` | **the engine** (~629 KB). GL2D plus the software rasterizer. This is what `template/main.wasm` ships. |
+| `build/engine-cpu.wasm` | software only, imports nothing from `gl`. The comparator the GL build is diffed against, and the fallback for a host with no GL. |
+
+## Performance
+
+GL2D against the software rasterizer, same cart, same frames, on an AMD 890M:
+
+| cart | GL2D | software | |
+|---|---|---|---|
+| the Cavern port | 0.118 ms | 5.666 ms | **47.9x** |
+| pong | 0.024 | 0.049 | 2.07x |
+| breakout | 0.054 | 0.098 | 1.82x |
+| shmup | 0.060 | 0.107 | 1.78x |
+| platformer | 0.132 | 0.187 | 1.41x |
+| kitchen-sink | 0.229 | 0.308 | 1.34x |
+| particles | 0.446 | 0.523 | 1.17x |
+
+Cavern is the honest headline: it is a real ported game, it is sprite-bound,
+and it is the case the renderer was built for. The small examples gain less
+because they were never slow -- at 0.02-0.5 ms a frame, most of what is left
+is fixed per-frame cost rather than drawing.
 
 ## Testing
 
@@ -254,16 +283,37 @@ frames, and any WASI import being called at runtime. It ends with a
 deliberately-broken cart that **must** fail — if that one passes, the harness
 can't see errors and every other green is meaningless.
 
+The `gl2d*` carts check GL against the software rasterizer by **tolerance**,
+not equality: GPU blending rounds differently from the software `div255`, by
+about 1 per blended draw. Sprites, canvases, text and circles hold ±2;
+additive gets ±8 because it accumulates rather than converging. `test/blit`
+and `test/prims` still assert **bit-equality**, against the CPU build.
+
 `test/determinism.js` proves the determinism claim two ways: the same seed
 must give a byte-identical framebuffer, and for carts whose visuals depend on
 RNG a *different* seed must give a different one. Without that second check
 the first is just measuring a constant.
 
 **What has actually been exercised:** headless Node/V8 and the romdev
-harness (spec conformance, screenshots, driven input, debug state). The
-"runs on every wasmcart host" line above is a property of the format — the
-cart is verified spec-conformant and imports nothing but the wasmcart `env`
-module — but it has not been run on a handheld or in a browser here.
+harness (spec conformance, screenshots, driven input, debug state), against a
+real GPU via an offscreen WebGL2 context. The "runs on every wasmcart host"
+line above is a property of the format — the cart is verified spec-conformant
+and imports only the wasmcart `env` and `gl` modules — but it has not been run
+on a handheld or in a browser here.
+
+One consequence of GL2D being the default: `build/engine.wasm` imports the
+`gl` module, which makes it a **GL cart** to every host. That is about whether
+a host supplies a GL context, *not* about how it displays the result --
+rendering on the GPU and printing to a terminal are orthogonal. Give the host
+an offscreen context and a GL cart reads back a normal framebuffer that chafa
+renders as ANSI exactly like a software one; that is precisely what the romdev
+harness does for every screenshot in this repo.
+
+Today `npx wasmcart --term` still refuses GL carts, because it loads without
+a `glBackend` at all rather than because a terminal cannot show one. Until
+that host grows an offscreen context, `engine-cpu.wasm` is the artifact for
+it. The engine also detects a stubbed `gl` module at startup and falls back
+to the software rasterizer rather than rendering a black screen.
 
 ## License
 

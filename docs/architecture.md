@@ -21,7 +21,7 @@ How the engine is put together, and why. Read this before changing
   any wasmcart host              Node, browser, RetroArch, native, handheld
 ```
 
-One prebuilt engine wasm (~596 KB, including Box2D v3) + your Lua source +
+One prebuilt engine wasm (~629 KB, including Box2D v3 and GL2D) + your Lua source +
 your assets, packed into a single `.wasc`. Games never compile anything.
 
 ## Why the API lives in Lua, not C
@@ -74,10 +74,12 @@ imports too, so the fixes paid twice:
 | Lua's string-hash seed (ASLR + time) | `luai_makeseed` overridden in `cartconf.h` — this is what makes `pairs()` order stable |
 | host clock reaching Lua | `os` is never opened |
 
-## Why the engine imports nothing but `env`
+## Why the engine imports nothing but `env` and `gl`
 
 A cart that imports `wasi_snapshot_preview1` functions will not instantiate on
-hosts that provide only the wasmcart `env` module. Getting to zero WASI *calls*
+hosts that provide only the wasmcart `env` module. (The GL build adds the
+`gl` module, which is the spec's own surface; `engine-cpu.wasm` imports `env`
+alone.) Getting to zero WASI *calls*
 took four steps, each documented at its site:
 
 1. **Never open `io`/`os`/`package`.** `open_cart_libs()` in `runtime.c`
@@ -252,146 +254,28 @@ Every manifest here previously omitted the field, which silently defaults to
 booted to "missing asset: main.lua", the Cavern port included. Declaring
 `"assets": "app/"` fixes both modes.
 
-## GL display path (opt-in)
+## GL display path
 
-`runtime/build.sh` with `WCL_GL=1` also produces `build/engine-gl.wasm`: the
-same engine, presenting through `wc_gl_blit` -- the spec's standard display
-path, where even a pure-2D cart uploads its finished pixels as a texture and
-draws one fullscreen quad.
+`wc_gl_blit` -- the spec's standard display path, where a 2D cart uploads its
+finished pixels as a texture and draws one fullscreen quad -- is still how a
+**fallback** frame reaches the screen. It is no longer how normal frames do:
+GL2D renders those directly, so the blit only runs when something drops the
+frame to the software rasterizer.
 
-It is a **separate artifact, not a replacement**, and default OFF. A cart
-*is* a GL cart iff its wasm imports from the `gl` module, and a host handed a
-GL cart with no GL context must fail the load rather than stub it. Shipping
-this as the default would break every 2D-only host these carts run on today,
-for a change that moves no pixels. The default `engine.wasm` is byte-identical
-to one built before any of this existed, and makes zero `gl` calls.
+`tools/gl-verify.mjs` gates that path: it runs a cart that deliberately falls
+back against a real WebGL2 context, reads the GPU framebuffer back, and
+requires it to equal the cart's software framebuffer **exactly**. The blit
+changes only how pixels reach the screen, never what they are.
 
-The software rasterizer remains the reference implementation. `wc_gl_blit`
-changes only *how* pixels reach the screen, so the `blit`/`prims` goldens stay
-valid, and `tools/gl-verify.mjs` asserts the stronger property: run the cart
-against a real WebGL2 context, read the GPU framebuffer back, and diff it
-against the cart's own software framebuffer. Verified pixel-identical (0 of
-921600 differing) on `blit`, `prims`, `kitchen-sink`, `shmup` and Cavern.
-`test/run.js` runs this as `gl-display` when the GL engine and a GL context
-are both present, and skips cleanly otherwise.
+Two things it caught, both worth keeping in mind when reading GL back:
 
-One format detail worth keeping: the framebuffer is XRGB8888 (`0x00RRGGBB`),
-so its bytes run B,G,R,X in little-endian memory, while `wc_gl_blit` uploads
-`GL_RGBA` (R first). The engine repacks into a scratch buffer rather than
-changing the framebuffer format, which the rasterizer and every golden depend
-on. Swapping those two channels is caught by gl-verify as ~23% of pixels
-differing, which is how that path is known to be tested.
-
-Why bother, when this moves no pixels and costs a repack? Because it is the
-step that makes a GPU rasterizer possible later without a flag day. Measured
-on this machine (`tools/gl-probe.js`, AMD 890M via native-gles), 2000
-textured quads cost 0.62 ms batched against 7.45 ms for the software sprite
-path -- 12x, and more against rotated sprites, which are free on a GPU. That
-work is not done here; this commit only moves *presentation*.
-
-### Can a GPU match the software rasterizer? Yes, with two corrections
-
-Step 2 (a GPU *rasterizer*, not just GL presentation) hinges on whether a GPU
-can reproduce `draw_image` bit-exactly. If it cannot, the `blit`/`prims`
-goldens stop being a shared contract and the GL path needs a weaker,
-tolerance-based one. `tools/gl-exactness.mjs` settles it by sweeping every
-destination size from 8 to 200 px against a model of the software sampling
-rule: **all 193 sizes bit-exact**, but only after two corrections.
-
-1. **Sample position.** A GPU interpolates UV and samples at the pixel
-   *centre*; `draw_image` indexes by destination pixel. Deriving the integer
-   index from `gl_FragCoord` and using `texelFetch` takes the interpolator
-   out of the sampling rule entirely.
-2. **`floor()` on an exact boundary.** At scales like 1.5x, `idx*qw/dw` lands
-   *exactly* on an integer for a third of the columns, and fp32 division
-   returns a hair under it, so `floor()` drops a whole texel. Without a small
-   epsilon, **30 of the 193 sizes differ, up to 55% of a sprite's pixels**.
-   Deleting the epsilon makes the sweep fail again, which is how it is known
-   to be doing something.
-
-This is the same family of bug as the reciprocal-multiply one in the software
-blitter: an arithmetically "equivalent" rewrite that selects a different
-texel. It is not driver flakiness -- run-to-run output on this driver is
-byte-identical.
-
-### Why step 2 is not just "put sprites on the GPU"
-
-The blocker is not exactness, it is **mixing**. The GPU path composites into
-the GL framebuffer while the software path writes `wc_framebuffer`, and
-software cannot see pixels the GPU drew. Any frame that uses both produces
-wrong output, and rotation, canvas targets, scissor and additive blending all
-have to fall back to software.
-
-Real carts mix constantly -- Cavern issues 34 `love.graphics.draw` calls
-against 36 rectangle/print/circle calls per frame, interleaved. Reconciling
-the two costs ~0.19 ms per switch (0.109 readback + 0.084 upload, measured),
-which is cheap once and ruinous seventy times.
-
-So step 2 is **the whole 2D pipeline on the GPU**, not a sprite fast path
-bolted onto a software rasterizer. That is a much larger change than step 1,
-and it is why step 1 shipped separately: presentation moved with zero pixel
-risk, and the exactness question above is now answered before committing to
-the rest.
-
-### What a full 2D GPU pipeline would cost and buy
-
-The performance case is not in doubt. `tools/gl-pipeline-probe.mjs` models a
-Cavern-shaped frame (34 textured sprite quads + 36 vector draws, each with
-its own uniforms) fully on the GPU: **0.11 ms against 5.50 ms software, ~49x**.
-Per-draw overhead is not a blocker either -- gl calls issued from wasm cost
-about **0.002 ms** each and account for 12% of a GL frame; the other 88% is
-the software rasterizer that the rewrite would delete. (An earlier reading of
-"64 us per gl call" was an artifact of dividing whole-frame time by call
-count, and is wrong.)
-
-The blocker is **bit-exactness of blended primitives**, and it is specific:
-
-- **Sprites**: exact, over all 193 swept sizes (above).
-- **Opaque primitives**: exact, once colours are passed as 0..255 integers
-  rather than floats. A float uniform of `0.35` is not the same value as
-  `89/255`, which alone put every pixel off by one.
-- **Blended primitives**: **cannot** match with fixed-function blending. The
-  GPU computes `src*a + dst*(1-a)` in normalized floats and rounds at 8 bit;
-  `blend_span` uses the exact `div255` multiply-shift. Those disagree on
-  **39.7% of (alpha, src, dst) combinations**, always by exactly 1.
-
-A shader doing the integer math itself reproduces `div255` exactly (0
-disagreements over the same sweep), but that means no fixed-function blending
-and a **destination read per draw** -- `EXT_shader_framebuffer_fetch` where
-available, a ping-pong FBO where not. That is the real scope of step 2, and
-it is a substantially different engine, not a port of the existing one.
-
-So the honest trade is: ~49x on sprite-bound carts, in exchange for either
-giving up bit-exact blending as a contract (the `prims` golden becomes
-tolerance-based, ±1 per channel) or carrying a destination-read blending path
-on every platform. That is a product decision about what the engine promises,
-not a performance one.
-
-### Prior art: wasmcart-mruby's GL2D backend
-
-The sibling `wasmcart-mruby` runtime already shipped this (`runtime/
-render2d_gl.c`, ~500 lines), which settles both open questions empirically:
-
-**It took the tolerance route.** It uses ordinary fixed-function blending
-(`glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)`), and its A/B checker
-compares with a tolerance of 8/255. Re-running that comparison at ZERO
-tolerance on Tetris: **~19% of pixels differ by exactly 1**, max delta 3,
-nothing above 8. So "pixel-equivalent" there means visually identical, not
-bit-identical -- exactly the `div255`-vs-float-rounding gap measured above,
-confirmed on a shipping implementation rather than in a probe.
-
-**It solves the mixing problem by not mixing.** `wy_r2d_disable()` makes the
-CPU fallback **whole-frame and sticky**: any unsupported operation (a render
-target, a TTF label, an `@rt:` sprite, a Ruby error) drops that entire frame
-to the software rasterizer, which is then presented with `wc_gl_blit`. There
-is no per-draw reconciliation, so the ~0.19 ms readback/upload cost never
-lands in the inner loop. That is a much better answer than the per-draw
-synchronisation this project was sizing, and it is the design to copy.
-
-Measured here on Tetris (1500 frames, this machine): **GL 0.377 ms vs CPU
-1.157 ms, 3.1x** -- consistent with the 2-14x range that backend reports, and
-well short of the 49x an idealised probe suggests, because a real cart is not
-purely fill-bound.
+- the framebuffer is XRGB8888 (`0x00RRGGBB`), so its bytes run B,G,R,X, while
+  `wc_gl_blit` uploads `GL_RGBA` (R first). The engine repacks rather than
+  changing a framebuffer format the whole rasterizer depends on. Swapping
+  those two channels shows up as ~23% of pixels differing.
+- `readPixels`' origin is bottom-left while the framebuffer's is top-left,
+  which made a **correct** blit look 55% wrong until the comparison
+  accounted for it.
 
 ## GL2D (the default)
 
@@ -503,31 +387,49 @@ the row offset, and `mediump` is only guaranteed ~10 bits of mantissa in
 GLES -- at r=66 that put 24 pixels a whole pixel outside the software fill.
 Colour and UVs stay `mediump`.
 
-**The CPU fallback is whole-frame and sticky.** What GL2D still does not
-implement -- concave polygon fills and the Lua error screen -- calls
-`wcl_r2d_disable()`,
-and from then on every frame is rasterized in software and presented with one
-`wc_gl_blit`. Reconciling per draw would cost ~0.19 ms each way, which a real
-frame pays dozens of times. Cavern uses canvases, so it takes this path and
-is bit-identical to the CPU build.
+**The CPU fallback is whole-frame and sticky.** Two things still take it, and
+both are deliberate rather than unfinished:
 
-Measured (400-600 frames each):
+- **self-intersecting polygon fills**, because even-odd leaves the overlap as
+  a hole and any triangulation of the outline would fill it in. That is a
+  wrong answer, not a missing feature.
+- **the Lua error screen**, which is CPU-drawn by design so it still appears
+  when the cart itself is broken.
 
-| cart | speedup |
-|---|---|
-| `test/gl2dcanvas` (render targets) | **113x** |
-| **the Cavern port** | **49.5x** |
-| `test/gl2d` (sprites, rotation, scissor) | **18x** |
-| `test/gl2dtext` (text-only) | **2.9x** |
+Anything that trips one calls `wcl_r2d_disable()`, and from then on every
+frame is rasterized in software and presented with one `wc_gl_blit`.
+Reconciling per draw instead would cost ~0.19 ms each way, which a real frame
+pays dozens of times.
 
-Cavern is the one that matters: it was the motivating case, it uses canvases
-*and* TTF, and it ran entirely on the software rasterizer until both landed.
-The text-only cart is lowest because a frame of nothing but text is cheap in
-software too, so the fixed per-frame GL cost is a larger share.
+The stickiness has a sharp edge worth knowing: **anything that trips the
+fallback during `love.load` costs the cart GL for its entire life.** That is
+not hypothetical -- GL2D used to initialize on the first `wc_render`, so a
+cart preparing art in a canvas at load time (a standard LÖVE pattern) lost GL
+permanently and silently. `kitchen-sink` was doing exactly that and ran at
+0.54x until initialization moved ahead of `love.load`.
 
-Circles are still a deliberate fallback rather than an approximation: a GL
-triangle fan does not reproduce the software span fill, and a circle is
-nearly all boundary at small radii.
+Measured on the real carts, 300 frames each, AMD 890M via native-gles:
+
+| cart | GL2D | software | |
+|---|---|---|---|
+| **the Cavern port** | 0.118 ms | 5.666 ms | **47.9x** |
+| pong | 0.024 | 0.049 | 2.07x |
+| breakout | 0.054 | 0.098 | 1.82x |
+| shmup | 0.060 | 0.107 | 1.78x |
+| platformer | 0.132 | 0.187 | 1.41x |
+| kitchen-sink | 0.229 | 0.308 | 1.34x |
+| particles | 0.446 | 0.523 | 1.17x |
+
+Cavern is the honest headline: a real ported game, sprite-bound, and the case
+the renderer was built for. The small examples gain less because they were
+never slow -- at 0.02-0.5 ms a frame, most of what remains is fixed per-frame
+cost rather than drawing.
+
+**Benchmark the real carts, not the feature carts.** Every `gl2d*` conformance
+cart looked excellent while three examples were at or below 1.0x, and the two
+bugs behind that (unbatched circles, GL initializing after `love.load`) were
+invisible in the synthetic ones. Each feature cart exercises its feature in
+isolation, which is exactly the shape that hides a per-draw or per-frame cost.
 
 Sloped lines stay a known gap. GL rasterizes lines by its own
 implementation-defined diamond-exit rule, which does not have to match
