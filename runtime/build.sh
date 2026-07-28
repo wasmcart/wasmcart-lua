@@ -106,6 +106,7 @@ cp ../build/engine.wasm ../template/main.wasm
 if [ -d ../examples/pong/app ]; then
   node "$WASMCART_REPO/bin/wasmcart-pack.js" \
     --wasm ../build/engine.wasm --assets ../examples/pong/app \
-    --name pong -o ../build/pong.wasc > /dev/null
+    --name pong --width 1280 --height 720 \
+    -o ../build/pong.wasc > /dev/null
   echo "packed ../build/pong.wasc"
 fi

@@ -62,7 +62,8 @@ my-game/
 When you want a shippable single file:
 
 ```bash
-npx wasmcart pack --wasm main.wasm --assets app --name my-game -o my-game.wasc
+npx wasmcart pack --wasm main.wasm --assets app --name my-game \
+  --width 1280 --height 720 -o my-game.wasc
 ```
 
 One `.wasc` that runs on every wasmcart host. Only rebuild the engine if

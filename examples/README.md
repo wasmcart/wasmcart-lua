@@ -24,5 +24,5 @@ Or pack it:
 
 ```bash
 npx wasmcart pack --wasm ../../build/engine.wasm --assets app \
-  --name pong -o pong.wasc
+  --name pong --width 1280 --height 720 -o pong.wasc
 ```

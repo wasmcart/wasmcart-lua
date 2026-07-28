@@ -201,6 +201,7 @@ Or pack the single-file cart (4.6 MB):
 
 ```bash
 npx wasmcart pack --wasm ../../build/engine.wasm --assets app \
+  --width 1280 --height 720 \
   --name cavern --players 4 --pointer -o cavern.wasc
 ```
 
