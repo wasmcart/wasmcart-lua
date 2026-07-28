@@ -1,0 +1,8 @@
+{
+  "name": "kitchen-sink",
+  "version": "1.0.0",
+  "abi": 3,
+  "entry": "main.wasm",
+  "players": 4,
+  "debug": true
+}

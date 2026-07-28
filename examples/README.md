@@ -1,0 +1,28 @@
+# Examples
+
+Six complete games, each exercising a different part of the engine. All are
+verified rendering (not just "runs without crashing").
+
+| example | what it demonstrates |
+|---|---|
+| `pong` | two-player pads, rectangles, deterministic RNG, beeps |
+| `breakout` | save data (persisted high score), game states, brick collision |
+| `platformer` | `require` of a lib, tile collision, gravity, scrolling camera |
+| `shmup` | coroutine-scripted waves, entity pools, additive blending |
+| `particles` | 900 particles, canvases, blend modes, stress test |
+| `kitchen-sink` | every v1 API in one screen; the contract example |
+
+Run one:
+
+```bash
+cd examples/pong
+cp ../../build/engine.wasm main.wasm
+npx wasmcart .
+```
+
+Or pack it:
+
+```bash
+npx wasmcart pack --wasm ../../build/engine.wasm --assets app \
+  --name pong -o pong.wasc
+```
