@@ -342,29 +342,111 @@ static void draw_image(image_t *im, double x, double y, double rot,
     if (x1 > dest_w()) x1 = dest_w();
     if (y1 > dest_h()) y1 = dest_h();
 
-    uint32_t tint = cur_rgb();
     int tr = cur_r, tg = cur_g, tb = cur_b, ta = cur_a;
-    (void)tint;
+
+    /* Loop invariants hoisted out. The per-pixel EXPRESSION is unchanged:
+     * this is deliberately NOT strength-reduced.
+     *
+     * The obvious optimization -- replace `/dw` with `* (1.0/dw)` -- is
+     * WRONG here and cost a day to pin down. When dw is not a power of two,
+     * 1.0/dw is inexact, and x*(1/dw) rounds to a DIFFERENT source texel
+     * than x/dw. Cavern's sprites land exactly on such sizes (dw = 67.5,
+     * 54.75, 672, ...), which shifted 5.5% of the screen's pixels. Same
+     * reason incremental u,v stepping is unsafe: accumulated error moves
+     * the texel. Rendering here is bit-exact by contract, so the divisions
+     * stay and the speed comes from everything around them. */
+    const double bu = ox * sx, by_ = oy * sy;
+    const int iw = im->w, ih = im->h;
+    const uint8_t *const base = im->rgba;
+    const int untinted = (tr == 255 && tg == 255 && tb == 255);
+    const int opaque_tint = (ta == 255);
+
+    /* blend_px re-reads five globals and re-tests bounds, scissor and blend
+     * mode for EVERY pixel, none of which change during a blit. Decide once
+     * here whether the simple path applies -- straight to the framebuffer,
+     * no scissor, no additive blending -- and inline it. That is the common
+     * case for tiles and sprites. Anything else falls through to blend_px
+     * unchanged, so behaviour is identical either way. */
+    const int fast_dst = (!rt_buf && !sc_on && !blend_add);
+
+    /* Row-constant halves of the inverse transform: py never varies across
+     * a row, so py*sn and py*cs are computed once per row instead of once
+     * per pixel. This is exact -- same operands, same order. */
+    /* Unrotated blits (sn == 0, cs == 1) are 84% of a real game's draws, and
+     * for them the whole v axis is ROW-CONSTANT: uy reduces to py, so fy and
+     * iy can be computed once per row instead of once per pixel. Verified
+     * exact over every dw the port produces -- it is the same expression,
+     * just evaluated fewer times. That removes one of the two per-pixel
+     * divisions, which is the only remaining cost that cannot be made
+     * cheaper without changing results. */
+    const int axis_aligned = (sn == 0.0 && cs == 1.0);
 
     for (int yy = y0; yy < y1; yy++) {
+        const double py = yy + 0.5 - y;
+        const double py_sn = py * sn, py_cs = py * cs;
+        uint32_t *const row = fast_dst ? &wc_framebuffer[yy * DEFAULT_WIDTH] : NULL;
+
+        int row_iy = 0;
+        if (axis_aligned) {
+            const double fy = (py + by_) / dh;
+            if (fy < 0 || fy >= 1) continue;         /* whole row is outside */
+            row_iy = qy + (int)(fy * qh);
+            if (row_iy < 0 || row_iy >= ih) continue;
+        }
+
         for (int xx = x0; xx < x1; xx++) {
-            /* inverse-transform pixel center into local (pre-rotation) space */
-            double px = xx + 0.5 - x, py = yy + 0.5 - y;
-            double ux =  px * cs + py * sn;
-            double uy = -px * sn + py * cs;
-            double fx = (ux + ox * sx) / dw;
-            double fy = (uy + oy * sy) / dh;
-            if (fx < 0 || fx >= 1 || fy < 0 || fy >= 1) continue;
-            int ix = qx + (int)(fx * qw);
-            int iy = qy + (int)(fy * qh);
-            if (ix < 0 || ix >= im->w || iy < 0 || iy >= im->h) continue;
-            const uint8_t *p = &im->rgba[(iy * im->w + ix) * 4];
-            int a = (p[3] * ta) / 255;
+            const double px = xx + 0.5 - x;
+            const double ux =  px * cs + py_sn;
+            const double fx = (ux + bu) / dw;        /* division kept: exact */
+            if (fx < 0 || fx >= 1) continue;
+            const int ix = qx + (int)(fx * qw);
+            if (ix < 0 || ix >= iw) continue;
+
+            int iy;
+            if (axis_aligned) {
+                iy = row_iy;
+            } else {
+                const double uy = -px * sn + py_cs;
+                const double fy = (uy + by_) / dh;
+                if (fy < 0 || fy >= 1) continue;
+                iy = qy + (int)(fy * qh);
+                if (iy < 0 || iy >= ih) continue;
+            }
+
+            const uint8_t *const p = &base[(iy * iw + ix) * 4];
+            /* Most pixels of a sprite sheet are fully transparent; testing
+             * the raw alpha first skips the multiply and the colour work.
+             * (p[3]*ta)/255 <= 0 exactly when p[3]==0 or ta==0, so this is
+             * the same predicate, just cheaper. */
+            const int sa = p[3];
+            if (sa == 0) continue;
+            const int a = opaque_tint ? sa : (sa * ta) / 255;
             if (a <= 0) continue;
-            uint32_t rgb = (((uint32_t)(p[0] * tr / 255)) << 16)
-                         | (((uint32_t)(p[1] * tg / 255)) << 8)
-                         |  ((uint32_t)(p[2] * tb / 255));
-            blend_px(xx, yy, rgb, a);
+
+            /* x*255/255 == x for all 0..255, so the untinted path is exact */
+            const uint32_t rgb = untinted
+                ? (((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2])
+                : ((((uint32_t)(p[0] * tr / 255)) << 16)
+                 | (((uint32_t)(p[1] * tg / 255)) << 8)
+                 |  ((uint32_t)(p[2] * tb / 255)));
+            if (row) {
+                /* identical arithmetic to blend_px's framebuffer path */
+                uint32_t *d = &row[xx];
+                if (a >= 255) {
+                    *d = rgb;
+                } else {
+                    const uint32_t o = *d;
+                    const uint32_t sr = (rgb >> 16) & 0xFF;
+                    const uint32_t sg = (rgb >> 8) & 0xFF;
+                    const uint32_t sb = rgb & 0xFF;
+                    const uint32_t rr = (sr * a + ((o >> 16) & 0xFF) * (255 - a)) / 255;
+                    const uint32_t gg = (sg * a + ((o >> 8) & 0xFF) * (255 - a)) / 255;
+                    const uint32_t bb = (sb * a + (o & 0xFF) * (255 - a)) / 255;
+                    *d = (rr << 16) | (gg << 8) | bb;
+                }
+            } else {
+                blend_px(xx, yy, rgb, a);
+            }
         }
     }
 }

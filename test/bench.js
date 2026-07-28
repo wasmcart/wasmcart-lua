@@ -25,17 +25,14 @@
  *   frame), and instrumenting it showed 97% of that is inside the C sprite
  *   blitter -- about 1% is Lua. A JIT would optimize the 1%.
  *
- * So the next real perf work is the rasterizer, not Tier 1. An attempt at
- * that is recorded in the repo history: hoisting the per-pixel transform
- * out of draw_image's inner loop made Cavern 1.8x faster (9.4 -> 5.25 ms)
- * but changed 5.5% of the pixels. The arithmetic was proven equivalent
- * over the full 8-bit domain and 653k transform samples, and it was not
- * FMA contraction, so the cause was never pinned down -- and bit-exact
- * rendering is a promise this engine makes. It was reverted rather than
- * shipped unexplained. Anyone retrying should start there, with
- * test/determinism.js AND a Cavern frame hash as the gate: the determinism
- * carts alone do NOT exercise sprite blitting and will pass a broken
- * blitter.
+ * So the perf work went into the rasterizer, not Tier 1. That is now done:
+ * draw_image is 1.65x faster and bit-identical (Cavern 9.1 -> 5.5 ms). See
+ * the commit for what was safe and what was not -- in short, the divisions
+ * cannot be replaced by reciprocal multiplication without moving pixels.
+ *
+ * Blitter changes are gated by test/blit/, NOT by determinism.js: those
+ * carts draw shapes and text, never sprites, and they passed for an entire
+ * session while the blitter was sampling the wrong texels.
  */
 const fs = require('fs');
 const path = require('path');

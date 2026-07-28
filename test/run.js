@@ -128,6 +128,7 @@ async function runCart(wasmPath, appDir, frames, opts = {}) {
   }
 
   return { info, logs, marks, trap, top, fields, ms, frames,
+           fb: new Uint8Array(mem.buffer, info.fbPtr, info.w * info.h * 4).slice(),
            wasi: [...wasiCalled], uniformity: top[0] ? top[0].pct : 100 };
 }
 
@@ -193,6 +194,41 @@ async function main() {
       failed++;
     } else {
       console.log(`\nok    unit         ${unitTotal} assertions passed in-engine`);
+    }
+  }
+
+  // ── the sprite blitter must not change, ever ──────────────────────
+  // determinism.js does NOT cover this: its carts draw shapes and text, and
+  // it passed for an entire session while the blitter sampled wrong texels.
+  // This hashes a frame that exercises every blit argument shape, including
+  // the non-power-of-two fractional-scale case that actually broke.
+  const blitDir = path.join(ROOT, 'test', 'blit');
+  const blitGolden = path.join(blitDir, 'golden.txt');
+  if (fs.existsSync(path.join(blitDir, 'main.lua'))) {
+    const rb2 = await runCart(ENGINE, blitDir, 3);
+    if (rb2.trap || rb2.fields.lua_ok === 0) {
+      console.log(`\nFAIL  blit  cart did not run: ${rb2.trap || 'lua error'}`);
+      for (const l of rb2.logs.slice(0, 6)) console.log(`      ${l}`);
+      failed++;
+    } else {
+      const crypto = require('crypto');
+      const hash = crypto.createHash('sha256')
+        .update(Buffer.from(rb2.fb)).digest('hex').slice(0, 16);
+      if (!fs.existsSync(blitGolden)) {
+        fs.writeFileSync(blitGolden, hash + '\n');
+        console.log(`\nok    blit         golden recorded (${hash})`);
+      } else {
+        const want = fs.readFileSync(blitGolden, 'utf8').trim();
+        if (hash === want) {
+          console.log(`\nok    blit         sprite output unchanged (${hash})`);
+        } else {
+          console.log(`\nFAIL  blit  sprite output CHANGED`);
+          console.log(`      golden ${want}`);
+          console.log(`      got    ${hash}`);
+          console.log(`      if this change is intended, delete test/blit/golden.txt`);
+          failed++;
+        }
+      }
     }
   }
 
