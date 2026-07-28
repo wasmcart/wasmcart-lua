@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "abi": 3,
   "entry": "main.wasm",
+  "assets": "app/",
   "players": 4,
   "pointer": true,
   "debug": true

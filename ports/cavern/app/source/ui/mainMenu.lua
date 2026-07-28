@@ -15,6 +15,72 @@ buttons[4] = {gameWidth - smSize - smOffset, gameHeight - smSize - smOffset, smS
 -- This value stores the message displayed at the bottom of the menu
 buttons.message = ""
 
+-- GAMEPAD NAVIGATION (added for the wasmcart port).
+--
+-- Upstream Cavern is a mouse game: the menu highlights on hover and acts on
+-- click, with no notion of a "selected" item. wasmcart is gamepad-first --
+-- the host synthesizes a pad from the keyboard when no physical pad is
+-- present, so love.pad is the input every cart can rely on and a mouse is
+-- the thing that may not exist. A pad host cannot produce a hover, so this
+-- menu was literally unstartable there.
+--
+-- The pad therefore OWNS the selection. The mouse is kept as an optional
+-- convenience on hosts that have one: hovering moves the pad's cursor rather
+-- than running a second, parallel notion of focus.
+buttons.sel = 1
+
+-- Only the two big menu entries are reachable with the pad. The corner
+-- sound/GitHub buttons stay mouse-only on purpose: opening a URL is
+-- meaningless on a console host, and a pad user should not be able to land
+-- on it by accident.
+local PAD_ITEMS = 2
+
+-- Per-frame pad handling for the menu. Called from love.update.
+function buttons:padUpdate()
+
+  if gameState.room ~= "rmMainMenu" then return end
+
+  local move = 0
+  if love.pad.wasPressed(1, "up")   then move = -1 end
+  if love.pad.wasPressed(1, "down") then move =  1 end
+  -- analog stick, for pads whose d-pad is not wired
+  if move == 0 then
+    local ly = love.pad.axis(1, "lefty")
+    if ly < -0.6 and not self.stickHeld then move = -1; self.stickHeld = true
+    elseif ly > 0.6 and not self.stickHeld then move = 1; self.stickHeld = true
+    elseif math.abs(ly) < 0.3 then self.stickHeld = false end
+  end
+
+  if move ~= 0 then
+    self.sel = self.sel + move
+    if self.sel < 1 then self.sel = PAD_ITEMS end
+    if self.sel > PAD_ITEMS then self.sel = 1 end
+    soundManager:play("click")
+  end
+
+  -- Confirm. Accept BOTH face buttons plus start: which physical button is
+  -- "confirm" differs by platform convention (and by how a given host maps
+  -- its pad), and guessing wrong strands the player on the title screen with
+  -- no way into the game at all. Being permissive here costs nothing.
+  if love.pad.wasPressed(1, "a") or love.pad.wasPressed(1, "b")
+     or love.pad.wasPressed(1, "start") then
+    self:activate(self.sel)
+  end
+
+end
+
+-- On hosts that HAVE a mouse, hovering just moves the pad cursor, so there
+-- is only ever one selection. Returns true if the mouse claimed a button.
+function buttons:syncMouse()
+  for i = 1, PAD_ITEMS do
+    if self:mouseCheck(self[i]) then
+      self.sel = i
+      return true
+    end
+  end
+  return false
+end
+
 -- This function draws everything on the Main Menu
 function menuDraw()
 
@@ -27,7 +93,7 @@ function menuDraw()
     -- Start message off as nothing, will be updated if hovering over a button
     buttons.message = ""
 
-    for _,b in ipairs(buttons) do
+    for i,b in ipairs(buttons) do
 
       -- Get attributes stored for the current button
       local bX = b[1] * scale;
@@ -36,7 +102,7 @@ function menuDraw()
       local bH = b[4] * scale;
       local bText = b[5];
 
-      if buttons:mouseCheck(b) then -- if the mouse is over the button...
+      if buttons:isFocused(b, i) then -- the current selection
 
         -- Button border
         -- love.graphics.setColor(0.384, 0.604, 0.475) -- enemy color
@@ -81,6 +147,14 @@ function menuDraw()
 
 end
 
+-- Is this button the one the player is currently on? The two pad-navigable
+-- entries follow buttons.sel; the mouse-only corner buttons still light up
+-- on hover, on hosts that have a mouse.
+function buttons:isFocused(b, i)
+  if i and i <= PAD_ITEMS then return self.sel == i end
+  return self:mouseCheck(b)
+end
+
 -- Check if the mouse is inside the passed button
 function buttons:mouseCheck(b)
 
@@ -111,8 +185,17 @@ function buttons:click()
 
     -- If the mouse is on the current button...
     if buttons:mouseCheck(b) then
+      self:activate(i)
+    end
 
-      -- The button has been clicked
+  end
+
+end
+
+-- The actual effect of button `i`, independent of which device chose it.
+function buttons:activate(i)
+
+  do
 
       if i == 1 then -- New Game button
 
@@ -150,8 +233,6 @@ function buttons:click()
       end
 
       soundManager:play("click")
-
-    end
 
   end
 

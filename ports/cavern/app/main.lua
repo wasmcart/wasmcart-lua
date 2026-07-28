@@ -28,6 +28,20 @@ function love.update(dt)
   scroll:update(dt)
   textBox:update(dt)
 
+  -- wasmcart is gamepad-first: the host synthesizes a pad from the keyboard
+  -- when no physical pad is attached, so love.pad is the input that always
+  -- exists. Upstream drove this menu from mouse hover + click alone, which
+  -- left the game unstartable on a pad host.
+  buttons:padUpdate()
+  if love.mouse then buttons:syncMouse() end
+
+  -- The intro text advances on any confirm press, matching the keyboard
+  -- path upstream (which any key interrupted).
+  if love.pad.wasPressed(1, "a") or love.pad.wasPressed(1, "start")
+     or love.pad.wasPressed(1, "b") then
+    intro:interrupt()
+  end
+
 end
 
 function love.draw()

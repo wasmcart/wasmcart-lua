@@ -234,22 +234,45 @@ passes, the harness cannot detect failure and every other result is
 unverified. A suite that only ever goes green is indistinguishable from a
 suite that is broken.
 
-## Packing a cart (known gap)
+## Packing a cart
 
-`app/main.lua` is the DEV layout: `npx wasmcart <dir>` serves assets relative
-to `app/`, so the engine's request for `main.lua` resolves. A packed `.wasc`
-keeps the `app/` prefix verbatim, and the engine does not strip it, so a cart
-packed straight from a dev directory boots to "missing asset: main.lua".
+The manifest declares where assets live:
 
-Until that is reconciled, pack from a FLAT directory -- `main.wasm`,
-`manifest.json` and the Lua/assets at the top level. Verified through the
-romdev host: the flat cart renders a frame pixel-identical to the Node test
-harness, the `app/`-nested one fails to find its entry point.
+```json
+{ "entry": "main.wasm", "assets": "app/" }
+```
 
-This affects every cart in the repo equally (the Cavern port included); it is
-a packaging convention mismatch, not an engine bug. The fix is a decision
-about which layout is canonical, so it is written down here rather than
-guessed at.
+The host reads `manifest.assets` in BOTH modes -- dev mode joins it as a
+directory, a packed `.wasc` strips it as a path prefix -- so one field covers
+both and the trailing slash is required (without it the prefix strip leaves a
+leading `/` and every asset lookup misses).
+
+Every manifest here previously omitted the field, which silently defaults to
+`assets/` while the files actually live in `app/`. Packed carts therefore
+booted to "missing asset: main.lua", the Cavern port included. Declaring
+`"assets": "app/"` fixes both modes.
+
+## Input: gamepad first, always
+
+**wasmcart is a gamepad platform.** The host synthesizes a pad from the
+keyboard when no physical controller is attached, so `love.pad` is the one
+input a cart can always rely on. A mouse or touch pointer may not exist.
+
+Carts should read `love.pad` (and `love.keyboard`, which the prelude maps
+onto pad 1). Anything driven only by `love.mouse` -- especially the
+`love.mousepressed` EVENT -- is a gap: the prelude synthesizes clicks from
+the pad at a virtual cursor, but that cursor starts at screen centre, so a
+hover-and-click menu is unreachable until the player nudges it onto a target.
+
+That is not hypothetical. Cavern is a mouse game upstream, and its main menu
+had no notion of a selected item, so on a pad host the game could not be
+started at all. Its menu now keeps an explicit selection driven by
+`love.pad`, with the mouse as an optional convenience that moves the same
+cursor. Confirm accepts both face buttons and start, because which button
+reads as "confirm" varies by host mapping and guessing wrong strands the
+player on the title screen.
+
+All six examples were already gamepad-only and needed no change.
 
 ## Adding to the API
 
