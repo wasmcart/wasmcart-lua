@@ -34,6 +34,14 @@ end
 
 ## Quick start
 
+**Just want to play something?** Eight prebuilt carts are attached to the
+[latest release](https://github.com/wasmcart/wasmcart-lua/releases/latest) —
+including Cavern, a complete LÖVE adventure game. Download one and run it:
+
+```bash
+npx wasmcart cavern.wasc
+```
+
 **The engine wasm ships in this repo.** You never build or install a
 toolchain — add your Lua and assets, and pack.
 
