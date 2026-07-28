@@ -124,11 +124,24 @@ static const char *FRAGMENT_SHADER =
     "  if (u_textured != 0) frag_color *= texture(u_tex, v_uv);\n"
     "}\n";
 
+/* Set when a shader or the program reports failure.
+ *
+ * On a real driver this would mean the GLSL below is wrong -- a CART bug, to
+ * be fixed in the shader, not worked around here. Both shaders are verified
+ * to compile on a real GLES3 driver, so that is not the case being handled.
+ *
+ * What this actually catches is a host that STUBS the `gl` module: every
+ * import returns 0, so glGetShaderiv reports "not compiled" for a shader
+ * that never existed. Indistinguishable from a compile error at this level,
+ * and the response is the same either way -- do not pretend GL works. */
+static int gl_broken;
+
 static void log_obj(GLuint object, const char *what, int shader) {
     GLint ok = 0, len = 0;
     if (shader) glGetShaderiv(object, GL_COMPILE_STATUS, &ok);
     else glGetProgramiv(object, GL_LINK_STATUS, &ok);
     if (ok) return;
+    gl_broken = 1;
     if (shader) glGetShaderiv(object, GL_INFO_LOG_LENGTH, &len);
     else glGetProgramiv(object, GL_INFO_LOG_LENGTH, &len);
     if (len > 0 && len < 512) {
@@ -274,6 +287,27 @@ int wcl_r2d_init(int w, int h) {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     blend_enabled = -1;
     textured_enabled = -1;
+
+    /* A host that stubs the `gl` module (every call returns 0) gets here
+     * with nothing actually compiled. Rendering into that produces a black
+     * frame with no error, which is the worst failure mode available, so
+     * treat it as no GL at all and stay on the software rasterizer. */
+    if (gl_broken || !program || !atlas_texture) {
+        /* Either the host stubbed `gl` (the usual cause: every call returns
+         * 0) or the shaders genuinely failed. The second would be a bug in
+         * this file and shows up on every host; the log line is deliberately
+         * about the outcome rather than guessing which. */
+        WC_LOG("gl2d: no usable GL context, using the software rasterizer");
+        cpu_mode = 1;
+        frame_disabled = 1;
+        /* ready stays 0 on purpose, which also suppresses the wc_gl_blit in
+         * wcl_r2d_end: if the gl module is stubbed then the blit cannot
+         * present either, and a 2D host reads fb_ptr directly. Attempting it
+         * would just be more no-op calls on the way to the same frame. */
+        ready = 0;
+        return 0;
+    }
+
     ready = 1;
     return 1;
 }
