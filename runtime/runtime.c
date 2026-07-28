@@ -21,6 +21,7 @@
 #define WC_USE_GL   /* must precede wasmcart.h: gates the "gl" import block */
 #endif
 #include "wasmcart.h"
+#include "render2d_gl.h"
 #include "wc_cart.h"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -305,6 +306,10 @@ static inline uint32_t cur_rgb(void) {
 
 static void fill_rect(int x, int y, int w, int h, uint32_t c, int a) {
     if (a <= 0 || w <= 0 || h <= 0) return;
+    /* GL only owns the screen; a canvas target, scissor or additive blending
+     * is not modelled here, so those keep the software path (and have
+     * already forced cpu_mode via wcl_r2d_disable). */
+    if (!rt_buf && !sc_on && !blend_add && wcl_r2d_solid(x, y, w, h, c, a)) return;
     int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
     int x1 = x + w > dest_w() ? dest_w() : x + w;
     int y1 = y + h > dest_h() ? dest_h() : y + h;
@@ -313,6 +318,7 @@ static void fill_rect(int x, int y, int w, int h, uint32_t c, int a) {
 
 static void raster_line(int x0, int y0, int x1, int y1, uint32_t c, int a) {
     if (a <= 0) return;
+    if (!rt_buf && !sc_on && !blend_add && wcl_r2d_line(x0, y0, x1, y1, c, a)) return;
     int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
     int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
     int err = dx + dy;
@@ -351,6 +357,9 @@ static void raster_line(int x0, int y0, int x1, int y1, uint32_t c, int a) {
 
 static void raster_circle(int cx, int cy, int r, uint32_t c, int a, int filled) {
     if (r <= 0) return;
+    /* Circles are span-filled in software. Rather than approximate them with
+     * a triangle fan (which would not match), drop to the CPU backend. */
+    wcl_r2d_disable();
     if (filled) {
         for (int yy = -r; yy <= r; yy++) {
             int span = (int)(sqrt((double)(r * r - yy * yy)) + 0.5);
@@ -382,6 +391,8 @@ static void raster_circle(int cx, int cy, int r, uint32_t c, int a, int filled) 
 static void raster_polygon(const double *xs, const double *ys, int n,
                            uint32_t c, int a, int filled) {
     if (n < 3) return;
+    /* Scanline-filled in software; no GL equivalent here yet. */
+    wcl_r2d_disable();
     if (!filled) {
         for (int i = 0; i < n; i++) {
             int j = (i + 1) % n;
@@ -517,6 +528,19 @@ static void draw_image(image_t *im, double x, double y, double rot,
     if (y1 > dest_h()) y1 = dest_h();
 
     int tr = cur_r, tg = cur_g, tb = cur_b, ta = cur_a;
+
+    /* GL sprite path: axis-aligned, to the screen, ordinary alpha blending.
+     * Rotation, canvas targets, scissor and additive all stay on the
+     * software path (and have already tripped cpu_mode). */
+    if (sn == 0.0 && cs == 1.0 && !rt_buf && !sc_on && !blend_add) {
+        const int ddx = (int)(x - ox * sx), ddy = (int)(y - oy * sy);
+        if (wcl_r2d_sprite(im->rgba, im->w, im->h,
+                           ddx, ddy, (int)dw, (int)dh,
+                           qx, qy, qw, qh,
+                           (uint32_t)((tr << 16) | (tg << 8) | tb), ta)) {
+            return;
+        }
+    }
 
     /* Loop invariants hoisted out. The per-pixel EXPRESSION is unchanged:
      * this is deliberately NOT strength-reduced.
@@ -713,6 +737,10 @@ static int glyph_index(char ch) {
 
 /* y is the TOP of the text box (LOVE convention) */
 static void draw_bitfont(int x, int y_top, const char *s, int scale, uint32_t c, int a) {
+    /* Glyphs are drawn as many tiny filled rects. They would batch fine, but
+     * the TTF path next to them rasterizes into the CPU target, so text as a
+     * whole stays on one backend for consistent output. */
+    wcl_r2d_disable();
     if (scale < 1) scale = 1;
     int cx = x;
     for (; *s; s++) {
@@ -793,6 +821,8 @@ static int font_load(const char *path, int px) {
 
 /* y_top = top of the text box; baseline sits px*0.8 below (top-left origin) */
 static void draw_ttf(font_t *f, int x, int y_top, const char *s, uint32_t c, int a) {
+    /* stb_truetype rasterizes glyph coverage into the CPU target. */
+    wcl_r2d_disable();
     float pen_x = (float)x;
     float baseline = (float)y_top + f->px * 0.8f;
     for (; *s; s++) {
@@ -931,9 +961,17 @@ static int l_set_color(lua_State *S) {
     return 0;
 }
 
+static uint32_t frame_clear_color;   /* last clear, for the GL path's glClear */
+
 static int l_clear(lua_State *S) {
     int r = ARGI(1), g = ARGI(2), b = ARGI(3);
     uint32_t c = (((uint32_t)r & 0xFF) << 16) | (((uint32_t)g & 0xFF) << 8) | ((uint32_t)b & 0xFF);
+    if (!rt_buf) {
+        frame_clear_color = c;
+        /* On the GL path wcl_r2d_begin already issued glClear for this
+         * colour; writing the framebuffer too would just be wasted work. */
+        if (wcl_r2d_active()) return 0;
+    }
     if (rt_buf) {
         for (int i = 0; i < rt_w * rt_h; i++) {
             rt_buf[i * 4 + 0] = (uint8_t)r; rt_buf[i * 4 + 1] = (uint8_t)g;
@@ -1023,6 +1061,9 @@ static int l_image_draw(lua_State *S) {
 }
 
 static int l_set_canvas(lua_State *S) {
+    /* Render targets need an FBO the backend does not have yet, so a cart
+     * that uses one runs entirely on the software rasterizer. */
+    if (!lua_isnoneornil(S, 1)) wcl_r2d_disable();
     if (lua_isnoneornil(S, 1)) { rt_buf = NULL; return 0; }
     image_t *im = image_by_id(ARGI(1));
     if (!im || !im->is_canvas) { rt_buf = NULL; return 0; }
@@ -1031,6 +1072,9 @@ static int l_set_canvas(lua_State *S) {
 }
 
 static int l_set_scissor(lua_State *S) {
+    /* glScissor exists, but the software path clips per span and the two
+     * would have to agree on edges; keep one backend per run instead. */
+    wcl_r2d_disable();
     if (lua_isnoneornil(S, 1)) { sc_on = 0; return 0; }
     sc_on = 1; sc_x = ARGI(1); sc_y = ARGI(2); sc_w = ARGI(3); sc_h = ARGI(4);
     return 0;
@@ -1038,6 +1082,7 @@ static int l_set_scissor(lua_State *S) {
 
 static int l_set_blend(lua_State *S) {
     blend_add = ARGI(1);
+    if (blend_add) wcl_r2d_disable();
     return 0;
 }
 
@@ -1345,6 +1390,14 @@ WC_EXPORT_INIT void wc_init(void) {
 WC_EXPORT_RENDER void wc_render(void) {
     dbg_draw_calls = 0;
 
+#ifdef WCL_ENABLE_GL2D
+    static int gl2d_started;
+    if (!gl2d_started) { gl2d_started = 1; wcl_r2d_init(DEFAULT_WIDTH, DEFAULT_HEIGHT); }
+    /* Returns 0 in sticky cpu_mode, in which case every draw below takes the
+     * software path and wcl_r2d_end blits the finished framebuffer. */
+    wcl_r2d_begin(frame_clear_color);
+#endif
+
     if (L && dbg_lua_ok) {
         lua_getglobal(L, "__wasmcart_frame");
         if (lua_isfunction(L, -1)) {
@@ -1372,6 +1425,8 @@ WC_EXPORT_RENDER void wc_render(void) {
     }
 
     if (!dbg_lua_ok) {
+        /* CPU-drawn, so the frame has to be presented via the blit path. */
+        wcl_r2d_disable();
         /* LOVE-style error screen: blue, readable, keeps the cart alive */
         for (int i = 0; i < DEFAULT_WIDTH * DEFAULT_HEIGHT; i++)
             wc_framebuffer[i] = 0x00201F6E;
@@ -1388,9 +1443,11 @@ WC_EXPORT_RENDER void wc_render(void) {
     tick_n++;
     dbg_tick = tick_n;
 
-#ifdef WCL_USE_GL
-    /* Last thing in the frame: everything above has finished writing pixels,
-     * including the Lua-error screen. */
+#ifdef WCL_ENABLE_GL2D
+    /* Flushes the batches on the GL path, or blits the CPU framebuffer when
+     * this frame fell back. Either way the frame is on screen after this. */
+    wcl_r2d_end(wc_framebuffer);
+#elif defined(WCL_USE_GL)
     gl_present();
 #endif
 }

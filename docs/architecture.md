@@ -393,6 +393,39 @@ Measured here on Tetris (1500 frames, this machine): **GL 0.377 ms vs CPU
 well short of the 49x an idealised probe suggests, because a real cart is not
 purely fill-bound.
 
+## GL2D (opt-in: `WCL_GL=1`)
+
+`build/engine-gl.wasm` renders through a real WebGL2 context: one shared
+2048x2048 atlas, batched solid and textured quads (a whole frame of sprites
+is one draw call), cached GL state, indices uploaded once. Built on the model
+`wasmcart-mruby` shipped first.
+
+**It is deliberately not bit-exact.** Fixed-function blending rounds
+differently from `div255` -- by exactly 1 per blended draw -- and that
+*compounds* where draws overlap: four stacked alpha layers measure a delta of
+2. The gate is therefore a tolerance (`tools/gl2d-compare.mjs`, ±2), not
+equality. The software rasterizer stays the reference implementation and
+stays bit-exact; `test/blit` and `test/prims` are unchanged and still assert
+equality against it.
+
+**The CPU fallback is whole-frame and sticky.** Anything GL2D does not
+implement -- rotation, canvas render targets, scissor, additive blending, TTF
+text, polygons, circles, the Lua error screen -- calls `wcl_r2d_disable()`,
+and from then on every frame is rasterized in software and presented with one
+`wc_gl_blit`. Reconciling per draw would cost ~0.19 ms each way, which a real
+frame pays dozens of times. Cavern uses canvases, so it takes this path and
+is bit-identical to the CPU build.
+
+Measured on `test/gl2d` (600 frames): **GL2D 0.075 ms vs software 0.597 ms,
+8.0x**.
+
+One consequence worth knowing: `setCanvas` trips the fallback the moment it
+is called, *including in `love.load`*. A cart that prepares its art in a
+canvas at load time never reaches the GL path, which is why `test/gl2d/`
+loads a PNG instead. That cart exists precisely because a cart which trips
+the fallback measures the software path on **both** engines and reports a
+perfect match while proving nothing -- `test/prims` does exactly that.
+
 ## Input: gamepad first, always
 
 **wasmcart is a gamepad platform.** The host synthesizes a pad from the

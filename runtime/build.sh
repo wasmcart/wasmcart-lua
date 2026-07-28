@@ -92,9 +92,9 @@ echo "built ../build/engine.wasm ($(wc -c < ../build/engine.wasm) bytes)"
 # context must fail the load rather than stub it -- so shipping this as the
 # default would break every 2D-only host for a change that moves no pixels.
 if [ "${WCL_GL:-0}" = "1" ]; then
-  emcc runtime.c vorbis.c cartconf.c physics.c \
+  emcc runtime.c vorbis.c cartconf.c physics.c render2d_gl.c \
     vendor/liblua54.a vendor/libbox2d.a \
-    -O2 -msimd128 -msse2 -DWCL_USE_GL \
+    -O2 -msimd128 -msse2 -DWCL_USE_GL -DWCL_ENABLE_GL2D \
     -I vendor/lua/src -I vendor/box2d/include -I "$WASMCART_REPO/include" -I . \
     -s STANDALONE_WASM=1 --no-entry -sSUPPORT_LONGJMP=wasm \
     -s EXPORTED_FUNCTIONS='["_wc_init","_wc_render","_wc_get_info","_wc_debug_state","_wc_set_seed"]' \

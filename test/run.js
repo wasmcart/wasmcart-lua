@@ -268,6 +268,34 @@ async function main() {
     }
   }
 
+  // ── the GL2D backend must stay within tolerance ───────────────────
+  // GL2D is deliberately NOT bit-exact: fixed-function blending rounds
+  // differently from div255, by exactly 1 per blended draw, and that
+  // compounds where draws overlap (4 stacked layers measured at 2). The
+  // gate is therefore a tolerance, not equality -- and test/gl2d/ uses only
+  // primitives the GL path implements, because a cart that trips the sticky
+  // CPU fallback measures the software path on both engines and would
+  // report a perfect match while proving nothing.
+  if (fs.existsSync(glEngine) && fs.existsSync(path.join(ROOT, 'test', 'gl2d', 'main.lua'))) {
+    const { execFileSync } = require('child_process');
+    try {
+      const out = execFileSync(process.execPath,
+        [path.join(ROOT, 'tools', 'gl2d-compare.mjs'), path.join(ROOT, 'test', 'gl2d'), '3', '2'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      const m = out.match(/max delta (\d+)/);
+      console.log(`\nok    gl2d         within tolerance (max delta ${m ? m[1] : '?'})`);
+    } catch (err) {
+      const txt = (err.stdout || '') + (err.stderr || '');
+      if (/Cannot find|ERR_MODULE_NOT_FOUND|createWebGL2Context/.test(txt)) {
+        console.log('\nskip  gl2d         no GL context available on this machine');
+      } else {
+        console.log('\nFAIL  gl2d  GL2D output drifted beyond tolerance');
+        for (const l of txt.trim().split('\n').slice(-6)) console.log(`      ${l}`);
+        failed++;
+      }
+    }
+  }
+
   // ── documented examples must actually run ─────────────────────────
   // Docs rot silently: an API gets renamed and the README keeps promising
   // the old one. test/doccheck/ is every code block from README.md and
