@@ -309,7 +309,7 @@ static void fill_rect(int x, int y, int w, int h, uint32_t c, int a) {
     /* GL only owns the screen; a canvas target, scissor or additive blending
      * is not modelled here, so those keep the software path (and have
      * already forced cpu_mode via wcl_r2d_disable). */
-    if (!blend_add && wcl_r2d_solid(x, y, w, h, c, a)) return;
+    if (wcl_r2d_solid(x, y, w, h, c, a)) return;
     int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
     int x1 = x + w > dest_w() ? dest_w() : x + w;
     int y1 = y + h > dest_h() ? dest_h() : y + h;
@@ -318,7 +318,7 @@ static void fill_rect(int x, int y, int w, int h, uint32_t c, int a) {
 
 static void raster_line(int x0, int y0, int x1, int y1, uint32_t c, int a) {
     if (a <= 0) return;
-    if (!blend_add && wcl_r2d_line(x0, y0, x1, y1, c, a)) return;
+    if (wcl_r2d_line(x0, y0, x1, y1, c, a)) return;
     int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
     int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
     int err = dx + dy;
@@ -538,7 +538,7 @@ static void draw_image(image_t *im, double x, double y, double rot,
      * destination corners, so GL gets the same geometry the software path
      * scans, with no second implementation of the transform. Canvas targets
      * and additive still fall back (and have tripped cpu_mode). */
-    if (!blend_add) {
+    {
         if (wcl_r2d_sprite(im->rgba, im->w, im->h, cxs, cys,
                            qx, qy, qw, qh,
                            (uint32_t)((tr << 16) | (tg << 8) | tb), ta)) {
@@ -829,7 +829,7 @@ static void draw_ttf(font_t *f, int x, int y_top, const char *s, uint32_t c, int
      * font uploads once as a coverage texture and each glyph is a quad in
      * the shared textured batch. Only the screen target is handled here;
      * canvases and additive fall through to the CPU rasterizer below. */
-    const int gl_text = (!rt_buf && !blend_add && wcl_r2d_active());
+    const int gl_text = (!rt_buf && wcl_r2d_active());
     float pen_x = (float)x;
     float baseline = (float)y_top + f->px * 0.8f;
     for (; *s; s++) {
@@ -1122,7 +1122,7 @@ static int l_set_scissor(lua_State *S) {
 
 static int l_set_blend(lua_State *S) {
     blend_add = ARGI(1);
-    if (blend_add) wcl_r2d_disable();
+    wcl_r2d_blend_add(blend_add);
     return 0;
 }
 

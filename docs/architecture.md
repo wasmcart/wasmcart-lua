@@ -453,9 +453,21 @@ which is the surface wasmcart specifies -- relying on it made glyphs read
 `(cov, 0, 0, 1)` and text came out red. Bitfont text needs nothing special:
 its pixels are `fill_rect`s that already batch.
 
+Additive blending is `GL_SRC_ALPHA / GL_ONE`, with destination alpha left
+alone so the framebuffer and canvases stay opaque exactly as `blend_px`
+leaves them. It gets a **wider tolerance (±8)** than everything else, for a
+reason worth stating: alpha blending *converges* -- the destination term
+decays by `(1-a)` each step, so old rounding error fades -- while additive
+*accumulates*. Eight stacked draws measured a drift of 8.
+
+And the drift is not GL being sloppy. Against the exact real-valued result,
+the GPU was **closer** (err 3.2) than the software path (err 4.8), because
+`div255` truncates every additive step. The wider budget is tolerating the
+software rasterizer's error as much as the GPU's.
+
 **The CPU fallback is whole-frame and sticky.** What GL2D still does not
-implement -- additive blending, polygons, circles, the Lua error screen --
-calls `wcl_r2d_disable()`,
+implement -- polygons, circles, the Lua error screen -- calls
+`wcl_r2d_disable()`,
 and from then on every frame is rasterized in software and presented with one
 `wc_gl_blit`. Reconciling per draw would cost ~0.19 ms each way, which a real
 frame pays dozens of times. Cavern uses canvases, so it takes this path and

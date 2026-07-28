@@ -31,6 +31,13 @@ const W = 1280, H = 720;
 
 const cartDir = process.argv[2] || path.join(ROOT, 'test', 'prims');
 const FRAMES = +(process.argv[3] || 60);
+// Default +/-2: +/-1 per blended draw, compounding a little where draws
+// overlap. ADDITIVE needs more (see test/gl2dblend): alpha blending converges
+// because the destination term decays by (1-a) each step, so old error fades,
+// while additive accumulates -- eight stacked draws measured a drift of 8.
+// Notably the GPU is the MORE accurate of the two there: div255 truncates
+// every additive step, so the software path drifts further from the exact
+// real-valued result than GL does.
 const TOL = +(process.argv[4] || 2);
 const MAX_EDGE_PCT = +(process.argv[5] || 0.05);
 

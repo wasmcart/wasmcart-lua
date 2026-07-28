@@ -128,6 +128,8 @@ static int textured_batch_mode = 1;   /* 1 = RGBA texture, 2 = glyph coverage */
 static uint16_t indices[BATCH_MAX * 6];
 
 static int scissor_on;
+static int blend_add_on;
+static void flush_batches(void);
 static int blend_enabled = -1;
 static int textured_enabled = -1;
 static GLuint bound_texture;
@@ -208,10 +210,32 @@ static void ndc(float x, float y, float *out_x, float *out_y) {
 }
 
 static void set_blend(int enabled) {
+    /* Additive needs blending ON even for fully opaque source colours, since
+     * "add" is about the destination, not the source alpha. */
+    if (blend_add_on) enabled = 1;
     if (blend_enabled == enabled) return;
     if (enabled) glEnable(GL_BLEND);
     else glDisable(GL_BLEND);
     blend_enabled = enabled;
+}
+
+/* love.graphics.setBlendMode("add"). The software path does
+ * dst = min(255, dst + src*a/255), which is GL_SRC_ALPHA / GL_ONE.
+ * Destination alpha is left alone: the framebuffer and every canvas stay
+ * opaque, exactly as blend_px leaves them. */
+void wcl_r2d_blend_add(int on) {
+    if (!ready || blend_add_on == on) return;
+    flush_batches();
+    blend_add_on = on;
+    if (on) {
+        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
+        glEnable(GL_BLEND);
+        blend_enabled = 1;
+    } else {
+        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+                            GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        blend_enabled = -1;   /* force the next set_blend to re-apply */
+    }
 }
 
 static void set_textured(int enabled) {

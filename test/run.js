@@ -282,13 +282,17 @@ async function main() {
   // primitives the GL path implements, because a cart that trips the sticky
   // CPU fallback measures the software path on both engines and would
   // report a perfect match while proving nothing.
-  for (const cart of ['gl2d', 'gl2dcanvas', 'gl2dtext']) {
+  // Per-cart tolerance. Additive gets more: it ACCUMULATES rounding rather
+  // than converging the way alpha blending does, and the GPU is actually the
+  // more accurate of the two there (div255 truncates every additive step).
+  for (const [cart, tol] of [['gl2d', '2'], ['gl2dcanvas', '2'],
+                             ['gl2dtext', '2'], ['gl2dblend', '8']]) {
     if (!fs.existsSync(glEngine)) break;
     if (!fs.existsSync(path.join(ROOT, 'test', cart, 'main.lua'))) continue;
     const { execFileSync } = require('child_process');
     try {
       const out = execFileSync(process.execPath,
-        [path.join(ROOT, 'tools', 'gl2d-compare.mjs'), path.join(ROOT, 'test', cart), '3', '2'],
+        [path.join(ROOT, 'tools', 'gl2d-compare.mjs'), path.join(ROOT, 'test', cart), '3', tol],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       // Report the two budgets separately. "max delta" alone is misleading:
       // it is dominated by a handful of rotated-sprite EDGE pixels, which
@@ -297,7 +301,7 @@ async function main() {
       const edge = out.match(/(\d+) pixels \(([\d.]+)%\) exceed/);
       console.log(edge
         ? `\nok    ${cart.padEnd(12)} within tolerance (${edge[2]}% edge pixels, budget 0.05%)`
-        : `\nok    ${cart.padEnd(12)} within tolerance (every pixel +/-2)`);
+        : `\nok    ${cart.padEnd(12)} within tolerance (every pixel +/-${tol})`);
     } catch (err) {
       const txt = (err.stdout || '') + (err.stderr || '');
       if (/Cannot find|ERR_MODULE_NOT_FOUND|createWebGL2Context/.test(txt)) {

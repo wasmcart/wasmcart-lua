@@ -44,6 +44,10 @@ int  wcl_r2d_sprite(const void *pixels, int sw, int sh,
 /* Scissor rect in cart pixels; w<0 disables. */
 void wcl_r2d_scissor(int x, int y, int w, int h);
 
+/* Additive blending on/off. Batches are flushed on a change because the
+ * blend mode is pipeline state, not per-vertex. */
+void wcl_r2d_blend_add(int on);
+
 /* Render targets. A canvas is both a destination and, later, a source, so it
  * lives in its own texture with an FBO attached rather than in the shared
  * atlas. `key` is the canvas's RGBA payload pointer, the same identity
@@ -91,6 +95,7 @@ static inline int wcl_r2d_sprite(const void *pixels, int sw, int sh,
 static inline void wcl_r2d_scissor(int x, int y, int w, int h) {
     (void)x; (void)y; (void)w; (void)h;
 }
+static inline void wcl_r2d_blend_add(int on) { (void)on; }
 static inline int wcl_r2d_target(const void *key, int w, int h) {
     (void)key; (void)w; (void)h; return 0;
 }
