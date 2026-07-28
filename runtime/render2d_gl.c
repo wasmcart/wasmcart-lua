@@ -72,7 +72,12 @@
 #define GL_COLOR_ATTACHMENT0 0x8CE0
 #define GL_FRAMEBUFFER_COMPLETE 0x8CD5
 
-typedef struct { float x, y, u, v, r, g, b, a; } vertex_t;
+/* u,v carry the circle centre and `rad` the radius when this vertex belongs
+ * to a circle quad; they are unused (0) for solids and carry real UVs for
+ * textured draws. Putting them per-vertex is what lets circles BATCH -- as a
+ * uniform, every circle needed its own draw call, and a cart drawing 900 of
+ * them spent 0.69 ms/frame in GL call overhead alone. */
+typedef struct { float x, y, u, v, r, g, b, a, rad; } vertex_t;
 typedef struct {
     const void *pixels;   /* cache key: the image's RGBA payload pointer */
     int w, h;
@@ -109,7 +114,7 @@ static int width, height;
 static float ndc_scale_x, ndc_scale_y;
 static GLuint program, vao, buffer, index_buffer;
 static GLint pos_attr, uv_attr, color_attr, tex_uniform, textured_uniform;
-static GLint circle_uniform;
+static GLint rad_attr;
 
 #define MAX_TEXTURES 64
 static texture_t textures[MAX_TEXTURES];
@@ -121,6 +126,7 @@ static int atlas_x, atlas_y, atlas_row_h;
 static vertex_t solid_batch[BATCH_MAX * 4];
 static int solid_batch_count;
 static int solid_batch_has_alpha;
+static int solid_batch_is_circle;
 static vertex_t textured_batch[BATCH_MAX * 4];
 static int textured_batch_count;
 /* Which texture the open textured batch is for. Sprites share the atlas, but
@@ -143,15 +149,24 @@ static const char *VERTEX_SHADER =
     "in vec2 a_pos;\n"
     "in vec2 a_uv;\n"
     "in vec4 a_color;\n"
+    "in highp float a_rad;\n"
     "out vec2 v_uv;\n"
     "out vec4 v_color;\n"
-    "void main() { gl_Position = vec4(a_pos, 0.0, 1.0); v_uv = a_uv; v_color = a_color; }\n";
+    "out highp vec2 v_centre;\n"
+    "out highp float v_rad;\n"
+    "void main() {\n"
+    "  gl_Position = vec4(a_pos, 0.0, 1.0);\n"
+    "  v_uv = a_uv; v_color = a_color;\n"
+    "  v_centre = a_uv; v_rad = a_rad;\n"   /* circle mode reuses a_uv */
+    "}\n";
 
 static const char *FRAGMENT_SHADER =
     "#version 300 es\n"
     "precision mediump float;\n"
     "in vec2 v_uv;\n"
     "in vec4 v_color;\n"
+    "in highp vec2 v_centre;\n"
+    "in highp float v_rad;\n"
     "out vec4 frag_color;\n"
     "uniform sampler2D u_tex;\n"
     "uniform int u_textured;\n"
@@ -159,7 +174,7 @@ static const char *FRAGMENT_SHADER =
      * the row offset, and mediump is only guaranteed ~10 bits of mantissa in
      * GLES. At r=66 that put 24 pixels a whole pixel outside the software
      * fill. Colour and UV stay mediump; only the coverage maths needs it. */
-    "uniform highp vec3 u_circle;   // cx, cy, r in cart pixels (y flipped)\n"
+
     "void main() {\n"
     "  frag_color = v_color;\n"
     /* u_textured: 0 = solid, 1 = RGBA sprite/canvas, 2 = single-channel
@@ -175,9 +190,9 @@ static const char *FRAGMENT_SHADER =
      * fan, no segment count, no minimum radius, and no tolerance. This is
      * what a 2D GPU renderer should do with a circle. */
     "  else if (u_textured == 3) {\n"
-    "    highp float dy = floor(gl_FragCoord.y) - u_circle.y;\n"
-    "    highp float dx = floor(gl_FragCoord.x) - u_circle.x;\n"
-    "    highp float t = u_circle.z * u_circle.z - dy * dy;\n"
+    "    highp float dy = floor(gl_FragCoord.y) - v_centre.y;\n"
+    "    highp float dx = floor(gl_FragCoord.x) - v_centre.x;\n"
+    "    highp float t = v_rad * v_rad - dy * dy;\n"
     "    if (t < 0.0) discard;\n"
     "    if (abs(dx) > floor(sqrt(t) + 0.5)) discard;\n"
     "  }\n"
@@ -276,7 +291,7 @@ static void flush_solid_batch(void) {
     glBindBuffer(GL_ARRAY_BUFFER, buffer);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(vertex_t) * solid_batch_count),
                  solid_batch, GL_DYNAMIC_DRAW);
-    set_textured(0);
+    set_textured(solid_batch_is_circle ? 3 : 0);
     glDrawElements(GL_TRIANGLES, (GLsizei)((solid_batch_count / 4) * 6),
                    GL_UNSIGNED_SHORT, (const void *)0);
     frame_stats.draws++;
@@ -284,6 +299,7 @@ static void flush_solid_batch(void) {
     frame_stats.upload_bytes += (uint32_t)(sizeof(vertex_t) * solid_batch_count);
     solid_batch_count = 0;
     solid_batch_has_alpha = 0;
+    solid_batch_is_circle = 0;
 }
 
 static void flush_textured_batch(void) {
@@ -331,7 +347,7 @@ int wcl_r2d_init(int w, int h) {
     color_attr = glGetAttribLocation(program, "a_color");
     tex_uniform = glGetUniformLocation(program, "u_tex");
     textured_uniform = glGetUniformLocation(program, "u_textured");
-    circle_uniform = glGetUniformLocation(program, "u_circle");
+    rad_attr = glGetAttribLocation(program, "a_rad");
 
     glGenVertexArrays(1, &vao);
     glBindVertexArray(vao);
@@ -343,6 +359,10 @@ int wcl_r2d_init(int w, int h) {
     glVertexAttribPointer(uv_attr, 2, GL_FLOAT, 0, sizeof(vertex_t), (const void *)8);
     glEnableVertexAttribArray(color_attr);
     glVertexAttribPointer(color_attr, 4, GL_FLOAT, 0, sizeof(vertex_t), (const void *)16);
+    if (rad_attr >= 0) {
+        glEnableVertexAttribArray(rad_attr);
+        glVertexAttribPointer(rad_attr, 1, GL_FLOAT, 0, sizeof(vertex_t), (const void *)32);
+    }
 
     /* Quad indices are constant for every batch, so upload them once. */
     for (int i = 0; i < BATCH_MAX; i++) {
@@ -468,6 +488,7 @@ int wcl_r2d_active(void) { return ready && !frame_disabled; }
 int wcl_r2d_solid(int x, int y, int w, int h, uint32_t color, int alpha) {
     if (!wcl_r2d_active() || w <= 0 || h <= 0) return 0;
     if (textured_batch_count) flush_textured_batch();
+    if (solid_batch_count && solid_batch_is_circle) flush_solid_batch();
     if (solid_batch_count + 4 > BATCH_MAX * 4) flush_solid_batch();
     if (alpha < 255) solid_batch_has_alpha = 1;
     vertex_t *v = &solid_batch[solid_batch_count];
@@ -481,7 +502,7 @@ int wcl_r2d_solid(int x, int y, int w, int h, uint32_t color, int alpha) {
     v[0].x = x0; v[0].y = y0; v[1].x = x1; v[1].y = y0;
     v[2].x = x1; v[2].y = y1; v[3].x = x0; v[3].y = y1;
     for (int i = 0; i < 4; i++) {
-        v[i].u = v[i].v = 0;
+        v[i].u = v[i].v = 0; v[i].rad = 0; v[i].rad = 0;
         v[i].r = r; v[i].g = g; v[i].b = b; v[i].a = a;
     }
     solid_batch_count += 4;
@@ -594,45 +615,48 @@ static int poly_triangulate(const double *xs, const double *ys, int n, int *out)
     return tris + 1;
 }
 
-/* Filled circle, evaluated in the fragment shader.
+/* Filled circle, evaluated in the fragment shader and BATCHED.
  *
- * Draws ONE quad over the circle's bounding box and lets the shader decide
- * coverage with the software rasterizer's own rule:
+ * Coverage uses the software rasterizer's own rule --
  *   span = round(sqrt(r*r - dy*dy));  covered iff |dx| <= span
- * That is bit-exact at every radius, which a triangle fan can never be --
- * a fan approximates the boundary with straight edges, and measurement put
- * that at ~0.5 px per boundary pixel, which is 1% of the area at r=100 but
- * 23% at r=4. One quad is also cheaper than the 64 triangles a fan needed to
- * stop improving. */
+ * -- which is bit-exact at every radius. A triangle fan cannot be: it
+ * approximates the boundary with straight edges, measured at ~0.5 px per
+ * boundary pixel, which is 1% of the area at r=100 but 23% at r=4.
+ *
+ * The circle's centre and radius travel in the VERTEX (reusing u,v plus a
+ * dedicated `rad` attribute) rather than a uniform. As a uniform each circle
+ * needed its own draw call, and a cart drawing 900 of them spent 0.69 ms per
+ * frame in GL call overhead -- slower than software drawing them outright.
+ * Per-vertex, a whole frame of circles is one draw.
+ */
 int wcl_r2d_circle(int cx, int cy, int r, uint32_t color, int alpha) {
     if (!wcl_r2d_active() || r <= 0) return 0;
-    flush_batches();
+    if (textured_batch_count) flush_textured_batch();
+    /* circle quads and plain solids cannot share a batch: the shader picks
+     * its rule from u_textured, which is per-draw state */
+    if (solid_batch_count && !solid_batch_is_circle) flush_solid_batch();
+    if (solid_batch_count + 4 > BATCH_MAX * 4) flush_solid_batch();
+    solid_batch_is_circle = 1;
+    if (alpha < 255) solid_batch_has_alpha = 1;
 
     /* gl_FragCoord.y counts up from the bottom; the cart's y counts down. */
     const float fcy = (float)(current_target ? current_target->h : height) - 1.0f - (float)cy;
-    glUniform3f(circle_uniform, (float)cx, fcy, (float)r);
-
-    vertex_t v[6];
+    vertex_t *v = &solid_batch[solid_batch_count];
     float x0, y0, x1, y1;
     ndc((float)(cx - r), (float)(cy - r), &x0, &y0);
     ndc((float)(cx + r + 1), (float)(cy + r + 1), &x1, &y1);
-    float rr = (float)((color >> 16) & 255) / 255.0f;
-    float gg = (float)((color >> 8) & 255) / 255.0f;
-    float bb = (float)(color & 255) / 255.0f;
-    float aa = (float)alpha / 255.0f;
-    const float xs[6] = { x0, x1, x1, x0, x1, x0 };
-    const float ys[6] = { y0, y0, y1, y0, y1, y1 };
-    for (int i = 0; i < 6; i++) {
-        v[i].x = xs[i]; v[i].y = ys[i]; v[i].u = v[i].v = 0;
+    const float rr = (float)((color >> 16) & 255) / 255.0f;
+    const float gg = (float)((color >> 8) & 255) / 255.0f;
+    const float bb = (float)(color & 255) / 255.0f;
+    const float aa = (float)alpha / 255.0f;
+    const float xs[4] = { x0, x1, x1, x0 };
+    const float ys[4] = { y0, y0, y1, y1 };
+    for (int i = 0; i < 4; i++) {
+        v[i].x = xs[i]; v[i].y = ys[i];
+        v[i].u = (float)cx; v[i].v = fcy; v[i].rad = (float)r;
         v[i].r = rr; v[i].g = gg; v[i].b = bb; v[i].a = aa;
     }
-    set_blend(alpha < 255);
-    glBindBuffer(GL_ARRAY_BUFFER, buffer);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(v), v, GL_DYNAMIC_DRAW);
-    set_textured(3);
-    glDrawArrays(GL_TRIANGLES, 0, 6);
-    set_textured(0);            /* mode 3 must not leak into the next batch */
-    frame_stats.draws++;
+    solid_batch_count += 4;
     frame_stats.quads++;
     return 1;
 }
@@ -640,11 +664,10 @@ int wcl_r2d_circle(int cx, int cy, int r, uint32_t color, int alpha) {
 /* Triangulation cache.
  *
  * Ear clipping is O(n^3) in the worst case and a cart re-submits the same
- * shape every frame: a 19-vertex comb costs ~3400 point-in-triangle tests,
- * and doing that per frame made a polygon-heavy cart 0.38x, i.e. SLOWER than
- * the software scanline fill it replaced. The triangulation depends only on
- * the vertex positions, so cache it against a hash of them. Convex polygons
- * skip all of this -- their fan is derived directly.
+ * shape every frame: a 19-vertex comb costs ~3400 point-in-triangle tests.
+ * The triangulation depends only on the vertex positions, so cache it
+ * against a hash of them. Convex polygons skip all of this -- their fan is
+ * derived directly.
  */
 typedef struct {
     uint32_t hash;
@@ -721,7 +744,7 @@ int wcl_r2d_poly(const double *xs, const double *ys, int n,
     int vc = 0;
     for (int t = 0; t < ntri * 3; t++) {
         ndc((float)xs[tri[t]], (float)ys[tri[t]], &v[vc].x, &v[vc].y);
-        v[vc].u = v[vc].v = 0;
+        v[vc].u = v[vc].v = 0; v[vc].rad = 0;
         v[vc].r = r; v[vc].g = g; v[vc].b = b; v[vc].a = a;
         vc++;
     }
@@ -762,7 +785,7 @@ int wcl_r2d_line(int x0, int y0, int x1, int y1, uint32_t color, int alpha) {
     float b = (float)(color & 255) / 255.0f;
     float a = (float)alpha / 255.0f;
     for (int i = 0; i < 2; i++) {
-        v[i].u = v[i].v = 0;
+        v[i].u = v[i].v = 0; v[i].rad = 0; v[i].rad = 0;
         v[i].r = r; v[i].g = g; v[i].b = b; v[i].a = a;
     }
     glBindBuffer(GL_ARRAY_BUFFER, buffer);
@@ -796,6 +819,7 @@ static texture_t *get_texture(const void *pixels, int w, int h) {
          * still reference the old contents. */
         flush_batches();
         bind_texture(atlas_texture);
+        WC_LOG("atlas-upload");
         glTexSubImage2D(GL_TEXTURE_2D, 0, atlas_x, atlas_y, w, h,
                         GL_RGBA, GL_UNSIGNED_BYTE, pixels);
         atlas_x += w;
@@ -937,7 +961,7 @@ int wcl_r2d_sprite(const void *pixels, int sw, int sh,
 
     for (int i = 0; i < 4; i++) {
         ndc((float)cx[i], (float)cy[i], &v[i].x, &v[i].y);
-        v[i].u = us[i]; v[i].v = vs[i];
+        v[i].u = us[i]; v[i].v = vs[i]; v[i].rad = 0;
         v[i].r = r; v[i].g = g; v[i].b = b; v[i].a = a;
     }
     textured_batch_count += 4;

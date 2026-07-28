@@ -1435,6 +1435,14 @@ WC_EXPORT_INIT void wc_init(void) {
     }
     if (!prelude_ok) return;
 
+#ifdef WCL_ENABLE_GL2D
+    /* Before love.load, not on the first wc_render. Carts routinely prepare
+     * art in a canvas during load; with the backend not yet initialized
+     * wcl_r2d_target failed, tripped the sticky fallback, and the cart ran
+     * on the software rasterizer for its whole life. */
+    wcl_r2d_init(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+#endif
+
     if (run_source("main.lua") != 0) return;
 
     /* love.load() */
@@ -1447,8 +1455,7 @@ WC_EXPORT_RENDER void wc_render(void) {
     dbg_draw_calls = 0;
 
 #ifdef WCL_ENABLE_GL2D
-    static int gl2d_started;
-    if (!gl2d_started) { gl2d_started = 1; wcl_r2d_init(DEFAULT_WIDTH, DEFAULT_HEIGHT); }
+    wcl_r2d_init(DEFAULT_WIDTH, DEFAULT_HEIGHT);   /* no-op after the first */
     /* Returns 0 in sticky cpu_mode, in which case every draw below takes the
      * software path and wcl_r2d_end blits the finished framebuffer. */
     if (wcl_r2d_begin(frame_clear_color)) {
