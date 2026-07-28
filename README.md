@@ -315,6 +315,23 @@ that host grows an offscreen context, `engine-cpu.wasm` is the artifact for
 it. The engine also detects a stubbed `gl` module at startup and falls back
 to the software rasterizer rather than rendering a black screen.
 
+## The wasmcart org
+
+This is one language runtime among several. Every repo below produces or runs
+the *same* `.wasc` carts, so a host that plays one plays them all. Full list:
+**[github.com/orgs/wasmcart/repositories](https://github.com/orgs/wasmcart/repositories)**
+
+| Repo | What it is |
+|------|------------|
+| [**wasmcart**](https://github.com/wasmcart/wasmcart) | the spec, the JS reference hosts (`CartHost`, `CartHostWeb`), and the `wasmcart` CLI + packer |
+| [**wasmcart-lua**](https://github.com/wasmcart/wasmcart-lua) (this repo) | write games in Lua (Lua 5.4, LÖVE-style API, batched GL2D renderer) |
+| [**wasmcart-mruby**](https://github.com/wasmcart/wasmcart-mruby) | write games in Ruby (mruby runtime, DragonRuby-style API) |
+| [**wasmcart-pygame**](https://github.com/wasmcart/wasmcart-pygame) | write games in Python (CPython 3.13 + pygame-ce) |
+| [**wasmcart-jsgame**](https://github.com/wasmcart/wasmcart-jsgame) | write games in JavaScript (QuickJS, Canvas 2D + WebGL2 + Web Audio) |
+| [**wasmcart-sdl2**](https://github.com/wasmcart/wasmcart-sdl2) | SDL2 backend + porting guide, for bringing existing C/SDL games over |
+| [**wasmcart-libretro**](https://github.com/wasmcart/wasmcart-libretro) | libretro core - run carts in RetroArch / RetroDECK |
+| [**wasmcart-native**](https://github.com/wasmcart/wasmcart-native) | native player built on libnode, no Node install needed |
+
 ## License
 
 MIT.
