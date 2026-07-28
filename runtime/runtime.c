@@ -394,8 +394,13 @@ static void raster_circle(int cx, int cy, int r, uint32_t c, int a, int filled) 
 static void raster_polygon(const double *xs, const double *ys, int n,
                            uint32_t c, int a, int filled) {
     if (n < 3) return;
-    /* Scanline-filled in software; no GL equivalent here yet. */
-    wcl_r2d_disable();
+    /* Filled convex polygons go to GL as a triangle fan; outlines are just
+     * lines, which are already on the GL path. A concave fill has no correct
+     * fan, so it keeps the scanline fill and drops the frame to software. */
+    if (filled) {
+        if (wcl_r2d_poly(xs, ys, n, c, a)) return;
+        wcl_r2d_disable();
+    }
     if (!filled) {
         for (int i = 0; i < n; i++) {
             int j = (i + 1) % n;

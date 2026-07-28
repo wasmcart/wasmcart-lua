@@ -468,6 +468,62 @@ int wcl_r2d_solid(int x, int y, int w, int h, uint32_t color, int alpha) {
     return 1;
 }
 
+/* Convex fill as a triangle fan.
+ *
+ * The software path is an even-odd scanline fill sampling at pixel centres,
+ * which is what GPU triangle rasterization does too, so interiors agree and
+ * only the boundary can differ -- the same edge-coverage story as rotated
+ * sprites.
+ *
+ * CONVEX ONLY. A fan over a concave polygon covers area the polygon does
+ * not, which is a visible error rather than an edge difference, so those
+ * return 0 and the caller keeps the scanline fill. Even-odd self-
+ * intersecting polygons are rejected by the same test. */
+static int poly_is_convex(const double *xs, const double *ys, int n) {
+    int sign = 0;
+    for (int i = 0; i < n; i++) {
+        int j = (i + 1) % n, k = (i + 2) % n;
+        double cross = (xs[j] - xs[i]) * (ys[k] - ys[j])
+                     - (ys[j] - ys[i]) * (xs[k] - xs[j]);
+        if (cross > 1e-9)      { if (sign < 0) return 0; sign = 1; }
+        else if (cross < -1e-9) { if (sign > 0) return 0; sign = -1; }
+    }
+    return 1;
+}
+
+int wcl_r2d_poly(const double *xs, const double *ys, int n,
+                 uint32_t color, int alpha) {
+    if (!wcl_r2d_active() || n < 3) return 0;
+    if (!poly_is_convex(xs, ys, n)) return 0;
+    /* the fan is (n-2) triangles = 3*(n-2) vertices, drawn unindexed */
+    if (n > 64) return 0;
+    flush_batches();
+
+    vertex_t v[3 * 62];
+    float r = (float)((color >> 16) & 255) / 255.0f;
+    float g = (float)((color >> 8) & 255) / 255.0f;
+    float b = (float)(color & 255) / 255.0f;
+    float a = (float)alpha / 255.0f;
+    int vc = 0;
+    for (int i = 1; i + 1 < n; i++) {
+        const int idx[3] = { 0, i, i + 1 };
+        for (int k = 0; k < 3; k++) {
+            ndc((float)xs[idx[k]], (float)ys[idx[k]], &v[vc].x, &v[vc].y);
+            v[vc].u = v[vc].v = 0;
+            v[vc].r = r; v[vc].g = g; v[vc].b = b; v[vc].a = a;
+            vc++;
+        }
+    }
+    set_blend(alpha < 255);
+    glBindBuffer(GL_ARRAY_BUFFER, buffer);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(vertex_t) * vc), v, GL_DYNAMIC_DRAW);
+    set_textured(0);
+    glDrawArrays(GL_TRIANGLES, 0, vc);
+    frame_stats.draws++;
+    frame_stats.quads += (uint32_t)(n - 2);
+    return 1;
+}
+
 int wcl_r2d_line(int x0, int y0, int x1, int y1, uint32_t color, int alpha) {
     if (!wcl_r2d_active()) return 0;
     flush_batches();

@@ -465,8 +465,21 @@ the GPU was **closer** (err 3.2) than the software path (err 4.8), because
 `div255` truncates every additive step. The wider budget is tolerating the
 software rasterizer's error as much as the GPU's.
 
+Convex polygon fills are triangle fans. The software fill is an even-odd
+scanline sampling at pixel centres, which is what GPU triangle rasterization
+does, so interiors agree and only the boundary differs -- 21 pixels (0.002%)
+on `test/gl2dpoly`. **Concave fills stay on the CPU**: a fan over a concave
+polygon covers area the polygon does not, which is a visible error rather
+than an edge difference, so `poly_is_convex` rejects them (and self-
+intersecting even-odd polygons with them).
+
+This one reaches further than it looks. `graphics.rectangle` emits a *polygon*
+whenever the transform stack has a rotation, so any cart that calls
+`love.graphics.rotate` around a rect was dropping to software before this and
+now stays on GL.
+
 **The CPU fallback is whole-frame and sticky.** What GL2D still does not
-implement -- polygons, circles, the Lua error screen -- calls
+implement -- concave polygon fills, circles, the Lua error screen -- calls
 `wcl_r2d_disable()`,
 and from then on every frame is rasterized in software and presented with one
 `wc_gl_blit`. Reconciling per draw would cost ~0.19 ms each way, which a real

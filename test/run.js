@@ -286,7 +286,8 @@ async function main() {
   // than converging the way alpha blending does, and the GPU is actually the
   // more accurate of the two there (div255 truncates every additive step).
   for (const [cart, tol] of [['gl2d', '2'], ['gl2dcanvas', '2'],
-                             ['gl2dtext', '2'], ['gl2dblend', '8']]) {
+                             ['gl2dtext', '2'], ['gl2dblend', '8'],
+                             ['gl2dpoly', '2']]) {
     if (!fs.existsSync(glEngine)) break;
     if (!fs.existsSync(path.join(ROOT, 'test', cart, 'main.lua'))) continue;
     const { execFileSync } = require('child_process');

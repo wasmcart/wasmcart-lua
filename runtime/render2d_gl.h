@@ -44,6 +44,11 @@ int  wcl_r2d_sprite(const void *pixels, int sw, int sh,
 /* Scissor rect in cart pixels; w<0 disables. */
 void wcl_r2d_scissor(int x, int y, int w, int h);
 
+/* Fill a CONVEX polygon as a triangle fan. Returns 0 for a concave one --
+ * a fan would cover area outside it -- so the caller falls back. */
+int  wcl_r2d_poly(const double *xs, const double *ys, int n,
+                  uint32_t color, int alpha);
+
 /* Additive blending on/off. Batches are flushed on a change because the
  * blend mode is pipeline state, not per-vertex. */
 void wcl_r2d_blend_add(int on);
@@ -96,6 +101,10 @@ static inline void wcl_r2d_scissor(int x, int y, int w, int h) {
     (void)x; (void)y; (void)w; (void)h;
 }
 static inline void wcl_r2d_blend_add(int on) { (void)on; }
+static inline int wcl_r2d_poly(const double *xs, const double *ys, int n,
+                               uint32_t color, int alpha) {
+    (void)xs; (void)ys; (void)n; (void)color; (void)alpha; return 0;
+}
 static inline int wcl_r2d_target(const void *key, int w, int h) {
     (void)key; (void)w; (void)h; return 0;
 }
