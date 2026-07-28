@@ -158,6 +158,34 @@ Cavern is sprite-bound, not Lua-bound: 97% of its frame is inside the
 blitter and about 1% is Lua. That is why the perf work went into the
 rasterizer rather than into a JIT.
 
+The rasterizer's inner loops were re-decided per pixel: every write
+re-read the destination (screen or canvas), the scissor rect and the blend
+mode, then branched. Those are constant for a whole run of pixels, so they
+are now hoisted into `blend_span()`, which fills one horizontal run with the
+decisions already made, and into an equivalent hoist for the per-pixel
+Bresenham walk that lines and circle outlines use. Measured per 2000 draws:
+
+| primitive | before | after |
+|---|---|---|
+| rect fill (opaque) | 0.45 ms | 0.62 ms* |
+| rect fill (alpha) | 7.88 ms | 1.24 ms |
+| rect outline | 1.18 ms | 0.75 ms |
+| circle fill | 4.67 ms | 0.81 ms |
+| line | 4.70 ms | 2.73 ms |
+| polygon | 8.64 ms | 2.75 ms |
+| into a canvas | 10.35 ms | 0.69 ms |
+| scissored | 4.70 ms | 0.53 ms |
+
+*opaque rect fill was already the one primitive with a fast path; it now
+shares the general one, which costs a little there and pays for itself
+everywhere else. Alpha rects previously cost 17x their opaque equivalent
+for identical pixel counts, purely from that missing path.
+
+A primitive-heavy frame (`test/prims`) is **2.46x** faster end to end. The
+example carts do not move: they draw few enough shapes to sit at 0.06 ms
+either way, and Cavern does not move either because it is sprite-bound.
+Every change is bit-identical -- see the note on divisions below.
+
 (GC figures are higher than they were pre-Box2D: the physics layer keeps
 Lua-side collider tables alive. Headroom is unaffected.)
 
@@ -176,11 +204,26 @@ draw-call count.
 - the final frame isn't ≥99.5% a single color (blank-render detector)
 - no error-shaped log lines
 
-`test/blit/` hashes a frame that exercises every sprite-blit argument shape
-against a golden. This is separate from the determinism suite on purpose:
-those carts draw shapes and text, never sprites, and they passed for an
-entire debugging session while the blitter was sampling the wrong texels.
-If a blitter change is intended, delete `test/blit/golden.txt`.
+`test/blit/` and `test/prims/` hash a frame against a golden: the first
+exercises every sprite-blit argument shape, the second every vector
+primitive across the opaque, alpha, additive, scissored and canvas paths.
+Both are separate from the determinism suite on purpose, and neither is
+redundant:
+
+- the determinism carts draw shapes and text but never sprites, and they
+  passed for an entire debugging session while the blitter sampled the
+  wrong texels;
+- none of the 11 carts in the suite drew an **alpha** line, so a control
+  that deliberately corrupted every alpha line pixel changed nothing
+  anywhere. `test/prims/` was written for exactly that hole and fails on
+  that control now.
+
+If such a change is intended, delete the matching `golden.txt`.
+
+Because a golden only proves a frame is *stable*, not *correct*,
+`test/render-hash.js --shot <cart> <out.png>` renders any cart to a PNG so
+the output can actually be looked at. Three real bugs in this engine were
+found that way while the suite was fully green.
 
 Then it runs `test/unit/` — a cart of 278 in-engine assertions covering real
 Lua semantics (closures, coroutines, metatables, varargs, pcall, goto),
@@ -190,6 +233,23 @@ Finally it runs a **deliberately broken cart that must fail**. If that one
 passes, the harness cannot detect failure and every other result is
 unverified. A suite that only ever goes green is indistinguishable from a
 suite that is broken.
+
+## Packing a cart (known gap)
+
+`app/main.lua` is the DEV layout: `npx wasmcart <dir>` serves assets relative
+to `app/`, so the engine's request for `main.lua` resolves. A packed `.wasc`
+keeps the `app/` prefix verbatim, and the engine does not strip it, so a cart
+packed straight from a dev directory boots to "missing asset: main.lua".
+
+Until that is reconciled, pack from a FLAT directory -- `main.wasm`,
+`manifest.json` and the Lua/assets at the top level. Verified through the
+romdev host: the flat cart renders a frame pixel-identical to the Node test
+harness, the `app/`-nested one fails to find its entry point.
+
+This affects every cart in the repo equally (the Cavern port included); it is
+a packaging convention mismatch, not an engine bug. The fix is a decision
+about which layout is canonical, so it is written down here rather than
+guessed at.
 
 ## Adding to the API
 

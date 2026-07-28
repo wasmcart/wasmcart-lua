@@ -6,9 +6,10 @@
 -- that C builtins (Tier -1) are the cheaper lever if the hot loop is not
 -- actually in Lua.
 --
--- Two groups:
+-- Three groups:
 --   micro  - classic Lua benchmarks (pure interpreter throughput)
 --   macro  - what games actually do (entity updates, collision, particles)
+--   draw   - each raster primitive on its own, so a slow one is visible
 --
 -- IMPORTANT: love.timer.getTime() is frame-quantized by design (it is
 -- frame_n * 1/60, so replays stay deterministic). It therefore CANNOT time
@@ -139,28 +140,120 @@ local function particle_step(count)
   end
 end
 
--- ── the renderer, for comparison ────────────────────────────────────
--- If drawing dominates, the JIT is aimed at the wrong thing.
+-- ── draw: each primitive isolated ──────────────────────────────────
+--
+-- Every case that can be is sized to the SAME footprint (2000 x 32x32 =
+-- ~2M pixels, about 2.2 screens), so the numbers compare per-pixel rather
+-- than per-call. Sprites use the same 32x32 box as the rect fills, which
+-- makes the blit and the fill directly comparable.
 
-local function draw_rects(n)
+local sprite, font_ttf, canvas
+
+local function draw_rects_opaque(n)
+  love.graphics.setColor(0.3, 0.6, 0.9)
   for i = 1, n do
-    love.graphics.setColor(0.3, 0.6, 0.9)
-    love.graphics.rectangle("fill", (i * 13) % 1200, (i * 29) % 680, 24, 24)
+    love.graphics.rectangle("fill", (i * 13) % 1200, (i * 29) % 660, 32, 32)
   end
 end
 
-local function draw_circles(n)
+local function draw_rects_alpha(n)
+  love.graphics.setColor(0.3, 0.6, 0.9, 0.5)      -- forces the blend path
   for i = 1, n do
-    love.graphics.setColor(0.9, 0.5, 0.3)
-    love.graphics.circle("fill", (i * 17) % 1200, (i * 31) % 680, 12)
+    love.graphics.rectangle("fill", (i * 13) % 1200, (i * 29) % 660, 32, 32)
+  end
+  love.graphics.setColor(1, 1, 1, 1)
+end
+
+local function draw_rect_outlines(n)
+  love.graphics.setColor(0.8, 0.8, 0.3)
+  for i = 1, n do
+    love.graphics.rectangle("line", (i * 13) % 1200, (i * 29) % 660, 32, 32)
   end
 end
 
-local function fill_screen(n)
+local function draw_circles_fill(n)
+  love.graphics.setColor(0.9, 0.5, 0.3)
+  for i = 1, n do
+    love.graphics.circle("fill", (i * 17) % 1200, (i * 31) % 660, 16)
+  end
+end
+
+local function draw_circles_line(n)
+  love.graphics.setColor(0.5, 0.9, 0.6)
+  for i = 1, n do
+    love.graphics.circle("line", (i * 17) % 1200, (i * 31) % 660, 16)
+  end
+end
+
+local function draw_lines(n)
+  love.graphics.setColor(0.9, 0.9, 0.4)
+  for i = 1, n do
+    local x = (i * 23) % 1100
+    love.graphics.line(x, 40, x + 120, 640)
+  end
+end
+
+local function draw_polys(n)
+  love.graphics.setColor(0.7, 0.4, 0.9)
+  for i = 1, n do
+    local x, y = (i * 19) % 1150, (i * 37) % 620
+    love.graphics.polygon("fill", { x, y, x + 40, y + 8, x + 30, y + 44, x + 6, y + 36 })
+  end
+end
+
+local function draw_fullscreen(n)
+  love.graphics.setColor(0.1, 0.1, 0.15)
   for _ = 1, n do
-    love.graphics.setColor(0.1, 0.1, 0.15)
     love.graphics.rectangle("fill", 0, 0, 1280, 720)
   end
+end
+
+local function draw_sprites(n)
+  love.graphics.setColor(1, 1, 1)
+  for i = 1, n do
+    love.graphics.draw(sprite, (i * 13) % 1200, (i * 29) % 660)
+  end
+end
+
+local function draw_sprites_rot(n)
+  love.graphics.setColor(1, 1, 1)
+  for i = 1, n do
+    love.graphics.draw(sprite, (i * 13) % 1200, (i * 29) % 660, i * 0.01, 1, 1, 16, 16)
+  end
+end
+
+local function draw_text_bitfont(n)
+  love.graphics.setColor(1, 1, 1)
+  love.graphics.setFont(love.graphics.newFont(8))
+  for i = 1, n do
+    love.graphics.print("the quick brown fox 0123456789", 20, (i * 11) % 680)
+  end
+end
+
+local function draw_text_ttf(n)
+  love.graphics.setColor(1, 1, 1)
+  love.graphics.setFont(font_ttf)
+  for i = 1, n do
+    love.graphics.print("the quick brown fox 0123456789", 20, (i * 11) % 680)
+  end
+end
+
+local function draw_to_canvas(n)
+  love.graphics.setCanvas(canvas)
+  love.graphics.setColor(0.4, 0.7, 0.9)
+  for i = 1, n do
+    love.graphics.rectangle("fill", (i * 7) % 220, (i * 13) % 220, 32, 32)
+  end
+  love.graphics.setCanvas()
+end
+
+local function draw_scissored(n)
+  love.graphics.setScissor(100, 100, 600, 400)
+  love.graphics.setColor(0.9, 0.4, 0.5)
+  for i = 1, n do
+    love.graphics.rectangle("fill", (i * 13) % 1200, (i * 29) % 660, 32, 32)
+  end
+  love.graphics.setScissor()
 end
 
 -- ── driver ─────────────────────────────────────────────────────────
@@ -177,9 +270,20 @@ bench("macro/entities(2000)x20", function() for _=1,20 do entity_update(2000) en
 bench("macro/aabb(2000x24)",   function() aabb_sweep(2000) end)
 bench("macro/particles(2000)", function() particle_step(2000) end)
 bench("macro/particles(2000)x20", function() for _=1,20 do particle_step(2000) end end)
-bench("draw/rects(2000)",      function() draw_rects(2000) end)
-bench("draw/circles(2000)",    function() draw_circles(2000) end)
-bench("draw/fullscreen(10)",   function() fill_screen(10) end)
+bench("draw/rect fill(2000)",     function() draw_rects_opaque(2000) end)
+bench("draw/rect alpha(2000)",    function() draw_rects_alpha(2000) end)
+bench("draw/rect line(2000)",     function() draw_rect_outlines(2000) end)
+bench("draw/circle fill(2000)",   function() draw_circles_fill(2000) end)
+bench("draw/circle line(2000)",   function() draw_circles_line(2000) end)
+bench("draw/line(2000)",          function() draw_lines(2000) end)
+bench("draw/polygon(2000)",       function() draw_polys(2000) end)
+bench("draw/sprite(2000)",        function() draw_sprites(2000) end)
+bench("draw/sprite rot(2000)",    function() draw_sprites_rot(2000) end)
+bench("draw/text bitfont(200)",   function() draw_text_bitfont(200) end)
+bench("draw/text ttf(200)",       function() draw_text_ttf(200) end)
+bench("draw/to canvas(2000)",     function() draw_to_canvas(2000) end)
+bench("draw/scissored(2000)",     function() draw_scissored(2000) end)
+bench("draw/fullscreen(10)",      function() draw_fullscreen(10) end)
 
 local idx, warmed = 0, false
 
@@ -187,6 +291,22 @@ function love.load()
   love.graphics.setBackgroundColor(0.04, 0.05, 0.08)
   -- build the entity/particle tables once so allocation is not timed
   entity_update(2000); particle_step(2000)
+
+  -- a 32x32 sprite, the same footprint as the rect cases
+  sprite = love.graphics.newCanvas(32, 32)
+  love.graphics.setCanvas(sprite)
+  love.graphics.clear(0, 0, 0)
+  for y = 0, 31 do
+    for x = 0, 31 do
+      love.graphics.setColor(x / 31, y / 31, 0.5)
+      love.graphics.rectangle("fill", x, y, 1, 1)
+    end
+  end
+  love.graphics.setCanvas()
+
+  font_ttf = love.graphics.newFont("fonts/vt323/VT323-Regular.ttf", 16)
+  canvas = love.graphics.newCanvas(256, 256)
+
   love.log("BENCHCOUNT " .. #WORK)
 end
 

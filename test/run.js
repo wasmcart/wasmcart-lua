@@ -197,37 +197,47 @@ async function main() {
     }
   }
 
-  // ── the sprite blitter must not change, ever ──────────────────────
-  // determinism.js does NOT cover this: its carts draw shapes and text, and
-  // it passed for an entire session while the blitter sampled wrong texels.
-  // This hashes a frame that exercises every blit argument shape, including
-  // the non-power-of-two fractional-scale case that actually broke.
-  const blitDir = path.join(ROOT, 'test', 'blit');
-  const blitGolden = path.join(blitDir, 'golden.txt');
-  if (fs.existsSync(path.join(blitDir, 'main.lua'))) {
-    const rb2 = await runCart(ENGINE, blitDir, 3);
+  // ── the rasterizer must not change, ever ──────────────────────────
+  // determinism.js does NOT cover this, and neither cart is redundant:
+  //
+  //   blit/   the sprite blitter. determinism.js passed for an entire
+  //           session while the blitter sampled wrong texels, because its
+  //           carts draw shapes and text and never a sprite.
+  //   prims/  the vector primitives. During the primitive optimization, a
+  //           control that corrupted every ALPHA line pixel changed nothing
+  //           in any of the 11 carts then in the suite -- alpha lines were
+  //           drawn by none of them. Both controls now fail here.
+  //
+  // Each hashes a frame that drives its primitives through every branch the
+  // optimizer hoists a decision out of: opaque, alpha, additive, scissored,
+  // and canvas destination.
+  for (const [name, why] of [['blit', 'sprite output'], ['prims', 'primitive output']]) {
+    const dir = path.join(ROOT, 'test', name);
+    const golden = path.join(dir, 'golden.txt');
+    if (!fs.existsSync(path.join(dir, 'main.lua'))) continue;
+    const rb2 = await runCart(ENGINE, dir, 3);
     if (rb2.trap || rb2.fields.lua_ok === 0) {
-      console.log(`\nFAIL  blit  cart did not run: ${rb2.trap || 'lua error'}`);
+      console.log(`\nFAIL  ${name}  cart did not run: ${rb2.trap || 'lua error'}`);
       for (const l of rb2.logs.slice(0, 6)) console.log(`      ${l}`);
       failed++;
+      continue;
+    }
+    const crypto = require('crypto');
+    const hash = crypto.createHash('sha256')
+      .update(Buffer.from(rb2.fb)).digest('hex').slice(0, 16);
+    if (!fs.existsSync(golden)) {
+      fs.writeFileSync(golden, hash + '\n');
+      console.log(`\nok    ${name.padEnd(12)} golden recorded (${hash})`);
     } else {
-      const crypto = require('crypto');
-      const hash = crypto.createHash('sha256')
-        .update(Buffer.from(rb2.fb)).digest('hex').slice(0, 16);
-      if (!fs.existsSync(blitGolden)) {
-        fs.writeFileSync(blitGolden, hash + '\n');
-        console.log(`\nok    blit         golden recorded (${hash})`);
+      const want = fs.readFileSync(golden, 'utf8').trim();
+      if (hash === want) {
+        console.log(`\nok    ${name.padEnd(12)} ${why} unchanged (${hash})`);
       } else {
-        const want = fs.readFileSync(blitGolden, 'utf8').trim();
-        if (hash === want) {
-          console.log(`\nok    blit         sprite output unchanged (${hash})`);
-        } else {
-          console.log(`\nFAIL  blit  sprite output CHANGED`);
-          console.log(`      golden ${want}`);
-          console.log(`      got    ${hash}`);
-          console.log(`      if this change is intended, delete test/blit/golden.txt`);
-          failed++;
-        }
+        console.log(`\nFAIL  ${name}  ${why} CHANGED`);
+        console.log(`      golden ${want}`);
+        console.log(`      got    ${hash}`);
+        console.log(`      if this change is intended, delete test/${name}/golden.txt`);
+        failed++;
       }
     }
   }
