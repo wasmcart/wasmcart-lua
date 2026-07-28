@@ -1,0 +1,25 @@
+{
+  "name": "wasmcart-lua",
+  "version": "0.1.0",
+  "description": "Write games in Lua, ship them as wasmcart carts. Real Lua 5.4 with a LOVE-style API.",
+  "license": "MIT",
+  "scripts": {
+    "build": "cd runtime && ./build.sh",
+    "test": "node test/run.js && node test/determinism.js",
+    "test:determinism": "node test/determinism.js"
+  },
+  "keywords": [
+    "lua",
+    "wasmcart",
+    "gamedev",
+    "wasm",
+    "cartridge"
+  ],
+  "files": [
+    "runtime/",
+    "template/",
+    "docs/",
+    "README.md",
+    "LICENSE"
+  ]
+}

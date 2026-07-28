@@ -1,0 +1,25 @@
+# Vendored upstream sources are FETCHED by runtime/build.sh, never committed.
+# These rules are deliberately specific: a blanket `build/` ignore would also
+# swallow vendored library source living under a build/ subdir, which has
+# eaten a vendored toolchain before.
+runtime/vendor/lua/
+runtime/vendor/luau/
+runtime/vendor/box2d/
+runtime/vendor/*.a
+runtime/vendor/*.tar.gz
+runtime/prelude.inc
+
+# COMMITTED ON PURPOSE (do NOT add to this ignore list):
+#   build/engine.wasm   - the prebuilt engine
+#   template/main.wasm  - so `cp -r template my-game && ./run.sh` works with
+#                         no toolchain. Shipping the wasm IS the product.
+#   ports/cavern/main.wasm - same, for the ported game
+
+# packed carts are per-user output, not source
+build/*.wasc
+examples/*/*.wasc
+examples/*/main.wasm
+ports/*/*.wasc
+
+node_modules/
+*.log
