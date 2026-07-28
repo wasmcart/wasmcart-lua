@@ -117,7 +117,14 @@ a canvas when one is bound.
 - Rotated rectangles are emitted from Lua as polygons; the polygon filler is
   a scanline even-odd fill.
 - `draw_image` inverse-transforms each destination pixel back into source
-  space, so rotation/scale/quad/tint are one code path.
+  space, so rotation/scale/quad/tint are one code path. It carries a
+  hard-won constraint: the per-pixel `/dw` division must NOT be replaced by
+  a hoisted reciprocal. When `dw` is not a power of two, `1/dw` is inexact
+  and `x*(1/dw)` rounds to a different source texel -- that moved 5.5% of
+  the screen in a real game. Incremental u,v stepping fails identically.
+  The speed instead comes from hoisting row-constant terms, computing the
+  whole v axis once per row for unrotated blits (84% of real draws), and
+  deciding destination/scissor/blend once per blit instead of per pixel.
 - Text: a 5x7 bitfont (85 glyphs, upper + lower + digits + punctuation) and
   TTF via stb_truetype with a baked atlas cached per (path, pixel size).
 
@@ -138,6 +145,19 @@ Measured headless (V8, no host pacing), 180 frames each:
 | particles (900) | ~1900 | 902 | 336 KB |
 | kitchen-sink | ~1500 | 136 | 141 KB |
 
+Per-frame cost of real carts, which is the number that matters (measure with
+`node test/bench.js` and the cart profiler):
+
+| cart | median frame | share of a 60fps budget |
+|---|---|---|
+| pong / shmup / platformer | 0.07 - 0.19 ms | ~1% |
+| particles, kitchen-sink | 0.4 - 0.6 ms | ~3% |
+| the Cavern port | 5.5 ms | 33% |
+
+Cavern is sprite-bound, not Lua-bound: 97% of its frame is inside the
+blitter and about 1% is Lua. That is why the perf work went into the
+rasterizer rather than into a JIT.
+
 (GC figures are higher than they were pre-Box2D: the physics layer keeps
 Lua-side collider tables alive. Headroom is unaffected.)
 
@@ -155,6 +175,12 @@ draw-call count.
 - no WASI function is called at runtime
 - the final frame isn't ≥99.5% a single color (blank-render detector)
 - no error-shaped log lines
+
+`test/blit/` hashes a frame that exercises every sprite-blit argument shape
+against a golden. This is separate from the determinism suite on purpose:
+those carts draw shapes and text, never sprites, and they passed for an
+entire debugging session while the blitter was sampling the wrong texels.
+If a blitter change is intended, delete `test/blit/golden.txt`.
 
 Then it runs `test/unit/` — a cart of 278 in-engine assertions covering real
 Lua semantics (closures, coroutines, metatables, varargs, pcall, goto),
