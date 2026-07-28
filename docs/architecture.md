@@ -465,13 +465,22 @@ the GPU was **closer** (err 3.2) than the software path (err 4.8), because
 `div255` truncates every additive step. The wider budget is tolerating the
 software rasterizer's error as much as the GPU's.
 
-Convex polygon fills are triangle fans. The software fill is an even-odd
-scanline sampling at pixel centres, which is what GPU triangle rasterization
-does, so interiors agree and only the boundary differs -- 21 pixels (0.002%)
-on `test/gl2dpoly`. **Concave fills stay on the CPU**: a fan over a concave
-polygon covers area the polygon does not, which is a visible error rather
-than an edge difference, so `poly_is_convex` rejects them (and self-
-intersecting even-odd polygons with them).
+Polygon fills are triangles. Convex ones fan directly; concave ones are
+**ear-clipped**, which is exact for any simple polygon. The software fill is
+an even-odd scanline sampling at pixel centres, which is what GPU triangle
+rasterization does, so interiors agree and only the boundary differs -- 21
+pixels (0.002%) on `test/gl2dpoly`.
+
+**Self-intersecting polygons stay on the CPU, permanently.** Even-odd leaves
+the overlap as a hole -- a pentagram's centre is empty -- while any
+triangulation of the outline fills it in. That is a wrong answer, not an
+unimplemented one, so `poly_is_simple` rejects them.
+
+Two ordering details matter here. Simplicity is checked **before** convexity:
+a pentagram turns the same way at every vertex, so `poly_is_convex` calls it
+convex, and it would otherwise take the fan path and skip the guard entirely.
+And ear clipping is O(n³) worst case on a shape a cart re-submits every
+frame, so triangulations are cached against a hash of the vertex positions.
 
 This one reaches further than it looks. `graphics.rectangle` emits a *polygon*
 whenever the transform stack has a rotation, so any cart that calls

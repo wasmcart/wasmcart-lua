@@ -8,17 +8,30 @@
 -- the GPU (it reported "the cart drew nothing", since prims then had an
 -- empty software framebuffer).
 --
--- A CONCAVE polygon fill is the trigger here: a triangle fan over one covers
--- area the polygon does not, so those keep the scanline rasterizer by design
--- rather than by omission. If GL2D ever gains concave fills, this cart needs
--- a new trigger and the gate will say so the same way.
+-- The trigger is a SELF-INTERSECTING polygon fill. That is not a gap waiting
+-- to be closed: even-odd leaves the overlap as a hole (a pentagram's centre
+-- is empty) while any triangulation of the outline fills it in, so those keep
+-- the scanline rasterizer permanently.
+--
+-- This cart has now been re-triggered twice, and each time the gate said so
+-- rather than silently passing. It first used circles, which moved to a
+-- fragment shader; then a concave fill, which moved to ear clipping. Both
+-- times the gate failed with "the cart drew nothing" -- correct, because its
+-- premise had expired. A self-intersecting fill should not expire the same
+-- way, since triangulating it would be wrong rather than merely unimplemented.
 
 function love.draw()
   love.graphics.setBackgroundColor(0.05, 0.06, 0.1)
 
-  -- the fallback trigger: a concave (arrow) polygon
+  -- the fallback trigger: a self-intersecting (pentagram) polygon
   love.graphics.setColor(0.9, 0.4, 0.2)
-  love.graphics.polygon("fill", 200, 100, 300, 250, 200, 200, 100, 250)
+  local star = {}
+  for i = 0, 4 do
+    local a = -math.pi / 2 + i * 4 * math.pi / 5
+    star[#star + 1] = 200 + math.cos(a) * 90
+    star[#star + 1] = 170 + math.sin(a) * 90
+  end
+  love.graphics.polygon("fill", star)
 
   -- ordinary content, so the blit has a real frame to carry
   love.graphics.setColor(0.3, 0.7, 1.0)

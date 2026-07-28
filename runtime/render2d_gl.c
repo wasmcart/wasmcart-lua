@@ -489,17 +489,19 @@ int wcl_r2d_solid(int x, int y, int w, int h, uint32_t color, int alpha) {
     return 1;
 }
 
-/* Convex fill as a triangle fan.
+/* Polygon fill as triangles.
  *
  * The software path is an even-odd scanline fill sampling at pixel centres,
  * which is what GPU triangle rasterization does too, so interiors agree and
  * only the boundary can differ -- the same edge-coverage story as rotated
  * sprites.
  *
- * CONVEX ONLY. A fan over a concave polygon covers area the polygon does
- * not, which is a visible error rather than an edge difference, so those
- * return 0 and the caller keeps the scanline fill. Even-odd self-
- * intersecting polygons are rejected by the same test. */
+ * Convex polygons fan trivially. Concave ones are ear-clipped first, which
+ * is exact for any SIMPLE polygon. Self-intersecting polygons are the one
+ * case that must NOT be triangulated: even-odd leaves the overlap as a hole
+ * (a pentagram's centre is empty) while a triangulation of the outline fills
+ * it in. Those keep the scanline fill.
+ */
 static int poly_is_convex(const double *xs, const double *ys, int n) {
     int sign = 0;
     for (int i = 0; i < n; i++) {
@@ -510,6 +512,86 @@ static int poly_is_convex(const double *xs, const double *ys, int n) {
         else if (cross < -1e-9) { if (sign > 0) return 0; sign = -1; }
     }
     return 1;
+}
+
+static double poly_area2(const double *xs, const double *ys, int n) {
+    double a = 0;
+    for (int i = 0, j = n - 1; i < n; j = i++)
+        a += (xs[j] - xs[i]) * (ys[j] + ys[i]);
+    return a;
+}
+
+static int seg_hits(double ax, double ay, double bx, double by,
+                    double cx, double cy, double dx, double dy) {
+    const double d1 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    const double d2 = (bx - ax) * (dy - ay) - (by - ay) * (dx - ax);
+    const double d3 = (dx - cx) * (ay - cy) - (dy - cy) * (ax - cx);
+    const double d4 = (dx - cx) * (by - cy) - (dy - cy) * (bx - cx);
+    return ((d1 > 0) != (d2 > 0)) && ((d3 > 0) != (d4 > 0));
+}
+
+/* Only non-adjacent edges can cross in a simple polygon. O(n^2), but n is
+ * capped at 64 and this runs once per polygon, not per pixel. */
+static int poly_is_simple(const double *xs, const double *ys, int n) {
+    for (int i = 0; i < n; i++) {
+        const int i2 = (i + 1) % n;
+        for (int j = i + 1; j < n; j++) {
+            const int j2 = (j + 1) % n;
+            if (i == j || i2 == j || j2 == i) continue;
+            if (seg_hits(xs[i], ys[i], xs[i2], ys[i2],
+                         xs[j], ys[j], xs[j2], ys[j2])) return 0;
+        }
+    }
+    return 1;
+}
+
+static int pt_in_tri(double px, double py,
+                     double ax, double ay, double bx, double by,
+                     double cx, double cy) {
+    const double d1 = (px - bx) * (ay - by) - (ax - bx) * (py - by);
+    const double d2 = (px - cx) * (by - cy) - (bx - cx) * (py - cy);
+    const double d3 = (px - ax) * (cy - ay) - (cx - ax) * (py - ay);
+    const int neg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+    const int pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+    return !(neg && pos);
+}
+
+/* Ear clipping. Writes 3*(n-2) indices into `out`; returns the triangle
+ * count, or 0 if the polygon could not be triangulated. */
+static int poly_triangulate(const double *xs, const double *ys, int n, int *out) {
+    int idx[64];
+    const int ccw = poly_area2(xs, ys, n) > 0;
+    for (int i = 0; i < n; i++) idx[i] = ccw ? i : (n - 1 - i);
+
+    int m = n, tris = 0, guard = 0;
+    while (m > 3 && guard++ < 64 * 64) {
+        int clipped = 0;
+        for (int i = 0; i < m; i++) {
+            const int ia = idx[(i + m - 1) % m], ib = idx[i], ic = idx[(i + 1) % m];
+            const double ax = xs[ia], ay = ys[ia];
+            const double bx = xs[ib], by = ys[ib];
+            const double cx = xs[ic], cy = ys[ic];
+            /* convex corner? (consistent winding, so cross > 0) */
+            if ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax) <= 0) continue;
+            /* no other vertex inside the candidate ear */
+            int ok = 1;
+            for (int k = 0; k < m && ok; k++) {
+                const int iv = idx[k];
+                if (iv == ia || iv == ib || iv == ic) continue;
+                if (pt_in_tri(xs[iv], ys[iv], ax, ay, bx, by, cx, cy)) ok = 0;
+            }
+            if (!ok) continue;
+            out[tris * 3 + 0] = ia; out[tris * 3 + 1] = ib; out[tris * 3 + 2] = ic;
+            tris++;
+            for (int k = i; k + 1 < m; k++) idx[k] = idx[k + 1];
+            m--;
+            clipped = 1;
+            break;
+        }
+        if (!clipped) return 0;   /* no ear found: give up, caller falls back */
+    }
+    out[tris * 3 + 0] = idx[0]; out[tris * 3 + 1] = idx[1]; out[tris * 3 + 2] = idx[2];
+    return tris + 1;
 }
 
 /* Filled circle, evaluated in the fragment shader.
@@ -555,28 +637,93 @@ int wcl_r2d_circle(int cx, int cy, int r, uint32_t color, int alpha) {
     return 1;
 }
 
+/* Triangulation cache.
+ *
+ * Ear clipping is O(n^3) in the worst case and a cart re-submits the same
+ * shape every frame: a 19-vertex comb costs ~3400 point-in-triangle tests,
+ * and doing that per frame made a polygon-heavy cart 0.38x, i.e. SLOWER than
+ * the software scanline fill it replaced. The triangulation depends only on
+ * the vertex positions, so cache it against a hash of them. Convex polygons
+ * skip all of this -- their fan is derived directly.
+ */
+typedef struct {
+    uint32_t hash;
+    int n, ntri;
+    int tri[3 * 64];
+    int used;
+} tricache_t;
+#define MAX_TRICACHE 16
+static tricache_t tricache[MAX_TRICACHE];
+static int tricache_next;
+
+static uint32_t poly_hash(const double *xs, const double *ys, int n) {
+    uint32_t h = 2166136261u ^ (uint32_t)n;
+    for (int i = 0; i < n; i++) {
+        /* quantize to 1/16 px: far finer than any visible difference, and
+         * stable against the float noise a transform stack introduces */
+        const int32_t qx = (int32_t)(xs[i] * 16.0);
+        const int32_t qy = (int32_t)(ys[i] * 16.0);
+        h = (h ^ (uint32_t)qx) * 16777619u;
+        h = (h ^ (uint32_t)qy) * 16777619u;
+    }
+    return h;
+}
+
 int wcl_r2d_poly(const double *xs, const double *ys, int n,
                  uint32_t color, int alpha) {
-    if (!wcl_r2d_active() || n < 3) return 0;
-    if (!poly_is_convex(xs, ys, n)) return 0;
-    /* the fan is (n-2) triangles = 3*(n-2) vertices, drawn unindexed */
-    if (n > 64) return 0;
+    if (!wcl_r2d_active() || n < 3 || n > 64) return 0;
+
+    /* Simplicity is checked FIRST, before convexity.
+     *
+     * A pentagram turns the same way at every vertex, so poly_is_convex
+     * calls it convex and it would take the fan path -- skipping the
+     * self-intersection guard entirely and filling a centre that even-odd
+     * leaves hollow. That was latent while only convex fills were on GL;
+     * adding ear clipping is what surfaced it. Cheap enough at n <= 64 to
+     * run unconditionally, and it is the correctness gate for both paths. */
+    if (!poly_is_simple(xs, ys, n)) return 0;
+
+    int tri[3 * 64];
+    int ntri = 0;
+    if (poly_is_convex(xs, ys, n)) {
+        /* a fan needs no clipping and no cache */
+        for (int i = 1; i + 1 < n; i++) {
+            tri[ntri * 3 + 0] = 0; tri[ntri * 3 + 1] = i; tri[ntri * 3 + 2] = i + 1;
+            ntri++;
+        }
+    } else {
+        const uint32_t h = poly_hash(xs, ys, n);
+        tricache_t *hit = NULL;
+        for (int i = 0; i < MAX_TRICACHE; i++)
+            if (tricache[i].used && tricache[i].hash == h && tricache[i].n == n) {
+                hit = &tricache[i]; break;
+            }
+        if (hit) {
+            ntri = hit->ntri;
+            for (int i = 0; i < ntri * 3; i++) tri[i] = hit->tri[i];
+        } else {
+            ntri = poly_triangulate(xs, ys, n, tri);
+            if (ntri <= 0) return 0;
+            tricache_t *slot = &tricache[tricache_next];
+            tricache_next = (tricache_next + 1) % MAX_TRICACHE;
+            slot->hash = h; slot->n = n; slot->ntri = ntri; slot->used = 1;
+            for (int i = 0; i < ntri * 3; i++) slot->tri[i] = tri[i];
+        }
+    }
+    if (ntri <= 0) return 0;
     flush_batches();
 
-    vertex_t v[3 * 62];
+    vertex_t v[3 * 64];
     float r = (float)((color >> 16) & 255) / 255.0f;
     float g = (float)((color >> 8) & 255) / 255.0f;
     float b = (float)(color & 255) / 255.0f;
     float a = (float)alpha / 255.0f;
     int vc = 0;
-    for (int i = 1; i + 1 < n; i++) {
-        const int idx[3] = { 0, i, i + 1 };
-        for (int k = 0; k < 3; k++) {
-            ndc((float)xs[idx[k]], (float)ys[idx[k]], &v[vc].x, &v[vc].y);
-            v[vc].u = v[vc].v = 0;
-            v[vc].r = r; v[vc].g = g; v[vc].b = b; v[vc].a = a;
-            vc++;
-        }
+    for (int t = 0; t < ntri * 3; t++) {
+        ndc((float)xs[tri[t]], (float)ys[tri[t]], &v[vc].x, &v[vc].y);
+        v[vc].u = v[vc].v = 0;
+        v[vc].r = r; v[vc].g = g; v[vc].b = b; v[vc].a = a;
+        vc++;
     }
     set_blend(alpha < 255);
     glBindBuffer(GL_ARRAY_BUFFER, buffer);
@@ -584,7 +731,7 @@ int wcl_r2d_poly(const double *xs, const double *ys, int n,
     set_textured(0);
     glDrawArrays(GL_TRIANGLES, 0, vc);
     frame_stats.draws++;
-    frame_stats.quads += (uint32_t)(n - 2);
+    frame_stats.quads += (uint32_t)ntri;
     return 1;
 }
 

@@ -4,11 +4,11 @@
 -- is what GPU triangle rasterization does, so interiors agree and only the
 -- boundary can differ -- the same edge-coverage story as rotated sprites.
 --
--- Only CONVEX polygons take the GL path. A triangle fan over a concave
--- polygon covers area the polygon does not, which is a visible error rather
--- than an edge difference, so concave fills stay on the scanline rasterizer.
--- This cart is convex-only so it measures the GL path; the concave case is
--- covered by test/prims, which falls back.
+-- Convex polygons fan directly; concave ones are ear-clipped first, which is
+-- exact for any SIMPLE polygon. Self-intersecting polygons are the one case
+-- that must NOT be triangulated: even-odd leaves the overlap as a hole (a
+-- pentagram's centre is empty) while a triangulation of the outline fills it
+-- in, so those keep the scanline fill. test/fallback covers that.
 
 function love.draw()
   love.graphics.setBackgroundColor(0.05, 0.05, 0.1)
@@ -56,6 +56,32 @@ function love.draw()
     love.graphics.setColor(0.9, 0.2, 0.6, 0.35)
     ngon(500 + i * 45, 450, 70, 6, i * 0.2)
   end
+
+  -- CONCAVE fills, which are ear-clipped rather than fanned. Every one of
+  -- these is SIMPLE (non-self-intersecting): a self-intersecting polygon
+  -- correctly falls back, so using one here would measure the software path
+  -- and report a meaningless "0 differing". Two of the shapes originally
+  -- written for this cart did exactly that.
+  love.graphics.setColor(1, 0.5, 0.2)
+  love.graphics.polygon("fill", 80, 710, 80, 620, 180, 690, 280, 620, 280, 710)
+  -- an arrow: one reflex vertex
+  love.graphics.setColor(0.4, 0.9, 1.0)
+  love.graphics.polygon("fill", 320, 620, 440, 665, 320, 710, 350, 665)
+  -- an L, where the ear order matters
+  love.graphics.setColor(0.9, 0.9, 0.3, 0.7)
+  love.graphics.polygon("fill", 500, 620, 560, 620, 560, 680, 620, 680, 620, 710, 500, 710)
+  -- a comb, several reflex vertices in a row
+  love.graphics.setColor(0.8, 0.4, 1.0)
+  local comb = { 680, 710, 680, 620 }
+  for i = 0, 3 do
+    local x = 700 + i * 30
+    comb[#comb + 1] = x;      comb[#comb + 1] = 620
+    comb[#comb + 1] = x;      comb[#comb + 1] = 670
+    comb[#comb + 1] = x + 15; comb[#comb + 1] = 670
+    comb[#comb + 1] = x + 15; comb[#comb + 1] = 620
+  end
+  comb[#comb + 1] = 830; comb[#comb + 1] = 710
+  love.graphics.polygon("fill", comb)
 
   -- outlines, which are lines and already on the GL path
   love.graphics.setColor(1, 1, 1)
