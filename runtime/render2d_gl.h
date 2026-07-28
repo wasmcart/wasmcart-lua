@@ -49,6 +49,11 @@ void wcl_r2d_scissor(int x, int y, int w, int h);
 int  wcl_r2d_poly(const double *xs, const double *ys, int n,
                   uint32_t color, int alpha);
 
+/* Filled circle as a triangle fan. Returns 0 for small radii, where the
+ * shape is mostly boundary and the edge-coverage difference stops being a
+ * rounding detail. */
+int  wcl_r2d_circle(int cx, int cy, int r, uint32_t color, int alpha);
+
 /* Additive blending on/off. Batches are flushed on a change because the
  * blend mode is pipeline state, not per-vertex. */
 void wcl_r2d_blend_add(int on);
@@ -101,6 +106,9 @@ static inline void wcl_r2d_scissor(int x, int y, int w, int h) {
     (void)x; (void)y; (void)w; (void)h;
 }
 static inline void wcl_r2d_blend_add(int on) { (void)on; }
+static inline int wcl_r2d_circle(int cx, int cy, int r, uint32_t color, int alpha) {
+    (void)cx; (void)cy; (void)r; (void)color; (void)alpha; return 0;
+}
 static inline int wcl_r2d_poly(const double *xs, const double *ys, int n,
                                uint32_t color, int alpha) {
     (void)xs; (void)ys; (void)n; (void)color; (void)alpha; return 0;

@@ -478,8 +478,24 @@ whenever the transform stack has a rotation, so any cart that calls
 `love.graphics.rotate` around a rect was dropping to software before this and
 now stays on GL.
 
+Filled circles are evaluated **in the fragment shader**, not approximated by
+geometry. One quad covers the bounding box and the shader applies the
+software rasterizer's own rule -- `span = round(sqrt(r*r - dy*dy))`, covered
+iff `|dx| <= span` -- which is **bit-exact at every radius**, with no segment
+count, no minimum radius and no fallback.
+
+A triangle fan was tried first and is the wrong tool: it approximates the
+boundary with straight edges, measured at ~0.5 px per boundary pixel, which
+is 1% of the area at r=100 but **23% at r=4**. One quad is also cheaper than
+the 64 triangles a fan needed before extra segments stopped helping.
+
+The shader's coverage maths must be `highp`. It squares both the radius and
+the row offset, and `mediump` is only guaranteed ~10 bits of mantissa in
+GLES -- at r=66 that put 24 pixels a whole pixel outside the software fill.
+Colour and UVs stay `mediump`.
+
 **The CPU fallback is whole-frame and sticky.** What GL2D still does not
-implement -- concave polygon fills, circles, the Lua error screen -- calls
+implement -- concave polygon fills and the Lua error screen -- calls
 `wcl_r2d_disable()`,
 and from then on every frame is rasterized in software and presented with one
 `wc_gl_blit`. Reconciling per draw would cost ~0.19 ms each way, which a real

@@ -249,16 +249,23 @@ async function main() {
     }
   }
 
-  // ── the GL display path must show what the cart drew ──────────────
-  // Only when a GL context is available on this machine. wc_gl_blit changes only HOW pixels reach the
-  // screen, so the GPU's output must equal the software framebuffer exactly;
-  // anything else means the display path is misreporting the cart.
+  // ── the CPU-fallback blit must show what the cart drew ────────────
+  // When a frame falls back, the software rasterizer draws it and wc_gl_blit
+  // presents it as a fullscreen quad, so the GPU's output must equal the
+  // cart's framebuffer EXACTLY -- the blit changes only how pixels reach the
+  // screen, not what they are.
+  //
+  // This needs a cart that actually falls back. It used to use test/prims,
+  // which fell back because it drew circles; now that circles render on the
+  // GPU, prims stays on GL, its software framebuffer is empty, and the gate
+  // reported "the cart drew nothing". Point it at a cart that still falls
+  // back for a reason GL2D does not implement -- a concave polygon fill.
   const glEngine = GL_ENGINE;
   if (fs.existsSync(glEngine)) {
     const { execFileSync } = require('child_process');
     try {
       const out = execFileSync(process.execPath,
-        [path.join(ROOT, 'tools', 'gl-verify.mjs'), glEngine, path.join(ROOT, 'test', 'prims'), '3'],
+        [path.join(ROOT, 'tools', 'gl-verify.mjs'), glEngine, path.join(ROOT, 'test', 'fallback'), '3'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       const m = out.match(/(\d+) differing pixels/);
       console.log(`\nok    gl-display   GPU output identical to software (${m ? m[1] : '0'} differing)`);
@@ -287,7 +294,7 @@ async function main() {
   // more accurate of the two there (div255 truncates every additive step).
   for (const [cart, tol] of [['gl2d', '2'], ['gl2dcanvas', '2'],
                              ['gl2dtext', '2'], ['gl2dblend', '8'],
-                             ['gl2dpoly', '2']]) {
+                             ['gl2dpoly', '2'], ['gl2dcircle', '2']]) {
     if (!fs.existsSync(glEngine)) break;
     if (!fs.existsSync(path.join(ROOT, 'test', cart, 'main.lua'))) continue;
     const { execFileSync } = require('child_process');

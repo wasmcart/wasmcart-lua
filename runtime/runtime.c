@@ -357,12 +357,22 @@ static void raster_line(int x0, int y0, int x1, int y1, uint32_t c, int a) {
 
 static void raster_circle(int cx, int cy, int r, uint32_t c, int a, int filled) {
     if (r <= 0) return;
-    /* A GL triangle fan does NOT reproduce the software span fill: the
-     * midpoint/sqrt spans and polygon coverage disagree on the boundary, and
-     * a circle is nearly all boundary at small radii. Circles therefore
-     * still drop the frame to the CPU backend, which is correct rather than
-     * approximate. Cavern hits this, which is why it stays on software. */
-    wcl_r2d_disable();
+    /* Filled circles are evaluated in the fragment shader with the same span
+     * rule used below, so they are bit-exact at every radius -- no fan, no
+     * minimum radius, no fallback. */
+    if (filled) {
+        if (wcl_r2d_circle(cx, cy, r, c, a)) return;
+        wcl_r2d_disable();
+    }
+    /* The OUTLINE writes single pixels. blend_span goes straight to the
+     * framebuffer and would be INVISIBLE on a GL frame, so on the GL path
+     * each pixel goes through fill_rect (a 1x1 quad) and joins the solid
+     * batch instead. Same pixels, one draw call for the whole circle. */
+    const int gl_outline = (!filled && !rt_buf && wcl_r2d_active());
+#define CIRC_PX(px, py) do { \
+    if (gl_outline) fill_rect((px), (py), 1, 1, c, a); \
+    else blend_span((px), (px) + 1, (py), c, a); \
+} while (0)
     if (filled) {
         for (int yy = -r; yy <= r; yy++) {
             int span = (int)(sqrt((double)(r * r - yy * yy)) + 0.5);
@@ -375,18 +385,19 @@ static void raster_circle(int cx, int cy, int r, uint32_t c, int a, int filled) 
      * still hoists the destination and scissor decisions per call. */
     int x = r, y = 0, err = 1 - x;
     while (x >= y) {
-        blend_span(cx + x, cx + x + 1, cy + y, c, a);
-        blend_span(cx + y, cx + y + 1, cy + x, c, a);
-        blend_span(cx - y, cx - y + 1, cy + x, c, a);
-        blend_span(cx - x, cx - x + 1, cy + y, c, a);
-        blend_span(cx - x, cx - x + 1, cy - y, c, a);
-        blend_span(cx - y, cx - y + 1, cy - x, c, a);
-        blend_span(cx + y, cx + y + 1, cy - x, c, a);
-        blend_span(cx + x, cx + x + 1, cy - y, c, a);
+        CIRC_PX(cx + x, cy + y);
+        CIRC_PX(cx + y, cy + x);
+        CIRC_PX(cx - y, cy + x);
+        CIRC_PX(cx - x, cy + y);
+        CIRC_PX(cx - x, cy - y);
+        CIRC_PX(cx - y, cy - x);
+        CIRC_PX(cx + y, cy - x);
+        CIRC_PX(cx + x, cy - y);
         y++;
         if (err < 0) err += 2 * y + 1;
         else { x--; err += 2 * (y - x) + 1; }
     }
+#undef CIRC_PX
 }
 
 /* convex/concave polygon scanline fill (even-odd) */
