@@ -23,7 +23,9 @@ const path = require('path');
 const crypto = require('crypto');
 
 const ROOT = path.join(__dirname, '..');
-const ENGINE = path.join(ROOT, 'build', 'engine.wasm');
+// The CPU comparator: these hashes assert BIT-equality, which only the
+// software rasterizer promises. build/engine.wasm is the GL build now.
+const ENGINE = path.join(ROOT, 'build', 'engine-cpu.wasm');
 const FRAMES = 120;
 
 // Every cart that renders. Each is hashed over FRAMES frames so animation and

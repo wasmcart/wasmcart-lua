@@ -108,8 +108,10 @@ async function run(engine, useGl) {
   return { rgb: out, logs };
 }
 
-const a = await run(path.join(ROOT, 'build', 'engine-gl.wasm'), true);
-const b = await run(path.join(ROOT, 'build', 'engine.wasm'), false);
+// engine.wasm is the GL build (the default); engine-cpu.wasm is the
+// software-only comparator it is diffed against.
+const a = await run(path.join(ROOT, 'build', 'engine.wasm'), true);
+const b = await run(path.join(ROOT, 'build', 'engine-cpu.wasm'), false);
 
 const hist = new Map();
 let over = 0, maxd = 0, lit = 0;

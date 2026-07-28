@@ -11,7 +11,7 @@
  * native-gles one), then reads the GPU's framebuffer back and diffs it
  * against the cart's software framebuffer, pixel for pixel.
  *
- *   node tools/gl-verify.mjs build/engine-gl.wasm test/prims
+ *   node tools/gl-verify.mjs build/engine.wasm test/prims
  */
 import fs from 'fs';
 import path from 'path';
@@ -20,7 +20,7 @@ const WEBGL_NODE = process.env.WEBGL_NODE
   || `${process.env.HOME}/code/cliemu/romdev/node_modules/webgl-node/index.mjs`;
 
 const W = 1280, H = 720;
-const enginePath = process.argv[2] || 'build/engine-gl.wasm';
+const enginePath = process.argv[2] || 'build/engine.wasm';
 const cartDir = process.argv[3] || 'test/prims';
 const FRAMES = +(process.argv[4] || 3);
 

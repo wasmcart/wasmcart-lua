@@ -71,38 +71,33 @@ mkdir -p ../build
 # -sSUPPORT_LONGJMP=wasm is REQUIRED: Lua's error handling is setjmp/longjmp
 # and the default JS-trampoline form breaks under import-stubbing hosts.
 # No LTO: it crashes the wasm-sjlj path.
-emcc runtime.c vorbis.c cartconf.c physics.c \
-  vendor/liblua54.a vendor/libbox2d.a \
-  -O2 -msimd128 -msse2 \
-  -I vendor/lua/src -I vendor/box2d/include -I "$WASMCART_REPO/include" -I . \
-  -s STANDALONE_WASM=1 --no-entry -sSUPPORT_LONGJMP=wasm \
-  -s EXPORTED_FUNCTIONS='["_wc_init","_wc_render","_wc_get_info","_wc_debug_state","_wc_set_seed"]' \
-  -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
-  -s ALLOW_MEMORY_GROWTH=1 -s INITIAL_MEMORY=67108864 -s STACK_SIZE=4194304 \
-  -o ../build/engine.wasm
-echo "built ../build/engine.wasm ($(wc -c < ../build/engine.wasm) bytes)"
-
-# ── optional GL-presenting variant ──────────────────────────────────
-# WCL_USE_GL builds the same engine but presents through wc_gl_blit: the
-# software rasterizer still produces every pixel, and one fullscreen quad
-# puts them on screen, which is the spec's standard display path.
-#
-# It is a SEPARATE artifact, not a replacement. A cart that imports the "gl"
-# module is a GL cart to every host, and a host handed a GL cart with no GL
-# context must fail the load rather than stub it -- so shipping this as the
-# default would break every 2D-only host for a change that moves no pixels.
-if [ "${WCL_GL:-0}" = "1" ]; then
+# ── the engine ──────────────────────────────────────────────────────
+# GL2D is the DEFAULT. Target hardware has a GPU, and the measured wins are
+# large (Cavern 49.5x, render targets 113x). The software rasterizer is still
+# built into this same binary and still renders every frame that GL2D cannot
+# (circles, polygons, additive, the error screen) via the sticky whole-frame
+# fallback -- it is the reference implementation, not a legacy path.
+build_engine() {   # $1 = output, $2... = extra flags
+  local out="$1"; shift
   emcc runtime.c vorbis.c cartconf.c physics.c render2d_gl.c \
     vendor/liblua54.a vendor/libbox2d.a \
-    -O2 -msimd128 -msse2 -DWCL_USE_GL -DWCL_ENABLE_GL2D \
+    -O2 -msimd128 -msse2 "$@" \
     -I vendor/lua/src -I vendor/box2d/include -I "$WASMCART_REPO/include" -I . \
     -s STANDALONE_WASM=1 --no-entry -sSUPPORT_LONGJMP=wasm \
     -s EXPORTED_FUNCTIONS='["_wc_init","_wc_render","_wc_get_info","_wc_debug_state","_wc_set_seed"]' \
     -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
     -s ALLOW_MEMORY_GROWTH=1 -s INITIAL_MEMORY=67108864 -s STACK_SIZE=4194304 \
-    -o ../build/engine-gl.wasm
-  echo "built ../build/engine-gl.wasm ($(wc -c < ../build/engine-gl.wasm) bytes)"
-fi
+    -o "$out"
+  echo "built $out ($(wc -c < "$out") bytes)"
+}
+
+build_engine ../build/engine.wasm -DWCL_USE_GL -DWCL_ENABLE_GL2D
+
+# ── the CPU-only comparator ─────────────────────────────────────────
+# Imports nothing from the `gl` module, so it is what the GL build is
+# measured and diffed against (tools/gl2d-compare.mjs, test/render-hash.js).
+# Also the artifact to reach for on a host with no GL at all.
+build_engine ../build/engine-cpu.wasm
 
 # the template ships the engine so `run.sh` works with no build step
 cp ../build/engine.wasm ../template/main.wasm

@@ -19,7 +19,14 @@ const fs = require('fs');
 const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
-const ENGINE = path.join(ROOT, 'build', 'engine.wasm');
+// build/engine.wasm is now the GL build. The example smoke runs, the unit
+// cart and the blit/prims GOLDENS all target the CPU comparator instead: the
+// goldens assert bit-equality, which is a property of the software
+// rasterizer, and running them against GL would either fail or force the
+// goldens to be loosened into meaninglessness. GL is gated separately, by
+// tolerance, in the gl2d* section below.
+const ENGINE = path.join(ROOT, 'build', 'engine-cpu.wasm');
+const GL_ENGINE = path.join(ROOT, 'build', 'engine.wasm');
 
 function loadAssets(dir) {
   const out = {};
@@ -243,11 +250,10 @@ async function main() {
   }
 
   // ── the GL display path must show what the cart drew ──────────────
-  // Only when build/engine-gl.wasm exists (runtime/build.sh WCL_GL=1) and a
-  // GL context is available. wc_gl_blit changes only HOW pixels reach the
+  // Only when a GL context is available on this machine. wc_gl_blit changes only HOW pixels reach the
   // screen, so the GPU's output must equal the software framebuffer exactly;
   // anything else means the display path is misreporting the cart.
-  const glEngine = path.join(ROOT, 'build', 'engine-gl.wasm');
+  const glEngine = GL_ENGINE;
   if (fs.existsSync(glEngine)) {
     const { execFileSync } = require('child_process');
     try {

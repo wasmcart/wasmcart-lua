@@ -393,9 +393,22 @@ Measured here on Tetris (1500 frames, this machine): **GL 0.377 ms vs CPU
 well short of the 49x an idealised probe suggests, because a real cart is not
 purely fill-bound.
 
-## GL2D (opt-in: `WCL_GL=1`)
+## GL2D (the default)
 
-`build/engine-gl.wasm` renders through a real WebGL2 context: one shared
+`runtime/build.sh` produces two artifacts:
+
+| artifact | what it is |
+|---|---|
+| `build/engine.wasm` | **the engine.** GL2D + the software rasterizer, which still renders every frame GL2D cannot. This is what `template/main.wasm` ships. |
+| `build/engine-cpu.wasm` | software only, imports nothing from `gl`. The comparator the GL build is diffed against, and the artifact for a host with no GL. |
+
+The goldens (`test/blit`, `test/prims`, `test/render-hash.js`) run against the
+**CPU** build on purpose: they assert bit-equality, which is a property of the
+software rasterizer. Running them against GL would either fail or force them
+to be loosened into meaninglessness. GL is gated separately and by tolerance,
+in the `gl2d*` carts.
+
+`build/engine.wasm` renders through a real WebGL2 context: one shared
 2048x2048 atlas, batched solid and textured quads (a whole frame of sprites
 is one draw call), cached GL state, indices uploaded once. Built on the model
 `wasmcart-mruby` shipped first.
