@@ -417,9 +417,159 @@ function graphics.setBlendMode(mode)
   wc.set_blend(mode == "add" and 1 or 0)
 end
 
+-- ── shaders ────────────────────────────────────────────────────────
+--
+-- LOVE's shader shape, on the GL2D renderer's own program contract.
+--
+-- A cart writes only the LOVE-shaped body:
+--
+--   local s = love.graphics.newShader[[
+--     vec4 effect(vec4 color, Image tex, vec2 texture_coords, vec2 screen_coords) {
+--       vec4 px = Texel(tex, texture_coords);
+--       return vec4(1.0 - px.rgb, px.a) * color;
+--     }
+--   ]]
+--
+-- Everything around it -- the "#version 300 es" line, the ins and outs, the
+-- Texel/love_ScreenSize predefines, and a main() that reproduces the
+-- engine's own solid/texture/glyph/circle dispatch -- is synthesized in C
+-- (see SHADER_FRAG_PROLOGUE in render2d_gl.c). That is what lets a shader
+-- apply uniformly to rectangles, sprites, text and circles instead of only
+-- to textured draws.
+--
+-- The surface is WebGL2 / GLES 3.0. A shader that writes its own #version,
+-- or uses GLSL ES 1.00 spellings (gl_FragColor, texture2D, varying,
+-- attribute) or anything from GLES 3.1+, is refused BY NAME rather than
+-- handed to the driver, because a driver error points at line numbers in
+-- generated code the cart author never wrote.
+
+local Shader = {}
+Shader.__index = Shader
+function Shader:type() return "Shader" end
+function Shader:getHandle() return self.id end
+
+-- Shader:send(name, value, ...)
+--
+-- Accepts what LOVE's does minus the types this engine has no object for:
+--   number, number...      -> float / vecN
+--   { a, b, c }            -> vecN (N = #table, up to 4)
+--   { {..},{..},{..},{..} } -> mat4
+--   boolean...             -> bool / bvecN
+--   Image or Canvas        -> sampler2D
+--
+-- A name that is not in the LINKED program returns false rather than
+-- erroring: GLSL compilers remove uniforms that do not affect the output, so
+-- a live uniform can vanish the moment a cart comments out a line, and
+-- throwing there would be worse than useless. A name that was never written
+-- at all is the same case and is reported the same way.
+function Shader:send(name, a, ...)
+  if type(name) ~= "string" then
+    error("Shader:send: the uniform name must be a string", 2)
+  end
+  if type(a) == "table" then
+    if a.id and (a.w or a.canvas) then          -- an Image or a Canvas
+      return wc.shader_send_image(self.id, name, a.id)
+    end
+    return wc.shader_send(self.id, name, a)
+  end
+  if type(a) == "boolean" then
+    return wc.shader_send_bool(self.id, name, a, ...)
+  end
+  if type(a) == "number" then
+    return wc.shader_send(self.id, name, a, ...)
+  end
+  error("Shader:send('" .. name .. "'): unsupported value type '" ..
+        type(a) .. "'. Supported: number(s), a table of 1-4 numbers, a 4x4 " ..
+        "table-of-tables, boolean(s), an Image or a Canvas.", 2)
+end
+
+-- LOVE's introspection helper, and a READ-ONLY one. The obvious shortcut --
+-- "try sending 0 and see whether it took" -- writes the uniform, so merely
+-- asking whether a uniform exists would zero it. Games call hasUniform to
+-- guard an optional uniform immediately before setting it, where that
+-- clobber is invisible right up until it is not.
+function Shader:hasUniform(name)
+  return wc.shader_has_uniform(self.id, name)
+end
+
+function Shader:release() return true end
+
+-- newShader(pixelcode) | newShader(pixelcode, vertexcode)
+--
+-- LOVE also accepts filenames. A cart's GLSL lives in its asset bundle, so a
+-- string that names an existing asset is read from it; anything else is
+-- treated as source, which is how the inline [[...]] idiom works.
+local function shader_source(s)
+  if type(s) ~= "string" then return nil end
+  if not s:find("[\n{;]") and wc.asset_exists(s) then
+    local src = wc.asset_read(s)
+    if not src then error("could not read shader asset: " .. s, 3) end
+    return src
+  end
+  return s
+end
+
+-- Which of the two arguments is the pixel shader and which is the vertex one
+-- is decided by CONTENT, not position: LOVE allows either order, and games
+-- pass them either way.
+-- NOTE: ipairs is wrong here. newShader(nil, vertexcode) is legal -- a
+-- vertex-only shader keeps the engine's default fragment stage -- and
+-- ipairs({nil, v}) stops at index 1, so the vertex source was dropped and
+-- the call failed with "no shader source given". Index explicitly.
+local function shader_split(a, b)
+  local pixel, vertex
+  for i = 1, 2 do
+    local s = (i == 1) and a or b
+    if s then
+      if s:find("vec4%s+position%s*%(") then vertex = s
+      elseif s:find("vec4%s+effect%s*%(") then pixel = s
+      elseif not pixel then pixel = s
+      else vertex = s end
+    end
+  end
+  return pixel, vertex
+end
+
+function graphics.newShader(a, b)
+  local pixel, vertex = shader_split(shader_source(a), shader_source(b))
+  if not pixel and not vertex then
+    error("love.graphics.newShader: no shader source given", 2)
+  end
+  local id = wc.shader_new(pixel, vertex)
+  if not id then
+    -- the GL info log has already gone to wc_log with the real compiler
+    -- message; this is the Lua-visible failure so a cart cannot carry on
+    -- believing it has a shader
+    error("love.graphics.newShader: the shader did not compile or link " ..
+          "(the GL info log was written to the cart log)", 2)
+  end
+  return setmetatable({ id = id }, Shader)
+end
+
+local cur_shader = nil
+
+-- setShader(shader) | setShader() to revert to the engine's default program
+function graphics.setShader(s)
+  if s == nil then
+    cur_shader = nil
+    wc.shader_use(nil)
+    return
+  end
+  if getmetatable(s) ~= Shader then
+    error("love.graphics.setShader: expected a Shader from " ..
+          "love.graphics.newShader", 2)
+  end
+  if not wc.shader_use(s.id) then
+    error("love.graphics.setShader: this run is on the software rasterizer " ..
+          "(no GL context, or a draw used a feature the GL backend does not " ..
+          "implement), so a shader cannot be applied. See the cart log.", 2)
+  end
+  cur_shader = s
+end
+
+function graphics.getShader() return cur_shader end
+
 -- deliberate v1 cuts, each loud
-graphics.newShader   = err("love.graphics.newShader", "shaders arrive with the GL renderer; use canvases and tinting for now")
-graphics.setShader   = err("love.graphics.setShader", "shaders arrive with the GL renderer")
 graphics.newMesh     = err("love.graphics.newMesh", "meshes arrive with the GL renderer; use polygon() for now")
 graphics.newVideo    = err("love.graphics.newVideo", "video playback is out of scope for this engine")
 

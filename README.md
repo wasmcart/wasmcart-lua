@@ -137,6 +137,7 @@ on a 1280x720 **top-left origin** canvas. Colors are 0..1 floats.
 | `newFont(size)` / `newFont(path,size)` / `setFont` | built-in bitfont + TTF |
 | `print(text,x,y)` / `printf(text,x,y,limit,align)` | `"center"`, `"right"` |
 | `push` `pop` `translate` `rotate` `scale` `origin` | full transform stack |
+| `newShader(code)` / `setShader(s)` / `Shader:send(...)` | GLSL ES 3.00; applies to solids, sprites, text and circles alike |
 | `setScissor(x,y,w,h)` · `setBlendMode("alpha"\|"add")` | |
 | `getWidth()` `getHeight()` | 1280 x 720 |
 
@@ -232,7 +233,7 @@ rather than silently doing nothing:
 
 | Missing | Why / what to do |
 |---|---|
-| custom shaders, meshes | GL2D owns the pipeline; use canvases and tinting |
+| meshes | not implemented; use `polygon()` |
 | threads | the engine is a single wasm instance |
 | video playback | out of scope |
 | real filesystem | carts have no files; use cart assets + the save region |
@@ -302,6 +303,19 @@ not equality: GPU blending rounds differently from the software `div255`, by
 about 1 per blended draw. Sprites, canvases, text and circles hold ±2;
 additive gets ±8 because it accumulates rather than converging. `test/blit`
 and `test/prims` still assert **bit-equality**, against the CPU build.
+
+Custom shaders get three gates, because none of the above can see them: a
+shader that fails to link renders **unshaded**, which is indistinguishable
+from success by frame count, and is *supposed* to differ from the software
+rasterizer, so the GL-vs-CPU comparison cannot judge it either.
+`examples/shaders` draws the same scene twice with an inverting shader on one
+half, and `tools/gl-shader-verify.mjs` asserts the halves are the **true
+inverse** rather than merely different — a shader that ran but sampled the
+wrong thing also "differs". The **control** is the same cart with the shader
+never bound, which must fail. `test/shaderfail` then asserts `newShader`
+*refuses* four differently-broken shaders with the driver's own message.
+`tools/gl-call-count.mjs` holds the performance line: a cart that never calls
+`setShader` must issue **zero** `glUseProgram` per frame.
 
 `test/determinism.js` proves the determinism claim two ways: the same seed
 must give a byte-identical framebuffer, and for carts whose visuals depend on

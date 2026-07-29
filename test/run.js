@@ -175,7 +175,18 @@ async function main() {
   let failed = 0;
   console.log('engine:', (fs.statSync(ENGINE).size / 1024).toFixed(1) + ' KB\n');
 
+  // Examples that CANNOT run on the CPU comparator, because the feature they
+  // demonstrate is a GPU program. `shaders` calls newShader, which refuses on
+  // a host with no GL rather than pretending -- so running it against
+  // engine-cpu.wasm would report a Lua error for behaving correctly. It is
+  // gated separately below, against a real GL context.
+  const GL_ONLY_EXAMPLES = new Set(['shaders']);
+
   for (const name of names) {
+    if (GL_ONLY_EXAMPLES.has(name)) {
+      console.log(`(gl)  ${name.padEnd(14)} GL-only example; gated by the shader section below`);
+      continue;
+    }
     const app = path.join(exDir, name, 'app');
     const r = await runCart(ENGINE, app, 180);
     const problems = check(name, r);
@@ -323,6 +334,135 @@ async function main() {
         console.log(`\nskip  ${cart.padEnd(12)} no GL context available on this machine`);
       } else {
         console.log(`\nFAIL  ${cart}  GL2D output drifted beyond tolerance`);
+        for (const l of txt.trim().split('\n').slice(-6)) console.log(`      ${l}`);
+        failed++;
+      }
+    }
+  }
+
+  // ── custom shaders ────────────────────────────────────────────────
+  //
+  // Three gates, because each catches a failure the others cannot see:
+  //
+  //  1. gl-shader-verify on examples/shaders -- did the shader run, and did
+  //     it produce the RIGHT colour? A shader that links but samples the
+  //     wrong thing still "differs from unshaded", so difference alone is
+  //     not evidence; the probes assert the true inverse.
+  //  2. the same tool on a copy with setShader commented out, which MUST
+  //     fail. A gate that has never been seen red is not a gate.
+  //  3. test/shaderfail in-engine, which asserts newShader REFUSES four
+  //     differently-broken shaders while still accepting a good one.
+  if (fs.existsSync(glEngine)) {
+    const { execFileSync } = require('child_process');
+    const os = require('os');
+    const tool = path.join(ROOT, 'tools', 'gl-shader-verify.mjs');
+    const shaderEx = path.join(ROOT, 'examples', 'shaders');
+    const runTool = (dir) => execFileSync(process.execPath, [tool, glEngine, dir, '3'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+
+    if (fs.existsSync(shaderEx)) {
+      let glMissing = false;
+      try {
+        const out = runTool(shaderEx);
+        const m = out.match(/all (\d+) probes inverted/);
+        console.log(`\nok    shaders      custom shader verified on ${m ? m[1] : '?'} draw paths ` +
+                    '(solids, circle, sprite)');
+      } catch (err) {
+        const txt = (err.stdout || '') + (err.stderr || '');
+        if (/Cannot find|ERR_MODULE_NOT_FOUND|createWebGL2Context/.test(txt)) {
+          console.log('\nskip  shaders      no GL context available on this machine');
+          glMissing = true;
+        } else {
+          console.log('\nFAIL  shaders      the custom shader did not run, or ran wrong');
+          for (const l of txt.trim().split('\n').slice(-6)) console.log(`      ${l}`);
+          failed++;
+        }
+      }
+
+      // the control: the SAME cart with the shader never bound must be
+      // caught. If this passes, the gate above is blind and means nothing.
+      if (!glMissing) {
+        const ctl = fs.mkdtempSync(path.join(os.tmpdir(), 'wcl-shader-ctl-'));
+        fs.cpSync(path.join(shaderEx, 'app'), path.join(ctl, 'app'), { recursive: true });
+        const mainPath = path.join(ctl, 'app', 'main.lua');
+        fs.writeFileSync(mainPath, fs.readFileSync(mainPath, 'utf8')
+          .replace('love.graphics.setShader(invert)', '-- control: not bound'));
+        let caught = false;
+        try { runTool(ctl); } catch { caught = true; }
+        fs.rmSync(ctl, { recursive: true, force: true });
+        if (caught) {
+          console.log('ok    shader-ctl   unshaded control correctly detected');
+        } else {
+          console.log('FAIL  shader-ctl   the control PASSED: the shader gate cannot see failure');
+          failed++;
+        }
+      }
+    }
+  }
+
+  // Shaders must cost NOTHING when a cart does not use them. A cart that
+  // never calls setShader must issue zero glUseProgram per frame; anything
+  // above that means the program is being re-bound per draw or per batch.
+  if (fs.existsSync(glEngine)) {
+    const { execFileSync } = require('child_process');
+    try {
+      const out = execFileSync(process.execPath,
+        [path.join(ROOT, 'tools', 'gl-call-count.mjs'), glEngine,
+         path.join(ROOT, 'test', 'gl2d'), '10', '--max-useprogram', '0'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      const m = out.match(/TOTAL\s+([\d.]+)/);
+      console.log(`ok    shader-cost  0 glUseProgram/frame with no shader bound ` +
+                  `(${m ? m[1] : '?'} GL calls/frame total)`);
+    } catch (err) {
+      const txt = (err.stdout || '') + (err.stderr || '');
+      if (/Cannot find|ERR_MODULE_NOT_FOUND|createWebGL2Context/.test(txt)) {
+        console.log('skip  shader-cost  no GL context available on this machine');
+      } else {
+        console.log('FAIL  shader-cost  the default path re-binds the GL program');
+        for (const l of txt.trim().split('\n').slice(-4)) console.log(`      ${l}`);
+        failed++;
+      }
+    }
+  }
+
+  // newShader must REFUSE broken shaders, with the driver's own message
+  // reaching the cart log.
+  //
+  // This has to run against a REAL GL context. On a stubbed `gl` every
+  // shader is refused because there is no GL at all, which would make the
+  // gate green without the compiler ever being consulted -- the refusal
+  // would be right for the wrong reason.
+  const sfDir = path.join(ROOT, 'test', 'shaderfail');
+  if (fs.existsSync(path.join(sfDir, 'main.lua')) && fs.existsSync(glEngine)) {
+    const { execFileSync } = require('child_process');
+    try {
+      const out = execFileSync(process.execPath,
+        [path.join(ROOT, 'tools', 'gl-shader-verify.mjs'), '--logs', glEngine, sfDir, '3'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      const lines = out.split('\n');
+      const refusals = lines.filter(l => /newShader/.test(l)).length;
+      // a real GLSL compiler message, not our own wrapper text
+      const compilerMsg = lines.some(l => /^LOG: \d+:\d+\(\d+\): error/.test(l));
+      const noGl = lines.some(l => /no GL context on this host/.test(l));
+      if (noGl) {
+        console.log('\nFAIL  shaderfail   ran without a GL context, so the refusals prove nothing');
+        failed++;
+      } else if (refusals < 4) {
+        console.log(`\nFAIL  shaderfail   only ${refusals} refusal messages, expected >= 4`);
+        for (const l of lines.slice(0, 10)) console.log(`      ${l}`);
+        failed++;
+      } else if (!compilerMsg) {
+        console.log('\nFAIL  shaderfail   refused, but no GL info log reached the cart log');
+        failed++;
+      } else {
+        console.log('\nok    shaderfail   4 broken shaders refused, driver messages logged');
+      }
+    } catch (err) {
+      const txt = (err.stdout || '') + (err.stderr || '');
+      if (/Cannot find|ERR_MODULE_NOT_FOUND|createWebGL2Context/.test(txt)) {
+        console.log('\nskip  shaderfail   no GL context available on this machine');
+      } else {
+        console.log('\nFAIL  shaderfail   the cart did not run');
         for (const l of txt.trim().split('\n').slice(-6)) console.log(`      ${l}`);
         failed++;
       }

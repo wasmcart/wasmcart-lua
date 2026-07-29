@@ -30,6 +30,7 @@
 #define WC_GL_BLIT_IMPLEMENTATION
 #include "wc_gl_blit.h"
 #include <string.h>
+#include <stdio.h>
 #include <math.h>
 
 #define GL_VERTEX_SHADER 0x8B31
@@ -138,11 +139,32 @@ static uint16_t indices[BATCH_MAX * 6];
 static int scissor_on;
 static int blend_add_on;
 static void flush_batches(void);
+/* Custom shaders (defined further down). Declared here because set_textured
+ * and bind_texture, which sit above them, must consult the bound program. */
+#define MAX_SHADERS 8
+typedef struct {
+    GLuint program;
+    GLint tex_uniform, textured_uniform;
+    int used;
+} shader_t;
+static shader_t shaders[MAX_SHADERS];
+static int active_shader = -1;   /* -1 = the engine's default program */
 static int blend_enabled = -1;
 static int textured_enabled = -1;
 static GLuint bound_texture;
 static uint32_t current_clear_color = 0xFFFFFFFFu;
 static wcl_r2d_stats_t frame_stats;
+
+/* Attribute LOCATIONS are pinned with glBindAttribLocation before every link,
+ * default program and custom shaders alike. One VAO is shared by every
+ * program, and a VAO records attribute state per INDEX -- so if a custom
+ * shader's linker happened to assign a_uv index 0 while the default had it at
+ * 1, binding that program would silently read positions as UVs. Pinning the
+ * indices is what makes "just glUseProgram a different program" safe. */
+#define ATTR_POS 0
+#define ATTR_UV 1
+#define ATTR_COLOR 2
+#define ATTR_RAD 3
 
 static const char *VERTEX_SHADER =
     "#version 300 es\n"
@@ -237,6 +259,497 @@ static GLuint compile_shader(GLenum type, const char *source) {
     return shader;
 }
 
+/* ── custom shaders ────────────────────────────────────────────────────
+ *
+ * A cart shader is a SECOND PROGRAM built to the same contract as the
+ * default one: same four attributes at the same pinned indices, same
+ * u_tex/u_textured uniforms with the same meanings. That is what lets every
+ * existing draw path keep working while one is bound -- a rect still batches
+ * as a solid, a sprite still samples the atlas, text still uses coverage
+ * mode 2 -- with only the fragment maths swapped.
+ *
+ * The cart writes LOVE's shape, a function
+ *     vec4 effect(vec4 color, Image tex, vec2 texture_coords, vec2 screen_coords)
+ * and this file wraps it: the #version line, the ins/outs, the Texel /
+ * love_ScreenSize / VaryingColor predefines, and a main() that dispatches on
+ * u_textured exactly the way the default fragment shader does and then hands
+ * the result to effect(). A cart never writes any of that, and CANNOT write
+ * its own #version -- the synthesized one has to come first, and two
+ * #version lines is a compile error rather than an override.
+ */
+/* How many texture units the cart's own Image uniforms may claim. Unit 0 is
+ * the engine's (the atlas, a canvas, or a glyph texture) and is never given
+ * away, because every draw path binds to it. */
+#define SHADER_TEX_UNITS 4
+typedef struct {
+    GLint location;
+    GLuint tex;
+    int unit;
+    int used;
+} shader_sampler_t;
+static shader_sampler_t shader_samplers[MAX_SHADERS][SHADER_TEX_UNITS];
+
+static void shader_log(const char *msg) {
+    wc_log(msg, (unsigned int)strlen(msg));
+}
+
+/* Compile without the gl_broken side effect log_obj has.
+ *
+ * A CART's shader failing to compile is a cart bug: report it, refuse the
+ * handle, and carry on rendering. log_obj sets gl_broken, which the engine
+ * reads as "this host has no usable GL" -- letting a typo in a cart's GLSL
+ * flip that would silently drop the whole run onto the software rasterizer,
+ * which is exactly the failure this is meant to make visible. */
+static int shader_compile_checked(GLenum type, const char *source, GLuint *out) {
+    GLuint sh = glCreateShader(type);
+    GLint length = (GLint)strlen(source);
+    glShaderSource(sh, 1, &source, &length);
+    glCompileShader(sh);
+    GLint ok = 0;
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        GLint len = 0;
+        glGetShaderiv(sh, GL_INFO_LOG_LENGTH, &len);
+        char log[1024];
+        const char *tag = (type == GL_FRAGMENT_SHADER)
+            ? "love.graphics.newShader: pixel shader failed to compile:\n"
+            : "love.graphics.newShader: vertex shader failed to compile:\n";
+        shader_log(tag);
+        if (len > 0) {
+            GLsizei got = 0;
+            glGetShaderInfoLog(sh, (GLsizei)sizeof log, &got, log);
+            if (got > 0) wc_log(log, (unsigned int)got);
+        } else {
+            /* A host that stubs `gl` reports "not compiled" with an empty log
+             * for a shader that never existed. Say which case it might be
+             * rather than printing nothing at all. */
+            shader_log("(no info log: the driver gave none, or this host has no GL)");
+        }
+        glDeleteShader(sh);
+        return 0;
+    }
+    *out = sh;
+    return 1;
+}
+
+/* The generated wrapper around the cart's effect().
+ *
+ * u_textured is handled here identically to the default fragment shader, so
+ * the same rect/sprite/glyph/circle batches keep their meanings:
+ *   0  solid       -> the cart sees a white 1x1 texel
+ *   1  RGBA texture-> the cart sees the sampled texel
+ *   2  glyph       -> coverage in .r, expanded to (1,1,1,cov) so a shader
+ *                     that ignores the texture still tints text correctly
+ *   3  circle      -> the coverage discard runs BEFORE effect(), because a
+ *                     discarded fragment must not run cart code at all
+ *
+ * The Texel/love_ScreenSize/VaryingColor names are LOVE's, defined here so a
+ * shader copied from a LOVE project compiles unchanged. */
+static const char *SHADER_FRAG_PROLOGUE =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2 v_uv;\n"
+    "in vec4 v_color;\n"
+    "in highp vec2 v_centre;\n"
+    "in highp float v_rad;\n"
+    "out vec4 wc_frag_color;\n"
+    "uniform sampler2D u_tex;\n"
+    "uniform int u_textured;\n"
+    "uniform vec2 love_ScreenSize;\n"
+    "#define Image sampler2D\n"
+    "#define VaryingColor v_color\n"
+    "#define VaryingTexCoord vec4(v_uv, 0.0, 1.0)\n"
+    "#define number float\n"
+    "#define extern uniform\n"
+    /* Texel() honours u_textured, because otherwise a shader gets a real
+     * atlas texel for a draw that has no texture at all.
+     *
+     * This is not a nicety. `return vec4(1.0 - Texel(tex, uv).rgb, px.a)` on
+     * a plain rectangle sampled atlas texel (0,0), which is opaque black, so
+     * every solid rect inverted to WHITE instead of to its own negative --
+     * visibly wrong, and wrong in a way that still looks like "the shader
+     * ran". A solid draw must see an all-white texel so `Texel(...) * color`
+     * reduces to the vertex colour, which is what LOVE's untextured draws do.
+     *
+     * The rule is applied unconditionally rather than only to the engine's
+     * own sampler, because GLSL ES 3.00 forbids comparing opaque sampler
+     * types -- `t == u_tex` will not compile. A cart sampling its OWN Image
+     * uniform (a palette or lookup table) should call texture() directly;
+     * that is plain GLSL and works here. */
+    "vec4 Texel(sampler2D t, vec2 uv) {\n"
+    "  if (u_textured == 1) return texture(t, uv);\n"
+    "  if (u_textured == 2) return vec4(1.0, 1.0, 1.0, texture(t, uv).r);\n"
+    "  return vec4(1.0);\n"
+    "}\n"
+    "#line 1\n";
+
+static const char *SHADER_FRAG_EPILOGUE =
+    "\nvoid main() {\n"
+    "  if (u_textured == 3) {\n"
+    "    highp float dy = floor(gl_FragCoord.y) - v_centre.y;\n"
+    "    highp float dx = floor(gl_FragCoord.x) - v_centre.x;\n"
+    "    highp float t = v_rad * v_rad - dy * dy;\n"
+    "    if (t < 0.0) discard;\n"
+    "    if (abs(dx) > floor(sqrt(t) + 0.5)) discard;\n"
+    "  }\n"
+    "  vec2 wc_uv = (u_textured == 1 || u_textured == 2) ? v_uv : vec2(0.0);\n"
+    "  wc_frag_color = effect(v_color, u_tex, wc_uv, gl_FragCoord.xy);\n"
+    "}\n";
+
+/* The vertex side. A cart's position() sees the same signature LOVE gives it,
+ * but our vertices arrive ALREADY IN CLIP SPACE (see ndc()) -- there is no
+ * model/view/projection matrix in this engine, so transform_projection is the
+ * identity. A shader that multiplies by it gets the right answer; one that
+ * builds its own projection from it will not, and that is documented rather
+ * than papered over. */
+static const char *SHADER_VERT_PROLOGUE =
+    "#version 300 es\n"
+    "in vec2 a_pos;\n"
+    "in vec2 a_uv;\n"
+    "in vec4 a_color;\n"
+    "in highp float a_rad;\n"
+    "out vec2 v_uv;\n"
+    "out vec4 v_color;\n"
+    "out highp vec2 v_centre;\n"
+    "out highp float v_rad;\n"
+    "uniform vec2 love_ScreenSize;\n"
+    "#define Image sampler2D\n"
+    "#define Texel texture\n"
+    "#define number float\n"
+    "#define extern uniform\n"
+    "#define VertexPosition vec4(a_pos, 0.0, 1.0)\n"
+    "#define VertexTexCoord vec4(a_uv, 0.0, 1.0)\n"
+    "#define VertexColor a_color\n"
+    "#line 1\n";
+
+static const char *SHADER_VERT_EPILOGUE =
+    "\nvoid main() {\n"
+    "  v_uv = a_uv; v_color = a_color;\n"
+    "  v_centre = a_uv; v_rad = a_rad;\n"
+    "  gl_Position = position(mat4(1.0), vec4(a_pos, 0.0, 1.0));\n"
+    "}\n";
+
+/* Composition buffer. Shaders are small and this runs once per newShader, so
+ * a single static buffer beats a malloc that has to be freed on every error
+ * path. Overflow is a hard refusal, not a truncation: a truncated shader
+ * would report a bewildering syntax error at the cut point. */
+#define SHADER_SRC_MAX 16384
+static char shader_src_buf[SHADER_SRC_MAX];
+
+static int shader_compose(const char *prologue, const char *body,
+                          const char *epilogue) {
+    size_t a = strlen(prologue), b = strlen(body), c = strlen(epilogue);
+    if (a + b + c + 1 > SHADER_SRC_MAX) {
+        shader_log("love.graphics.newShader: shader source is too large "
+                   "(limit is 16 KB of cart GLSL)");
+        return 0;
+    }
+    memcpy(shader_src_buf, prologue, a);
+    memcpy(shader_src_buf + a, body, b);
+    memcpy(shader_src_buf + a + b, epilogue, c);
+    shader_src_buf[a + b + c] = 0;
+    return 1;
+}
+
+/* Pin the attribute indices, then link. Shared by the default program and
+ * every cart shader so one VAO stays valid across all of them. */
+static void bind_attribs_and_link(GLuint prog) {
+    glBindAttribLocation(prog, ATTR_POS, "a_pos");
+    glBindAttribLocation(prog, ATTR_UV, "a_uv");
+    glBindAttribLocation(prog, ATTR_COLOR, "a_color");
+    glBindAttribLocation(prog, ATTR_RAD, "a_rad");
+    glLinkProgram(prog);
+}
+
+/* Reject desktop GLSL before the driver sees it.
+ *
+ * The surface here is WebGL2 / GLES 3.0 and nothing else. A cart's own
+ * #version line cannot be honoured (the synthesized one must come first, and
+ * two #version directives is an error), and desktop-only constructs give
+ * driver errors that point at generated line numbers a cart author never
+ * wrote. Naming the actual problem is worth the handful of string scans. */
+static int shader_reject_unsupported(const char *src, const char *which) {
+    char line[256];
+    if (strstr(src, "#version")) {
+        snprintf(line, sizeof line,
+                 "love.graphics.newShader: the %s shader declares its own "
+                 "#version. This engine targets WebGL2 / GLES 3.0 and emits "
+                 "\"#version 300 es\" itself; remove the directive.", which);
+        shader_log(line);
+        return 1;
+    }
+    /* GLES 3.0 has no compute, no geometry/tessellation stages, and no
+     * image load/store. These fail in the driver with messages about the
+     * generated preamble, so catch them by name instead. */
+    static const char *banned[] = {
+        "layout(local_size", "gl_GlobalInvocationID", "imageStore", "imageLoad",
+        "gl_FragColor", "texture2D", "varying", "attribute", NULL
+    };
+    static const char *why[] = {
+        "compute shaders are not in GLES 3.0",
+        "compute shaders are not in GLES 3.0",
+        "image load/store is GLES 3.1+, not available here",
+        "image load/store is GLES 3.1+, not available here",
+        "gl_FragColor is GLSL ES 1.00; return the colour from effect() instead",
+        "texture2D is GLSL ES 1.00; use Texel(...) or texture(...)",
+        "`varying` is GLSL ES 1.00; use in/out",
+        "`attribute` is GLSL ES 1.00; use in",
+        NULL
+    };
+    for (int i = 0; banned[i]; i++) {
+        if (strstr(src, banned[i])) {
+            snprintf(line, sizeof line,
+                     "love.graphics.newShader: the %s shader uses \"%s\" -- %s.",
+                     which, banned[i], why[i]);
+            shader_log(line);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int wcl_r2d_shader_new(const char *pixel_src, const char *vertex_src) {
+    if (!ready) {
+        shader_log("love.graphics.newShader: no GL context on this host, so "
+                   "shaders cannot run (the engine is on the software "
+                   "rasterizer)");
+        return -1;
+    }
+    if (!pixel_src && !vertex_src) return -1;
+
+    int slot = -1;
+    for (int i = 0; i < MAX_SHADERS; i++) if (!shaders[i].used) { slot = i; break; }
+    if (slot < 0) {
+        shader_log("love.graphics.newShader: out of shader slots (8 max)");
+        return -1;
+    }
+
+    GLuint vs = 0, fs = 0;
+    if (vertex_src) {
+        if (shader_reject_unsupported(vertex_src, "vertex")) return -1;
+        if (!shader_compose(SHADER_VERT_PROLOGUE, vertex_src, SHADER_VERT_EPILOGUE))
+            return -1;
+        if (!shader_compile_checked(GL_VERTEX_SHADER, shader_src_buf, &vs)) return -1;
+    } else {
+        vs = compile_shader(GL_VERTEX_SHADER, VERTEX_SHADER);
+    }
+
+    if (pixel_src) {
+        if (shader_reject_unsupported(pixel_src, "pixel")) { glDeleteShader(vs); return -1; }
+        if (!shader_compose(SHADER_FRAG_PROLOGUE, pixel_src, SHADER_FRAG_EPILOGUE)) {
+            glDeleteShader(vs);
+            return -1;
+        }
+        if (!shader_compile_checked(GL_FRAGMENT_SHADER, shader_src_buf, &fs)) {
+            glDeleteShader(vs);
+            return -1;
+        }
+    } else {
+        fs = compile_shader(GL_FRAGMENT_SHADER, FRAGMENT_SHADER);
+    }
+
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    bind_attribs_and_link(prog);
+    GLint ok = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    /* The shader objects are attached; the program keeps them alive. */
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    if (!ok) {
+        GLint len = 0;
+        glGetProgramiv(prog, GL_INFO_LOG_LENGTH, &len);
+        shader_log("love.graphics.newShader: program failed to link:\n");
+        if (len > 0) {
+            char log[1024];
+            GLsizei got = 0;
+            glGetProgramInfoLog(prog, (GLsizei)sizeof log, &got, log);
+            if (got > 0) wc_log(log, (unsigned int)got);
+        } else {
+            shader_log("(no info log; commonly a missing effect() or "
+                       "position() function)");
+        }
+        glDeleteProgram(prog);
+        return -1;
+    }
+
+    shader_t *sh = &shaders[slot];
+    sh->program = prog;
+    sh->used = 1;
+    sh->tex_uniform = glGetUniformLocation(prog, "u_tex");
+    sh->textured_uniform = glGetUniformLocation(prog, "u_textured");
+    for (int i = 0; i < SHADER_TEX_UNITS; i++) shader_samplers[slot][i].used = 0;
+
+    /* Seed the program's own uniform state. Uniform values belong to the
+     * PROGRAM, so this cannot wait for the first draw under the shared
+     * set_textured cache -- that cache tracks whichever program is current. */
+    glUseProgram(prog);
+    if (sh->tex_uniform >= 0) glUniform1i(sh->tex_uniform, 0);
+    GLint screen = glGetUniformLocation(prog, "love_ScreenSize");
+    if (screen >= 0) glUniform2f(screen, (float)width, (float)height);
+    glUseProgram(active_shader >= 0 ? shaders[active_shader].program : program);
+    return slot;
+}
+
+static shader_t *shader_by_handle(int handle) {
+    if (handle < 0 || handle >= MAX_SHADERS || !shaders[handle].used) return NULL;
+    return &shaders[handle];
+}
+
+void wcl_r2d_shader_use(int handle) {
+    if (!ready) return;
+    if (handle >= 0 && !shader_by_handle(handle)) return;
+    if (handle == active_shader) return;
+    /* A batch built for one program must not be drawn by another: the
+     * program is pipeline state, so pending vertices belong to the shader
+     * that was bound when they were queued. Same rule as a texture change. */
+    flush_batches();
+    active_shader = handle;
+    shader_t *sh = shader_by_handle(handle);
+    glUseProgram(sh ? sh->program : program);
+    /* u_textured lives in the program object, so the cached value from the
+     * program we just left says nothing about this one. */
+    textured_enabled = -1;
+    if (sh) {
+        /* Rebind the cart's own sampler uniforms: their texture-unit
+         * assignment is program state too, and a unit's binding is global,
+         * so both have to be re-established on every switch. */
+        for (int i = 0; i < SHADER_TEX_UNITS; i++) {
+            shader_sampler_t *s = &shader_samplers[handle][i];
+            if (!s->used) continue;
+            glActiveTexture((GLenum)(GL_TEXTURE0 + s->unit));
+            glBindTexture(GL_TEXTURE_2D, s->tex);
+        }
+        glActiveTexture(GL_TEXTURE0);
+    }
+}
+
+int wcl_r2d_shader_active(void) { return active_shader >= 0; }
+
+/* Uniform writes go to the named program, which must be current for the call
+ * to land, so the previous program is restored afterwards. LOVE lets a cart
+ * send to a shader that is not bound, and games do exactly that during load. */
+static GLint shader_uniform(int handle, const char *name, shader_t **out) {
+    shader_t *sh = shader_by_handle(handle);
+    if (!sh) return -1;
+    *out = sh;
+    return glGetUniformLocation(sh->program, name);
+}
+
+static void shader_restore_program(void) {
+    glUseProgram(active_shader >= 0 ? shaders[active_shader].program : program);
+}
+
+int wcl_r2d_shader_has_uniform(int handle, const char *name) {
+    shader_t *sh = NULL;
+    return shader_uniform(handle, name, &sh) >= 0;
+}
+
+int wcl_r2d_shader_send_float(int handle, const char *name, const float *v, int n) {
+    shader_t *sh = NULL;
+    GLint loc = shader_uniform(handle, name, &sh);
+    if (!sh || loc < 0) return 0;
+    glUseProgram(sh->program);
+    switch (n) {
+        case 1: glUniform1f(loc, v[0]); break;
+        case 2: glUniform2f(loc, v[0], v[1]); break;
+        case 3: glUniform3f(loc, v[0], v[1], v[2]); break;
+        case 4: glUniform4f(loc, v[0], v[1], v[2], v[3]); break;
+        case 16: glUniformMatrix4fv(loc, 1, 0, v); break;
+        default: glUseProgram(program); shader_restore_program(); return 0;
+    }
+    shader_restore_program();
+    return 1;
+}
+
+int wcl_r2d_shader_send_int(int handle, const char *name, const int *v, int n) {
+    shader_t *sh = NULL;
+    GLint loc = shader_uniform(handle, name, &sh);
+    if (!sh || loc < 0) return 0;
+    glUseProgram(sh->program);
+    switch (n) {
+        case 1: glUniform1i(loc, v[0]); break;
+        case 2: glUniform2i(loc, v[0], v[1]); break;
+        case 3: glUniform3i(loc, v[0], v[1], v[2]); break;
+        case 4: glUniform4i(loc, v[0], v[1], v[2], v[3]); break;
+        default: shader_restore_program(); return 0;
+    }
+    shader_restore_program();
+    return 1;
+}
+
+static texture_t *get_texture(const void *pixels, int w, int h);
+
+int wcl_r2d_shader_send_image(int handle, const char *name,
+                              const void *pixels, int w, int h) {
+    shader_t *sh = NULL;
+    GLint loc = shader_uniform(handle, name, &sh);
+    if (!sh || loc < 0 || !pixels) return 0;
+
+    /* Which GL texture backs this image? A canvas has its own; anything else
+     * lives in the shared atlas -- and an atlas entry is a SUB-RECT, so the
+     * uv range the shader must sample is not 0..1. That is a real limitation
+     * and it is reported rather than silently sampling the whole atlas. */
+    target_t *tgt = target_find(pixels);
+    GLuint tex;
+    if (tgt) {
+        tex = tgt->tex;
+    } else {
+        texture_t *t = get_texture(pixels, w, h);
+        if (!t) return 0;
+        if (t->w != ATLAS_SIZE || t->h != ATLAS_SIZE) {
+            /* Not fatal: many shaders use a lookup texture at fixed
+             * coordinates and do not care. Say what the uv range actually is
+             * so a cart author can scale for it. */
+            char line[256];
+            snprintf(line, sizeof line,
+                     "Shader:send(\"%s\", image): sprite images live in a shared "
+                     "atlas, so this sampler's uv range is (%g..%g, %g..%g), not "
+                     "0..1. Use a Canvas for a 0..1 sampler.",
+                     name,
+                     (double)t->atlas_x / ATLAS_SIZE,
+                     (double)(t->atlas_x + t->w) / ATLAS_SIZE,
+                     (double)t->atlas_y / ATLAS_SIZE,
+                     (double)(t->atlas_y + t->h) / ATLAS_SIZE);
+            shader_log(line);
+        }
+        tex = atlas_texture;
+    }
+
+    /* Find (or claim) a texture unit for this uniform. Unit 0 belongs to the
+     * engine -- every draw path binds its own texture there -- so cart
+     * samplers start at 1. */
+    int idx = -1;
+    for (int i = 0; i < SHADER_TEX_UNITS; i++) {
+        if (shader_samplers[handle][i].used &&
+            shader_samplers[handle][i].location == loc) { idx = i; break; }
+    }
+    if (idx < 0) {
+        for (int i = 0; i < SHADER_TEX_UNITS; i++)
+            if (!shader_samplers[handle][i].used) { idx = i; break; }
+    }
+    if (idx < 0) {
+        shader_log("Shader:send: out of texture units (4 image uniforms max "
+                   "per shader)");
+        return 0;
+    }
+    shader_sampler_t *s = &shader_samplers[handle][idx];
+    s->location = loc;
+    s->tex = tex;
+    s->unit = idx + 1;
+    s->used = 1;
+
+    flush_batches();   /* a pending batch was queued with the old binding */
+    glUseProgram(sh->program);
+    glUniform1i(loc, s->unit);
+    glActiveTexture((GLenum)(GL_TEXTURE0 + s->unit));
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glActiveTexture(GL_TEXTURE0);
+    shader_restore_program();
+    return 1;
+}
+
 /* Cart pixels -> clip space. y is flipped because the cart's origin is
  * top-left and GL's is bottom-left. */
 static void ndc(float x, float y, float *out_x, float *out_y) {
@@ -273,9 +786,16 @@ void wcl_r2d_blend_add(int on) {
     }
 }
 
+/* u_textured is per-DRAW state, and its location differs per program (a cart
+ * shader is a separate program object with its own uniform storage), so the
+ * location has to come from whichever program is current. The cached
+ * textured_enabled is invalidated on every program switch in
+ * wcl_r2d_shader_use for the same reason. */
 static void set_textured(int enabled) {
     if (textured_enabled == enabled) return;
-    glUniform1i(textured_uniform, enabled);
+    GLint loc = textured_uniform;
+    if (active_shader >= 0) loc = shaders[active_shader].textured_uniform;
+    if (loc >= 0) glUniform1i(loc, enabled);
     textured_enabled = enabled;
 }
 
@@ -338,16 +858,18 @@ int wcl_r2d_init(int w, int h) {
     program = glCreateProgram();
     glAttachShader(program, vs);
     glAttachShader(program, fs);
-    glLinkProgram(program);
+    bind_attribs_and_link(program);
     log_obj(program, "gl2d program link failed", 0);
     glUseProgram(program);
 
-    pos_attr = glGetAttribLocation(program, "a_pos");
-    uv_attr = glGetAttribLocation(program, "a_uv");
-    color_attr = glGetAttribLocation(program, "a_color");
+    /* Pinned by bind_attribs_and_link, so these are the same indices every
+     * cart shader gets and the one shared VAO stays valid across programs. */
+    pos_attr = ATTR_POS;
+    uv_attr = ATTR_UV;
+    color_attr = ATTR_COLOR;
+    rad_attr = ATTR_RAD;
     tex_uniform = glGetUniformLocation(program, "u_tex");
     textured_uniform = glGetUniformLocation(program, "u_textured");
-    rad_attr = glGetAttribLocation(program, "a_rad");
 
     glGenVertexArrays(1, &vao);
     glBindVertexArray(vao);
@@ -469,16 +991,34 @@ void wcl_r2d_end(const uint32_t *fb) {
                            (px & 0x0000FF00u) | ((px & 0xFFu) << 16);
         }
         wc_gl_blit(blit_rgba, width, height);
-        /* wc_gl_blit leaves its own program/texture/VAO bound. */
+        /* wc_gl_blit leaves its own program/texture/VAO bound, so the cached
+         * "which program is current" is stale too. Re-establish it rather
+         * than trusting active_shader, or the first draw of the next GL frame
+         * would go through the blit's program. */
         bound_texture = 0;
         textured_enabled = -1;
         blend_enabled = -1;
+        glUseProgram(active_shader >= 0 ? shaders[active_shader].program : program);
     }
     wcl_r2d_stats = frame_stats;
 }
 
+/* Warned once, not per call: a cart that trips the fallback trips it every
+ * frame, and 60 identical log lines a second buries the one that matters. */
+static int warned_shader_dropped;
+
 void wcl_r2d_disable(void) {
     if (wcl_r2d_active()) flush_batches();
+    /* A bound shader cannot follow the frame onto the software rasterizer --
+     * there is no CPU path that runs GLSL. Rendering would carry on looking
+     * plausible while the shader did nothing at all, so say it out loud. */
+    if (active_shader >= 0 && !warned_shader_dropped) {
+        warned_shader_dropped = 1;
+        WC_LOG("love.graphics.setShader: a custom shader is bound, but this "
+               "frame used a feature the GL backend does not implement, so the "
+               "engine fell back to the software rasterizer for the rest of "
+               "the run. The shader is NOT being applied from here on.");
+    }
     frame_disabled = 1;
     cpu_mode = 1;
 }

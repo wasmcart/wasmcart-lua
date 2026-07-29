@@ -112,13 +112,38 @@ These error loudly rather than silently no-op, so you'll find them fast:
 
 | LÖVE feature | Here |
 |---|---|
-| `love.graphics.newShader` | not until the GL renderer; use canvases + tinting |
-| `love.graphics.newMesh` | same |
+| `love.graphics.newShader` | **available** — GLES 3.0 / WebGL2 only; see below |
+| `love.graphics.newMesh` | not implemented; use `polygon()` |
 | `love.thread.*` | single wasm instance, no threads |
 | `love.physics.*` | **available** — Box2D v3 with wasm SIMD; see below |
 | `love.graphics.newVideo` | out of scope |
 | `love.window.setMode` | accepted and ignored; resolution is fixed |
 | `love.event.quit` | logged and ignored; consoles don't exit |
+
+## 6a. Shaders work, on GLES 3.0
+
+`newShader` / `setShader` / `Shader:send` are implemented on the GL2D
+renderer. A LÖVE pixel shader ports unchanged **if it is already GLSL ES
+3.00**: you write only `effect(...)` (or `position(...)` for a vertex
+shader) and the engine synthesizes everything around it.
+
+What a port usually has to change:
+
+- **Delete the shader's own `#version` line.** The engine emits
+  `#version 300 es` and a second directive is a compile error, so it is
+  refused up front with that explanation.
+- **Modernize GLSL ES 1.00 spellings.** `gl_FragColor` becomes the value you
+  `return`; `texture2D` becomes `Texel` or `texture`; `varying` and
+  `attribute` become `in` / `out`. Each is caught by name rather than left
+  to the driver.
+- **Do not build your own projection from `transform_projection`.** It is
+  the identity here: vertices arrive already in clip space.
+- **A shader is GPU-only.** If the renderer falls back to the software
+  rasterizer (a feature GL2D does not implement), the shader stops applying
+  and the engine logs that it has. It never silently renders unshaded.
+
+See `examples/shaders/` for a working cart and `docs/api.md` for the full
+surface, the `send` types, and the limits.
 
 ## 6b. Physics works, via Box2D v3
 
@@ -168,7 +193,8 @@ Check `gc_kb` and `draw_calls` in the debug state if a port feels slow.
 4. Map keyboard actions onto pad buttons.
 5. Collapse save files into one blob.
 6. Run it; the loud errors will point at anything left.
-7. Replace the shader/thread usages the errors surface (physics is fine).
+7. Replace the thread usages the errors surface (physics and shaders are fine;
+   shaders may need GLSL ES 1.00 spellings modernized — see 6a).
 8. If it uses windfield, forward it to the engine's native `wf`.
 
 Assets: PNG for images, WAV/OGG for audio, TTF for fonts.

@@ -1297,6 +1297,126 @@ static int l_pad_rumble_stop(lua_State *S) {
     return 0;
 }
 
+/* ── custom shaders ────────────────────────────────────────────────────
+ *
+ * The whole feature is GL-only by construction: a shader IS a GPU program,
+ * and there is no software rasterizer path that could run one. So rather
+ * than let a cart draw silently unshaded, shader_new refuses on a host with
+ * no GL and the prelude turns that into a clear Lua error.
+ *
+ * shader_use additionally refuses while the engine is in the sticky
+ * cpu_mode fallback: at that point every draw is CPU-rasterized and a bound
+ * shader would have no effect at all, which is the exact "looks fine, wrong
+ * pixels" failure this engine spends its comments avoiding.
+ */
+static int l_shader_new(lua_State *S) {
+    const char *pixel = lua_isnoneornil(S, 1) ? NULL : luaL_checkstring(S, 1);
+    const char *vertex = lua_isnoneornil(S, 2) ? NULL : luaL_checkstring(S, 2);
+    int h = wcl_r2d_shader_new(pixel, vertex);
+    if (h < 0) { lua_pushnil(S); return 1; }
+    lua_pushinteger(S, h);
+    return 1;
+}
+
+static int l_shader_use(lua_State *S) {
+    int h = lua_isnoneornil(S, 1) ? -1 : ARGI(1);
+    if (h >= 0 && !wcl_r2d_active()) {
+        /* GL is off for this run (no context, or the sticky software
+         * fallback tripped). Say so instead of drawing unshaded. */
+        lua_pushboolean(S, 0);
+        return 1;
+    }
+    wcl_r2d_shader_use(h);
+    lua_pushboolean(S, 1);
+    return 1;
+}
+
+/* send(handle, name, ...) - numbers, or a table of up to 4 numbers, or an
+ * image id. Returns false when the uniform is not in the linked program,
+ * which is the normal way a name typo shows up. */
+static int l_shader_send(lua_State *S) {
+    int h = ARGI(1);
+    const char *name = luaL_checkstring(S, 2);
+    if (lua_isnumber(S, 3) && lua_gettop(S) <= 6) {
+        float v[4];
+        int n = lua_gettop(S) - 2;
+        if (n > 4) n = 4;
+        for (int i = 0; i < n; i++) v[i] = (float)lua_tonumber(S, 3 + i);
+        lua_pushboolean(S, wcl_r2d_shader_send_float(h, name, v, n));
+        return 1;
+    }
+    if (lua_istable(S, 3)) {
+        /* A flat table is a vector; a table of tables is a matrix. Only 4x4
+         * is accepted, which is the one LOVE shaders actually send. */
+        lua_rawgeti(S, 3, 1);
+        int nested = lua_istable(S, -1);
+        lua_pop(S, 1);
+        int len = (int)lua_rawlen(S, 3);
+        if (nested) {
+            if (len != 4) {
+                lua_pushboolean(S, 0);
+                return 1;
+            }
+            float m[16];
+            for (int r = 0; r < 4; r++) {
+                lua_rawgeti(S, 3, r + 1);
+                for (int c = 0; c < 4; c++) {
+                    lua_rawgeti(S, -1, c + 1);
+                    m[r * 4 + c] = (float)lua_tonumber(S, -1);
+                    lua_pop(S, 1);
+                }
+                lua_pop(S, 1);
+            }
+            lua_pushboolean(S, wcl_r2d_shader_send_float(h, name, m, 16));
+            return 1;
+        }
+        if (len < 1 || len > 4) { lua_pushboolean(S, 0); return 1; }
+        float v[4];
+        for (int i = 0; i < len; i++) {
+            lua_rawgeti(S, 3, i + 1);
+            v[i] = (float)lua_tonumber(S, -1);
+            lua_pop(S, 1);
+        }
+        lua_pushboolean(S, wcl_r2d_shader_send_float(h, name, v, len));
+        return 1;
+    }
+    lua_pushboolean(S, 0);
+    return 1;
+}
+
+/* send_image(handle, name, image_id) */
+static int l_shader_send_image(lua_State *S) {
+    int h = ARGI(1);
+    const char *name = luaL_checkstring(S, 2);
+    image_t *im = image_by_id(ARGI(3));
+    if (!im || !im->rgba) { lua_pushboolean(S, 0); return 1; }
+    lua_pushboolean(S, wcl_r2d_shader_send_image(h, name, im->rgba, im->w, im->h));
+    return 1;
+}
+
+/* has_uniform(handle, name) - a read-only probe.
+ *
+ * NOT implementable as "try sending 0 and see if it took": that WRITES the
+ * uniform, so asking whether a uniform exists would silently zero it. Games
+ * call hasUniform to guard an optional uniform, immediately before setting
+ * it, so the clobber would usually be invisible and occasionally not. */
+static int l_shader_has_uniform(lua_State *S) {
+    lua_pushboolean(S, wcl_r2d_shader_has_uniform(ARGI(1), luaL_checkstring(S, 2)));
+    return 1;
+}
+
+static int l_shader_send_bool(lua_State *S) {
+    int h = ARGI(1);
+    const char *name = luaL_checkstring(S, 2);
+    int v[4];
+    int n = lua_gettop(S) - 2;
+    if (n < 1) { lua_pushboolean(S, 0); return 1; }
+    if (n > 4) n = 4;
+    for (int i = 0; i < n; i++) v[i] = lua_toboolean(S, 3 + i) ? 1 : 0;
+    lua_pushboolean(S, wcl_r2d_shader_send_int(h, name, v, n));
+    return 1;
+}
+
 static int l_asset_exists(lua_State *S) {
     const char *path = luaL_checkstring(S, 1);
     lua_pushboolean(S, wc_asset_size(path, (unsigned int)strlen(path)) >= 0);
@@ -1339,6 +1459,12 @@ static const luaL_Reg wc_lib[] = {
     {"asset_read",  l_asset_read},
     {"asset_exists", l_asset_exists},
     {"pointer",     l_pointer},
+    {"shader_new",  l_shader_new},
+    {"shader_use",  l_shader_use},
+    {"shader_send", l_shader_send},
+    {"shader_send_image", l_shader_send_image},
+    {"shader_send_bool",  l_shader_send_bool},
+    {"shader_has_uniform", l_shader_has_uniform},
     {"pad_has_rumble",  l_pad_has_rumble},
     {"pad_rumble",      l_pad_rumble},
     {"pad_rumble_stop", l_pad_rumble_stop},

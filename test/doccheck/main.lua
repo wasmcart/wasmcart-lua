@@ -82,6 +82,54 @@ function love.load()
     w:draw(150); w:getColliderCount()
     p:destroy(); w:destroy()
   end)
+  -- api.md: shaders.
+  --
+  -- This cart runs on the CPU comparator, which has no GL, and api.md says
+  -- newShader FAILS there rather than pretending. So the documented contract
+  -- has both branches and this block asserts whichever one applies -- which
+  -- is stronger than skipping: a build that silently accepted a shader with
+  -- no GL would fail here.
+  T("shaders", function()
+    local ok_, res = pcall(love.graphics.newShader, [[
+      vec4 effect(vec4 color, Image tex, vec2 texture_coords, vec2 screen_coords) {
+        vec4 px = Texel(tex, texture_coords) * color;
+        return vec4(1.0 - px.rgb, px.a);
+      }
+    ]])
+    if ok_ then
+      -- a GL host: the whole documented surface must be there
+      assert(res:type() == "Shader", "newShader returned a non-Shader")
+      res:send("u_time", 0.5)
+      res:send("u_tint", { 0.2, 1.0, 0.4 })
+      res:send("u_on", true)
+      -- hasUniform must be READ-ONLY. Probing by writing would zero the
+      -- uniform, so this asserts a send still reports success afterwards
+      -- (a write-probe implementation passes this too, which is why the
+      -- real gate is that hasUniform is a distinct C entry point -- but a
+      -- name that does not exist must still answer false).
+      assert(res:hasUniform("u_nope") == false,
+             "hasUniform claimed a uniform that was never declared")
+      love.graphics.setShader(res)
+      assert(love.graphics.getShader() == res, "getShader did not report the bound shader")
+      love.graphics.setShader()
+      assert(love.graphics.getShader() == nil, "setShader() did not clear")
+      res:release()
+      -- vertex-only: newShader(nil, vertexcode) keeps the default fragment
+      -- stage. This is the form that once dropped its argument entirely.
+      local vs = love.graphics.newShader(nil, [[
+        vec4 position(mat4 transform_projection, vec4 vertex_position) {
+          return transform_projection * vertex_position;
+        }
+      ]])
+      assert(vs:type() == "Shader", "vertex-only newShader returned a non-Shader")
+      love.graphics.setShader(vs)
+      love.graphics.setShader()
+    else
+      -- a host with no GL: the failure is required to be loud and to say why
+      assert(tostring(res):find("newShader"),
+             "newShader failed without naming itself: " .. tostring(res))
+    end
+  end)
   -- api.md: debug + logging
   T("debug", function() love.log("x", 1); love.debugValue(0, 5); love.mark(7) end)
   -- api.md: window/system/event

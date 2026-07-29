@@ -70,6 +70,82 @@ The built-in bitfont covers `A-Z a-z 0-9` and
 `space - . ! : > + = / ( ) , ? % * < # _ ' " ; [ ]`. Unmapped characters
 render as a space.
 
+### Shaders
+
+Custom fragment and vertex shaders run on the GL2D renderer.
+
+```lua
+local invert = love.graphics.newShader [[
+  vec4 effect(vec4 color, Image tex, vec2 texture_coords, vec2 screen_coords) {
+    vec4 px = Texel(tex, texture_coords) * color;
+    return vec4(1.0 - px.rgb, px.a);
+  }
+]]
+
+love.graphics.setShader(invert)
+love.graphics.rectangle("fill", 0, 0, 100, 100)   -- drawn inverted
+love.graphics.setShader()                          -- back to the default
+```
+
+You write only the LÖVE-shaped body. The `#version` line, the ins and outs,
+and a `main()` are synthesized by the engine, so the shader applies to
+**every** draw path: rectangles, sprites, text and circles alike.
+
+| Function | Notes |
+|---|---|
+| `newShader(pixelcode, [vertexcode])` | either argument may be an asset path instead of source; order does not matter, they are told apart by content |
+| `setShader(s)` / `setShader()` | no args reverts to the engine's default program |
+| `getShader()` | the currently bound Shader, or `nil` |
+| `Shader:send(name, ...)` | returns `false` if the uniform is not in the linked program |
+| `Shader:hasUniform(name)` | |
+
+`send` accepts numbers, a table of 1-4 numbers (a vector), a 4x4
+table-of-tables (a `mat4`), booleans, and an `Image` or `Canvas` for a
+`sampler2D`:
+
+```lua
+s:send("u_time", t)                    -- float
+s:send("u_tint", { 0.2, 1.0, 0.4 })    -- vec3
+s:send("u_on", true)                   -- bool
+s:send("u_lut", myCanvas)              -- sampler2D
+```
+
+Predefined for you, matching LÖVE: `Image`, `Texel(tex, uv)`,
+`love_ScreenSize`, `VaryingColor`, `number`, and `extern` as an alias for
+`uniform`.
+
+A vertex shader defines
+`vec4 position(mat4 transform_projection, vec4 vertex_position)`.
+
+**What is different from LÖVE, and why:**
+
+- **The surface is WebGL2 / GLES 3.0 only.** A shader that writes its own
+  `#version`, or uses GLSL ES 1.00 spellings (`gl_FragColor`, `texture2D`,
+  `varying`, `attribute`), or anything from GLES 3.1+ (compute, image
+  load/store) is refused **by name** with an explanation. That is
+  deliberate: handing it to the driver instead produces errors pointing at
+  line numbers in generated code you never wrote.
+- **`transform_projection` is the identity.** This engine has no
+  model/view/projection matrix; vertices reach the vertex shader already in
+  clip space. Multiplying by it is correct; deriving your own projection
+  from it is not.
+- **`Texel` on the draw's own texture honours the draw type.** An
+  untextured draw (a rectangle, a circle) sees an all-white texel, so
+  `Texel(tex, uv) * color` reduces to the vertex colour. Sample your own
+  `Image` uniforms with plain `texture()`.
+- **An `Image` sent as a uniform is a sub-rect of a shared atlas**, so its
+  uv range is not 0..1. The engine logs the actual range. Use a `Canvas` if
+  you need a 0..1 sampler.
+- **Limits:** 8 shaders, 4 image uniforms per shader, 16 KB of source.
+- **Shaders need GL.** `newShader` fails on a host with no GL context, and
+  `setShader` fails if the renderer has fallen back to the software
+  rasterizer, rather than drawing unshaded and looking almost right. If a
+  later draw trips that fallback while a shader is bound, the engine says so
+  in the cart log.
+
+A compile or link failure raises a Lua error, and the driver's own info log
+is written to the cart log so you see the real message.
+
 ### Transforms
 
 ```lua
