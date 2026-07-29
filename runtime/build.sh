@@ -81,10 +81,10 @@ build_engine() {   # $1 = output, $2... = extra flags
   local out="$1"; shift
   emcc runtime.c vorbis.c cartconf.c physics.c render2d_gl.c \
     vendor/liblua54.a vendor/libbox2d.a \
-    -O2 -msimd128 -msse2 "$@" \
+    -O2 -msimd128 -msse2 -DWC_USE_NET_PEER "$@" \
     -I vendor/lua/src -I vendor/box2d/include -I "$WASMCART_REPO/include" -I . \
     -s STANDALONE_WASM=1 --no-entry -sSUPPORT_LONGJMP=wasm \
-    -s EXPORTED_FUNCTIONS='["_wc_init","_wc_render","_wc_get_info","_wc_debug_state","_wc_set_seed"]' \
+    -s EXPORTED_FUNCTIONS='["_wc_init","_wc_render","_wc_get_info","_wc_debug_state","_wc_set_seed","_wc_peer_on_connect","_wc_peer_on_message","_wc_peer_on_disconnect","_wc_peer_on_error"]' \
     -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
     -s ALLOW_MEMORY_GROWTH=1 -s INITIAL_MEMORY=67108864 -s STACK_SIZE=4194304 \
     -o "$out"

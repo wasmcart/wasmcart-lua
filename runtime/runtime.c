@@ -1297,6 +1297,191 @@ static int l_pad_rumble_stop(lua_State *S) {
     return 0;
 }
 
+/* ── networking (wc_peer_*) ────────────────────────────────────────────
+ *
+ * One primitive: a connection to a peer. The transport underneath is the
+ * host's business and the cart cannot tell what it is, so this layer adds
+ * nothing but the Lua marshalling.
+ *
+ * Payloads are BINARY. Lua strings hold arbitrary bytes including NUL, so
+ * they are the carrier, and every crossing here uses explicit lengths -
+ * a strlen anywhere on this path would silently truncate a message at its
+ * first zero byte, which for packed binary game state is most of them.
+ *
+ * Peer ids are host-assigned integers, not indices, and there is no
+ * conversion at this boundary: unlike the pads, what Lua holds is exactly
+ * what the ABI uses. Handing an id back verbatim is what makes it usable
+ * as a stable key for a player table.
+ */
+
+/* Names arrive from a remote machine, so this is the length the engine is
+ * willing to receive - not a protocol limit. Anything longer is truncated
+ * rather than trusted to fit. */
+#define PEER_NAME_MAX 128
+
+static int l_peer_open(lua_State *S) {
+    size_t len = 0;
+    const char *addr = luaL_checklstring(S, 1, &len);
+    int id = wc_peer_open(addr, (unsigned int)len);
+    if (id < 0) { lua_pushnil(S); return 1; }
+    lua_pushinteger(S, id);
+    return 1;
+}
+
+static int l_peer_close(lua_State *S) {
+    wc_peer_close(ARGI(1));
+    return 0;
+}
+
+static int l_peer_send(lua_State *S) {
+    int id = ARGI(1);
+    size_t len = 0;
+    const char *data = luaL_checklstring(S, 2, &len);
+    lua_pushinteger(S, wc_peer_send(id, data, (unsigned int)len));
+    return 1;
+}
+
+static int l_peer_broadcast(lua_State *S) {
+    size_t len = 0;
+    const char *data = luaL_checklstring(S, 1, &len);
+    lua_pushinteger(S, wc_peer_broadcast(data, (unsigned int)len));
+    return 1;
+}
+
+static int l_peer_state(lua_State *S) {
+    lua_pushinteger(S, wc_peer_state(ARGI(1)));
+    return 1;
+}
+
+static int l_peer_count(lua_State *S) {
+    lua_pushinteger(S, wc_peer_count());
+    return 1;
+}
+
+/* index is 0-based here, matching the ABI; the prelude builds the 1-based
+ * Lua list from it. */
+static int l_peer_id(lua_State *S) {
+    int id = wc_peer_id((unsigned int)ARGI(1));
+    if (id < 0) { lua_pushnil(S); return 1; }
+    lua_pushinteger(S, id);
+    return 1;
+}
+
+static int l_peer_name(lua_State *S) {
+    char buf[PEER_NAME_MAX];
+    int n = wc_peer_name(ARGI(1), buf, (unsigned int)sizeof buf);
+    if (n <= 0) { lua_pushnil(S); return 1; }
+    /* The host returns bytes written INCLUDING the NUL terminator, and the
+     * name itself is untrusted text that may hold anything. Trust the count,
+     * not the bytes: scan for the terminator inside the reported span and
+     * fall back to the full span if the host did not write one. */
+    size_t span = (size_t)n <= sizeof buf ? (size_t)n : sizeof buf;
+    size_t text = span;
+    for (size_t i = 0; i < span; i++) {
+        if (buf[i] == 0) { text = i; break; }
+    }
+    lua_pushlstring(S, buf, text);
+    return 1;
+}
+
+static int l_peer_transport(lua_State *S) {
+    lua_pushinteger(S, wc_peer_transport(ARGI(1)));
+    return 1;
+}
+
+/* Host-called peer callbacks.
+ *
+ * These are queued rather than dispatched into Lua on the spot. The host is
+ * free to deliver them at any point it likes, including while a frame's Lua
+ * is on the stack; re-entering the VM from there would run a cart's handler
+ * inside its own update. Queueing keeps every cart callback in one place -
+ * the top of the frame, before love.update - so ordering is the cart's to
+ * reason about and a handler that errors takes down a frame, not the host's
+ * callback.
+ *
+ * The queue is bounded. A peer that floods faster than the cart drains must
+ * cost the cart frames, not memory: past the cap the oldest events are
+ * dropped and the cart is told how many, so it can resynchronize rather than
+ * silently play on a partial stream.
+ */
+#define PEER_EVQ_CAP     256
+#define PEER_MSG_MAX     8192
+
+typedef struct {
+    int      kind;      /* 0 connect, 1 message, 2 disconnect, 3 error */
+    int      peer_id;
+    uint32_t len;
+    char     data[PEER_MSG_MAX];
+} peer_event_t;
+
+static peer_event_t peer_evq[PEER_EVQ_CAP];
+static int peer_evq_head = 0, peer_evq_len = 0;
+static uint32_t peer_dropped = 0;
+
+static peer_event_t *peer_evq_push(int kind, int peer_id) {
+    if (peer_evq_len == PEER_EVQ_CAP) {
+        peer_evq_head = (peer_evq_head + 1) % PEER_EVQ_CAP;
+        peer_evq_len--;
+        peer_dropped++;
+    }
+    int slot = (peer_evq_head + peer_evq_len) % PEER_EVQ_CAP;
+    peer_evq_len++;
+    peer_event_t *ev = &peer_evq[slot];
+    ev->kind = kind;
+    ev->peer_id = peer_id;
+    ev->len = 0;
+    return ev;
+}
+
+static void peer_evq_copy(peer_event_t *ev, const void *src, unsigned int len) {
+    if (len > PEER_MSG_MAX) len = PEER_MSG_MAX;
+    if (len && src) memcpy(ev->data, src, len);
+    ev->len = len;
+}
+
+__attribute__((export_name("wc_peer_on_connect")))
+void wc_peer_on_connect(int peer_id, const char *name, unsigned int name_len) {
+    peer_evq_copy(peer_evq_push(0, peer_id), name, name_len);
+}
+
+__attribute__((export_name("wc_peer_on_message")))
+void wc_peer_on_message(int peer_id, const void *data, unsigned int len) {
+    peer_evq_copy(peer_evq_push(1, peer_id), data, len);
+}
+
+__attribute__((export_name("wc_peer_on_disconnect")))
+void wc_peer_on_disconnect(int peer_id) {
+    peer_evq_push(2, peer_id);
+}
+
+__attribute__((export_name("wc_peer_on_error")))
+void wc_peer_on_error(int peer_id) {
+    peer_evq_push(3, peer_id);
+}
+
+/* peer_poll() -> kind, peer_id, payload  (nil when the queue is empty).
+ * The prelude drains this at the top of each frame and turns each event into
+ * the matching love.net callback. */
+static int l_peer_poll(lua_State *S) {
+    if (peer_evq_len == 0) { lua_pushnil(S); return 1; }
+    peer_event_t *ev = &peer_evq[peer_evq_head];
+    peer_evq_head = (peer_evq_head + 1) % PEER_EVQ_CAP;
+    peer_evq_len--;
+    lua_pushinteger(S, ev->kind);
+    lua_pushinteger(S, ev->peer_id);
+    lua_pushlstring(S, ev->data, (size_t)ev->len);
+    return 3;
+}
+
+/* Number of events dropped since the last call, and reset. Reported rather
+ * than hidden: a cart that cares about a complete stream needs to know its
+ * view has a hole in it. */
+static int l_peer_dropped(lua_State *S) {
+    lua_pushinteger(S, (lua_Integer)peer_dropped);
+    peer_dropped = 0;
+    return 1;
+}
+
 /* ── custom shaders ────────────────────────────────────────────────────
  *
  * The whole feature is GL-only by construction: a shader IS a GPU program,
@@ -1742,6 +1927,17 @@ static const luaL_Reg wc_lib[] = {
     {"pad_has_rumble",  l_pad_has_rumble},
     {"pad_rumble",      l_pad_rumble},
     {"pad_rumble_stop", l_pad_rumble_stop},
+    {"peer_open",       l_peer_open},
+    {"peer_close",      l_peer_close},
+    {"peer_send",       l_peer_send},
+    {"peer_broadcast",  l_peer_broadcast},
+    {"peer_state",      l_peer_state},
+    {"peer_count",      l_peer_count},
+    {"peer_id",         l_peer_id},
+    {"peer_name",       l_peer_name},
+    {"peer_transport",  l_peer_transport},
+    {"peer_poll",       l_peer_poll},
+    {"peer_dropped",    l_peer_dropped},
     {NULL, NULL}
 };
 
@@ -1815,7 +2011,12 @@ static int run_source(const char *name) {
 }
 
 WC_EXPORT wc_info_t *wc_get_info(void) {
-    WC_FILL_INFO(WC_FLAG_DEBUG | WC_FLAG_DETERMINISTIC | WC_FLAG_POINTER);
+    /* WC_FLAG_NET_PEER is the cart-side half of the networking gate. The
+     * other half is the manifest's `net` grant, which the packager writes -
+     * a cart that never calls love.net simply never reaches a host that has
+     * not been given a domain to allow. */
+    WC_FILL_INFO(WC_FLAG_DEBUG | WC_FLAG_DETERMINISTIC | WC_FLAG_POINTER |
+                 WC_FLAG_NET_PEER);
     wc_info.audio_sample_rate = 48000;
 #ifdef WCL_USE_GL
     wc_info.gpu_api = 1;  /* WebGL2/GLES3: we present via wc_gl_blit */

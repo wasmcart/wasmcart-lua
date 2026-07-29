@@ -73,6 +73,20 @@ async function runCart(wasmPath, appDir, frames, opts = {}) {
       wc_pad_has_rumble: (id) => (rumbleCapable.has(id) ? 1 : 0),
       wc_pad_rumble: (id, low, high, ms) => rumbles.push({ id, low, high, ms }),
       wc_pad_rumble_stop: (id) => rumbles.push({ id, stop: true }),
+      // Peer networking, in the OFFLINE configuration: every open is refused
+      // and there are no peers. That is a supported host, not a degenerate
+      // one, and running the whole example suite against it is what proves
+      // no cart depends on the network to boot or draw. The real networking
+      // assertions need a real socket and live in test/net.mjs.
+      wc_peer_open: () => -1,
+      wc_peer_close: () => {},
+      wc_peer_send: () => -1,
+      wc_peer_broadcast: () => 0,
+      wc_peer_state: () => 3,   // WC_PEER_CLOSED
+      wc_peer_count: () => 0,
+      wc_peer_id: () => -1,
+      wc_peer_name: () => -1,
+      wc_peer_transport: () => 0,
       wc_debug_mark: (id) => marks.push(id),
       emscripten_notify_memory_growth: () => {},
     },

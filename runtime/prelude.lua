@@ -990,6 +990,146 @@ end
 function Joystick:isVibrationSupported() return pad.hasVibration(self.n) end
 function Joystick:getVibration() return pad.getVibration(self.n) end
 
+-- ── love.net ───────────────────────────────────────────────────────
+--
+-- LOVE has no networking, so this is not a LOVE API being mirrored: it is
+-- the wasmcart peer ABI given a LOVE-SHAPED surface. Polling functions on
+-- love.net, callbacks assigned as love.net.<event>, same as love.update.
+--
+-- There is ONE primitive: a connection to a peer. What it runs over is the
+-- host's business and deliberately invisible here - a WebSocket, a data
+-- channel, a LAN socket and a serial cable all arrive as the same peer.
+-- There is no client/server split either; which end dialed is a host-side
+-- fact. A cart that wants to be a server just behaves like one.
+--
+-- Payloads are BYTES. Lua strings carry arbitrary bytes including NUL, so
+-- they are what send/broadcast take and what the message callback hands
+-- back. Text framing, JSON, whatever structure the game wants on top is the
+-- cart's job: the ABI moves bytes and nothing else.
+--
+-- Reaching the network needs BOTH halves of the gate: the engine sets
+-- WC_FLAG_NET_PEER for you, and whoever packs the cart must grant the
+-- domains in the manifest's `net` object. Neither half can be asserted from
+-- Lua, which is the point - a cart cannot grant itself network reach.
+local net = {}
+love.net = net
+
+local STATE_NAMES = { [0] = "connecting", [1] = "open", [2] = "closing", [3] = "closed" }
+
+-- Transport PROPERTIES, not a transport name. There is deliberately no way
+-- to ask "am I on WebRTC": branching on the implementation is exactly what
+-- this design hides. A host that does not characterize its transport
+-- reports none of these, and a cart must cope with that.
+local TRANSPORT = { reliable = 0x01, ordered = 0x02, lowlatency = 0x04 }
+
+-- open(address) -> peer id, or nil when the host refuses.
+--
+-- The address grammar belongs to the HOST, not to this engine and not to
+-- the spec. "wss://example.com/lobby", "room:ABCD", "192.168.1.7:9000" are
+-- all plausible; a host that does not understand one fails the open. Treat
+-- nil as normal and recoverable, never as an error worth crashing on: an
+-- offline device is a supported configuration.
+function net.open(address)
+  if type(address) ~= "string" then return nil end
+  return wc.peer_open(address)
+end
+
+function net.close(peer)
+  if type(peer) ~= "number" then return end
+  wc.peer_close(peer)
+end
+
+-- send(peer, data) -> bytes sent, or nil if the host refused.
+-- Returning nil rather than 0 keeps "refused" distinguishable from "sent an
+-- empty message", which is a legal thing for a cart to do.
+function net.send(peer, data)
+  if type(peer) ~= "number" or type(data) ~= "string" then return nil end
+  local n = wc.peer_send(peer, data)
+  if n < 0 then return nil end
+  return n
+end
+
+-- broadcast(data) -> number of peers it reached.
+function net.broadcast(data)
+  if type(data) ~= "string" then return 0 end
+  local n = wc.peer_broadcast(data)
+  if n < 0 then return 0 end
+  return n
+end
+
+-- state(peer) -> "connecting" | "open" | "closing" | "closed".
+-- An unknown peer reads as "closed", which is the truth from the cart's
+-- point of view and saves every caller a nil check.
+function net.state(peer)
+  if type(peer) ~= "number" then return "closed" end
+  return STATE_NAMES[wc.peer_state(peer)] or "closed"
+end
+
+function net.isOpen(peer)
+  return net.state(peer) == "open"
+end
+
+-- peers() -> array of peer ids, in host order.
+function net.peers()
+  local out = {}
+  for i = 0, wc.peer_count() - 1 do
+    local id = wc.peer_id(i)
+    if id then out[#out + 1] = id end
+  end
+  return out
+end
+
+function net.count()
+  return wc.peer_count()
+end
+
+-- name(peer) -> display string, or nil.
+--
+-- DISPLAY-ONLY, and the source of a real bug class. The name comes from a
+-- remote machine, so it is attacker-controlled text: it is not unique, not
+-- stable across sessions, not necessarily valid UTF-8, and not a handle.
+-- Draw it, and nothing else. The PEER ID is the handle - key player tables
+-- on that. The engine already bounds the length the host may write; what it
+-- cannot do is stop a cart from trusting the contents.
+function net.name(peer)
+  if type(peer) ~= "number" then return nil end
+  return wc.peer_name(peer)
+end
+
+-- transport(peer) -> table of properties. All false is the normal answer
+-- from a host that does not characterize its transport, so a cart must not
+-- read "not reliable" as "unreliable" - it means "unknown, assume nothing".
+function net.transport(peer)
+  if type(peer) ~= "number" then return { reliable = false, ordered = false, lowLatency = false } end
+  local bits = wc.peer_transport(peer)
+  return {
+    reliable   = (bits & TRANSPORT.reliable) ~= 0,
+    ordered    = (bits & TRANSPORT.ordered) ~= 0,
+    lowLatency = (bits & TRANSPORT.lowlatency) ~= 0,
+  }
+end
+
+-- Drain the engine's event queue into the cart's callbacks. Called at the
+-- top of the frame, before love.update, so a handler runs with the same
+-- world state the rest of the frame sees rather than halfway through it.
+local function dispatch_net()
+  local dropped = wc.peer_dropped()
+  if dropped > 0 and net.overflow then net.overflow(dropped) end
+  while true do
+    local kind, peer, payload = wc.peer_poll()
+    if not kind then break end
+    if kind == 0 then
+      if net.connected then net.connected(peer, payload) end
+    elseif kind == 1 then
+      if net.message then net.message(peer, payload) end
+    elseif kind == 2 then
+      if net.disconnected then net.disconnected(peer) end
+    else
+      if net.error then net.error(peer) end
+    end
+  end
+end
+
 -- ── love.mouse ─────────────────────────────────────────────────────
 --
 -- Backed by the wasmcart pointer ABI (unified mouse/touch), so it works on
@@ -1776,6 +1916,8 @@ function __wasmcart_frame(b1, lx1, ly1, rx1, ry1,
 
   frame_n = frame_n + 1
   update_vcursor()
+
+  dispatch_net()
 
   -- Pointer edges -> love.mousepressed / love.mousereleased. Menus are
   -- driven by these callbacks rather than by polling, so a poll-only

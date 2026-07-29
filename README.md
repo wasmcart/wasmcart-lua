@@ -197,6 +197,42 @@ love.physics.stats()               -- { simd = "wasm-simd128", bodies = n }
 Multiple independent worlds are supported (a zero-gravity gameplay world
 alongside a gravity world for debris is a common real pattern).
 
+### love.net (multiplayer)
+
+LÖVE has no networking, so this one is not a LÖVE API being mirrored. It is
+wasmcart's peer ABI given a LÖVE-shaped surface: polling functions on
+`love.net`, callbacks assigned like `love.update`.
+
+```lua
+local peer = love.net.open("wss://example.com/lobby")   -- id, or nil
+
+function love.net.connected(peer, name) ... end
+function love.net.message(peer, data) ... end           -- data is BYTES
+function love.net.disconnected(peer) ... end
+
+love.net.send(peer, string.pack("<Bff", MSG_MOVE, x, y))
+love.net.broadcast(data)          -- every open peer
+love.net.peers()                  -- ids, keyed on by your player table
+love.net.state(peer)              -- "connecting" / "open" / "closing" / "closed"
+```
+
+There is **one primitive**: a connection to a peer. What it runs over is the
+host's business and invisible to the cart, so a WebSocket, a WebRTC data
+channel, a LAN socket and a serial cable all arrive as the same peer. There is
+no client/server split either; a cart that wants to be a server just behaves
+like one.
+
+Two things must both be true before a single byte moves: the cart sets
+`WC_FLAG_NET_PEER` (the engine always does), **and** the manifest grants the
+domain. Pack with `--ws example.com`. Without the grant every `open` returns
+`nil` and no callback fires, with byte-identical cart code: a cart cannot grant
+itself network reach.
+
+Payloads are binary; `string.pack` is the natural fit. The peer **id** is the
+handle. `love.net.name(peer)` is display-only, arrives from a remote machine,
+and is not unique, not stable and not necessarily valid UTF-8: draw it, never
+key on it. Full detail in [docs/api.md](docs/api.md#lovenet-networking).
+
 ### love.math / love.timer / love.filesystem
 
 ```lua
@@ -332,6 +368,19 @@ per-vertex colour interpolates instead of rendering flat, and that
 LÖVE's 1-based indices round-trip (an off-by-one there is invisible on
 screen — a mesh drawn from vertex 2 still looks like a mesh).
 `test/meshcost` holds the call budget: 12 meshes must be 12 draws.
+
+`test/net.mjs` is the one part of the suite that does **not** use the fake
+host, on purpose. Every interesting networking failure lives in a seam (a
+length that becomes a `strlen`, a peer id that becomes an index, a callback
+that never gets drained) and a fake host written alongside the engine shares
+its assumptions and so cannot see any of them. So it runs the real reference
+host against the real WebSocket server that ships with wasmcart: one cart
+round-trips a 10-byte payload with an embedded NUL through an echo endpoint,
+**two** carts exchange payloads through a relay room, and a cart packed with no
+`--ws` grant is refused despite identical code. The peer-id assertion registers
+a host-side peer at id 77 first, so id and enumeration index are different
+numbers and an engine that confused them fails instead of coinciding. Needs a
+wasmcart checkout (`WASMCART_REPO`); skips cleanly without one.
 
 `test/determinism.js` proves the determinism claim two ways: the same seed
 must give a byte-identical framebuffer, and for carts whose visuals depend on

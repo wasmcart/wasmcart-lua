@@ -5,8 +5,9 @@
   "license": "MIT",
   "scripts": {
     "build": "cd runtime && ./build.sh",
-    "test": "node test/run.js && node test/determinism.js",
-    "test:determinism": "node test/determinism.js"
+    "test": "node test/run.js && node test/determinism.js && node test/net.mjs",
+    "test:determinism": "node test/determinism.js",
+    "test:net": "node test/net.mjs"
   },
   "keywords": [
     "lua",

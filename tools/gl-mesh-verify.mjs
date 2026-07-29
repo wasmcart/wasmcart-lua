@@ -92,6 +92,17 @@ const env = {
   wc_pad_has_rumble: () => 0,
   wc_pad_rumble: () => {},
   wc_pad_rumble_stop: () => {},
+  // Offline peer host: nothing here is a networking test, and a cart
+  // that cannot boot without the network is the bug these would catch.
+  wc_peer_open: () => -1,
+  wc_peer_close: () => {},
+  wc_peer_send: () => -1,
+  wc_peer_broadcast: () => 0,
+  wc_peer_state: () => 3,
+  wc_peer_count: () => 0,
+  wc_peer_id: () => -1,
+  wc_peer_name: () => -1,
+  wc_peer_transport: () => 0,
   wc_debug_mark: () => {},
   emscripten_notify_memory_growth: () => {},
 };

@@ -293,6 +293,120 @@ for _, joy in ipairs(love.joystick.getJoysticks()) do
 end
 ```
 
+## love.net (networking)
+
+LÖVE has no networking, so this is not a LÖVE API being mirrored. It is the
+wasmcart peer ABI given a LÖVE-shaped surface: polling functions on `love.net`,
+callbacks assigned as `love.net.<event>` the same way `love.update` is.
+
+```lua
+local peer = love.net.open("wss://example.com/lobby")  -- id, or nil
+love.net.send(peer, data)          -- data is a string of BYTES
+love.net.broadcast(data)           -- every open peer; returns how many
+love.net.close(peer)
+love.net.state(peer)               -- "connecting" | "open" | "closing" | "closed"
+love.net.isOpen(peer)
+love.net.peers()                   -- array of peer ids
+love.net.count()
+love.net.name(peer)                -- DISPLAY ONLY, see below
+love.net.transport(peer)           -- { reliable, ordered, lowLatency }
+
+function love.net.connected(peer, name) end
+function love.net.message(peer, data) end
+function love.net.disconnected(peer) end
+function love.net.error(peer) end
+function love.net.overflow(dropped) end
+```
+
+### One primitive
+
+There is exactly one thing here: a connection to a peer. What it runs over is
+the host's business and deliberately invisible to the cart. A WebSocket, a
+WebRTC data channel, a LAN socket and a serial cable all arrive as the same
+peer, which is what lets one cart binary work on a host with matchmaking and on
+a host where you type in an IP.
+
+There is no client/server split either. Which end dialed is a host-side fact. A
+cart that wants to be a server just behaves like one, in the messages it sends.
+
+The address grammar belongs to the HOST, not to this engine. `wss://…`,
+`room:ABCD`, `192.168.1.7:9000` are all plausible; a host that does not
+understand one fails the open. `love.net.open` returning `nil` is normal and
+recoverable, not an error worth crashing on: an offline device is a supported
+configuration and a cart must still boot and play on one.
+
+### Two gates, and only one is yours
+
+Reaching the network needs BOTH halves:
+
+1. The cart sets `WC_FLAG_NET_PEER`. The engine does this for you, always.
+2. The manifest grants the transport. Pack with `--ws <domain>`, which writes
+   `net.domains`, and only the domains listed there can be dialed.
+
+Neither half can be asserted from Lua, and that is the point. A cart cannot
+grant itself network reach: that decision belongs to whoever packaged it. With
+no grant, every `love.net.open` returns `nil` and no callback ever fires, with
+the same cart code that works when the grant is there.
+
+```sh
+wasmcart-pack --wasm engine.wasm --assets app/ --ws example.com -o game.wasc
+```
+
+### Messages are bytes
+
+Payloads are binary. Lua strings carry arbitrary bytes including NUL, so they
+are what `send`/`broadcast` take and what `love.net.message` hands back, with
+exact lengths preserved end to end. Text framing, JSON, `string.pack` structs,
+whatever the game wants on top is the cart's job. The ABI moves bytes and
+nothing else, because a text frame is meaningful for a WebSocket and meaningless
+for a serial cable.
+
+```lua
+-- pack a position update; string.pack is the natural fit
+love.net.broadcast(string.pack("<Bff", MSG_MOVE, x, y))
+
+function love.net.message(peer, data)
+  local kind = string.unpack("<B", data)
+  if kind == MSG_MOVE then
+    local _, x, y = string.unpack("<Bff", data)
+    players[peer].x, players[peer].y = x, y   -- keyed on the PEER ID
+  end
+end
+```
+
+### The id is the handle, the name is decoration
+
+`peer` is a host-assigned integer, stable for the session. It is what you key a
+player table on and what you pass to `send`.
+
+`love.net.name(peer)` is DISPLAY ONLY, and this is the source of a real bug
+class. The name comes from a remote machine, so it is attacker-controlled text.
+It is not unique, not stable across sessions, not necessarily valid UTF-8, and
+not a handle. Draw it, and nothing else. Never use it as a table key, never
+compare it to decide who somebody is, and bound how much of it you render: the
+engine caps how many bytes the host may hand over, but it cannot stop a cart
+from trusting the contents.
+
+### Callback timing
+
+Peer events are queued by the engine and dispatched at the top of the frame,
+before `love.update`, so a handler runs against the same world state the rest of
+the frame sees rather than halfway through it. Ordering within a frame is the
+host's delivery order.
+
+The queue is bounded. A peer that floods faster than the cart drains costs the
+cart frames, not memory: past the cap the oldest events are dropped and
+`love.net.overflow(n)` reports how many, so a cart that needs a complete stream
+can resynchronize instead of silently playing on a partial one. Messages larger
+than 8 KiB are truncated to it.
+
+### Transport properties
+
+`love.net.transport(peer)` reports properties, never a transport name, so a cart
+cannot branch on the implementation this design exists to hide. All three false
+is the normal answer from a host that does not characterize its transport: read
+that as "unknown, assume nothing", not as "unreliable".
+
 ## love.audio
 
 ```lua

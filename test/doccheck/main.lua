@@ -183,6 +183,32 @@ function love.load()
              "newMesh failed without naming itself: " .. tostring(res))
     end
   end)
+  -- api.md: love.net. The doccheck host is OFFLINE, which is the interesting
+  -- case for a documented API: every one of these must return a defined value
+  -- rather than erroring, because "no networking available" is a supported
+  -- configuration a shipped cart has to survive.
+  T("net", function()
+    local peer = love.net.open("wss://example.com/lobby")
+    assert(peer == nil, "an offline host must refuse the open")
+    love.net.send(peer, "data"); love.net.broadcast("data"); love.net.close(peer)
+    assert(love.net.state(peer) == "closed")
+    assert(love.net.isOpen(peer) == false)
+    assert(type(love.net.peers()) == "table")
+    assert(love.net.count() == 0)
+    love.net.name(peer)
+    local t = love.net.transport(peer)
+    assert(t.reliable == false and t.ordered == false and t.lowLatency == false)
+  end)
+  -- api.md: the string.pack framing example
+  T("net-framing", function()
+    local MSG_MOVE = 1
+    local packed = string.pack("<Bff", MSG_MOVE, 3.5, 4.5)
+    love.net.broadcast(packed)
+    local kind = string.unpack("<B", packed)
+    assert(kind == MSG_MOVE)
+    local _, x, y = string.unpack("<Bff", packed)
+    assert(x == 3.5 and y == 4.5)
+  end)
   -- api.md: debug + logging
   T("debug", function() love.log("x", 1); love.debugValue(0, 5); love.mark(7) end)
   -- api.md: window/system/event
