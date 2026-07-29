@@ -27,6 +27,17 @@ function love.load()
     love.pad.isDown("a"); love.pad.isDown(2,"a"); love.pad.wasPressed("start")
     love.pad.wasReleased("b"); love.pad.axis("leftx"); love.pad.axis(3,"lefty")
   end)
+  -- api.md: rumble
+  T("rumble", function()
+    love.pad.hasVibration(); love.pad.hasVibration(2)
+    love.pad.setVibration(0.5, 0.25, 0.4)
+    love.pad.setVibration(2, 1, 0, 0.4)
+    love.pad.setVibration()
+    love.pad.stopVibration(2)
+    love.pad.getVibration()
+    local j = love.joystick.getJoysticks()[1]
+    j:isVibrationSupported(); j:setVibration(0.5, 0.5, 0.2); j:getVibration()
+  end)
   -- api.md: keyboard/joystick
   T("keyboard", function()
     love.keyboard.isDown("left","a")

@@ -62,6 +62,10 @@ const env = {
     new Uint8Array(mem.buffer, d, len).set(b.subarray(0, len));
     return len;
   },
+  // no pads in a headless run, so rumble is a no-op the engine can still call
+  wc_pad_has_rumble: () => 0,
+  wc_pad_rumble: () => {},
+  wc_pad_rumble_stop: () => {},
   wc_debug_mark: () => {},
   emscripten_notify_memory_growth: () => {},
 };

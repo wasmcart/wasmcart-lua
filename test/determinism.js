@@ -24,7 +24,10 @@ const path = require('path');
 const crypto = require('crypto');
 
 const ROOT = path.join(__dirname, '..');
-const ENGINE = path.join(ROOT, 'build', 'engine.wasm');
+// The CPU comparator, for the same reason render-hash.js uses it: these are
+// byte-equality claims about the software rasterizer, and the GL build needs
+// a real GL context this headless harness has no way to provide.
+const ENGINE = path.join(ROOT, 'build', 'engine-cpu.wasm');
 
 // seedSensitive: does RNG visibly affect this cart's rendered output?
 const CARTS = [
@@ -65,6 +68,10 @@ async function frameHash(appDir, seed, frames) {
         new Uint8Array(mem.buffer, d, len).set(b.subarray(0, len));
         return len;
       },
+      // no pads in a headless run, so rumble is a no-op the engine can still call
+      wc_pad_has_rumble: () => 0,
+      wc_pad_rumble: () => {},
+      wc_pad_rumble_stop: () => {},
       wc_debug_mark: () => {},
       emscripten_notify_memory_growth: () => {},
     },

@@ -180,6 +180,10 @@ typedef struct {
 #define WC_FLAG_NET_DC     (1 << 2)  // cart wants data channel imports (ABI v3)
 #define WC_FLAG_POINTER    (1 << 3)  // cart wants pointer input (ABI v3)
 #define WC_FLAG_KEYBOARD   (1 << 4)  // cart wants raw keyboard input (ABI v3)
+// Both of the following are OPT-IN and default OFF. A cart that sets neither is
+// byte-for-byte identical to one built before they existed - see SPEC.md.
+#define WC_FLAG_DEBUG      (1 << 5)  // cart exports wc_debug_state() (see wc_cart.h)
+#define WC_FLAG_DETERMINISTIC (1 << 6) // cart honors host deterministic mode
 
 // Info struct (returned by wc_get_info)
 typedef struct {
@@ -213,6 +217,18 @@ static inline void wc_log(const char* ptr, unsigned int len) { (void)ptr; (void)
 // Helper: log a string literal
 #define WC_LOG(s) wc_log(s, sizeof(s) - 1)
 
+// Optional debug annotation (OPT-IN, default OFF). Stamps {frame, id} into a
+// debug-capable host's event trace so a run or replay is navigable by event.
+// An UNCALLED import is not emitted into the wasm binary, so merely declaring
+// this keeps a cart with no call sites byte-identical. Keep call sites behind
+// your own debug #ifdef. Play-only hosts stub it; see SPEC.md "Debug events".
+#ifdef __wasm__
+__attribute__((import_module("env"), import_name("wc_debug_mark")))
+extern void wc_debug_mark(unsigned int id);
+#else
+static inline void wc_debug_mark(unsigned int id) { (void)id; }
+#endif
+
 // Optional host import: query gamepad device name
 // Returns bytes written to buf (0 if pad_id invalid or no name available).
 // The host provides the SDL controller name, Gamepad API id, or "Keyboard".
@@ -223,6 +239,44 @@ extern int wc_pad_name(unsigned int pad_id, char* buf, unsigned int buf_len);
 static inline int wc_pad_name(unsigned int pad_id, char* buf, unsigned int buf_len) {
     (void)pad_id; (void)buf; (void)buf_len; return 0;
 }
+#endif
+
+// --- Rumble (ABI v3) ---
+// Rumble runs the opposite way to the rest of input: the cart drives it, so it
+// is a host import rather than a field in wc_pad_t.
+//
+// Capability is per-DEVICE, not per-platform, so always ask rather than assume:
+// an Xbox 360 pad reports rumble but no trigger rumble, and a keyboard-only
+// setup reports none at all. Calls on a pad without rumble are silent no-ops,
+// so it is safe (if wasteful) to skip the query.
+//
+// low  = low-frequency / "strong" motor (0.0 .. 1.0)
+// high = high-frequency / "weak" motor  (0.0 .. 1.0)
+// Values outside 0..1 are clamped by the host. duration_ms is capped at
+// WC_RUMBLE_MAX_MS: the host stops the motors on its own timer, so a cart that
+// crashes mid-effect still leaves the controller quiet. For sustained rumble,
+// re-arm each frame -- which also means rumble stops when the cart stops.
+#define WC_RUMBLE_MAX_MS 5000
+
+#ifdef __wasm__
+__attribute__((import_module("env"), import_name("wc_pad_has_rumble")))
+extern unsigned int wc_pad_has_rumble(unsigned int pad_id);
+
+__attribute__((import_module("env"), import_name("wc_pad_rumble")))
+extern void wc_pad_rumble(unsigned int pad_id, float low, float high,
+                          unsigned int duration_ms);
+
+__attribute__((import_module("env"), import_name("wc_pad_rumble_stop")))
+extern void wc_pad_rumble_stop(unsigned int pad_id);
+#else
+static inline unsigned int wc_pad_has_rumble(unsigned int pad_id) {
+    (void)pad_id; return 0;
+}
+static inline void wc_pad_rumble(unsigned int pad_id, float low, float high,
+                                 unsigned int duration_ms) {
+    (void)pad_id; (void)low; (void)high; (void)duration_ms;
+}
+static inline void wc_pad_rumble_stop(unsigned int pad_id) { (void)pad_id; }
 #endif
 
 // --- Asset API (ABI v2) ---

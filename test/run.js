@@ -47,7 +47,9 @@ async function runCart(wasmPath, appDir, frames, opts = {}) {
   const assets = loadAssets(appDir);
   let mem;
   const dec = new TextDecoder();
-  const logs = [], marks = [];
+  const logs = [], marks = [], rumbles = [];
+  // pads the fake host reports as rumble-capable (0-based ids)
+  const rumbleCapable = new Set(opts.rumblePads ?? []);
   const wasiCalled = new Set();
   const wasi = new Proxy({}, { get: (_t, n) => () => { wasiCalled.add(String(n)); return 0; } });
 
@@ -66,6 +68,11 @@ async function runCart(wasmPath, appDir, frames, opts = {}) {
         new Uint8Array(mem.buffer, d, len).set(b.subarray(0, len));
         return len;
       },
+      // Rumble is write-only at the ABI, so recording the calls is the only
+      // way a test can see what the cart asked the host to do.
+      wc_pad_has_rumble: (id) => (rumbleCapable.has(id) ? 1 : 0),
+      wc_pad_rumble: (id, low, high, ms) => rumbles.push({ id, low, high, ms }),
+      wc_pad_rumble_stop: (id) => rumbles.push({ id, stop: true }),
       wc_debug_mark: (id) => marks.push(id),
       emscripten_notify_memory_growth: () => {},
     },
@@ -134,7 +141,7 @@ async function runCart(wasmPath, appDir, frames, opts = {}) {
     }
   }
 
-  return { info, logs, marks, trap, top, fields, ms, frames,
+  return { info, logs, marks, rumbles, trap, top, fields, ms, frames,
            fb: new Uint8Array(mem.buffer, info.fbPtr, info.w * info.h * 4).slice(),
            wasi: [...wasiCalled], uniformity: top[0] ? top[0].pct : 100 };
 }
@@ -338,6 +345,70 @@ async function main() {
       failed++;
     } else {
       console.log(`\nok    doccheck     ${blocks} documented code blocks run clean`);
+    }
+  }
+
+  // ── rumble: the ABI boundary the cart cannot see ──────────────────
+  // Nothing about rumble reaches the framebuffer, so the smoke run above is
+  // blind to it. The fake host records every call instead, which is the only
+  // place the two conversions can be checked: love.pad is 1-BASED and the ABI
+  // is 0-based, and LOVE durations are SECONDS while the ABI takes ms.
+  const rumbleDir = path.join(ROOT, 'test', 'rumble');
+  if (fs.existsSync(path.join(rumbleDir, 'main.lua'))) {
+    // only pad id 0 has motors, so a per-pad query has something to get wrong
+    const rr = await runCart(ENGINE, rumbleDir, 12, { rumblePads: [0] });
+    const MAX = 5000;
+    const want = [
+      { id: 0, low: 0.5, high: 0.25, ms: 500 },   // implicit pad 1
+      { id: 1, low: 1, high: 0, ms: 2000 },       // Lua pad 2 -> ABI id 1
+      { id: 0, low: 0.75, high: 0.75, ms: MAX },  // no duration -> host cap
+      { id: 0, stop: true },                      // zero strength is a stop
+      { id: 2, stop: true },                      // stopVibration(3)
+      { id: 0, stop: true },                      // no args stops pad 1
+      { id: 0, low: 1, high: 0, ms: 100 },        // clamped both ways
+      { id: 0, low: 0.5, high: 0.5, ms: MAX },    // duration past the cap
+      { id: 3, low: 0.2, high: 0.3, ms: 250 },    // Joystick route, pad 4
+      { id: 0, low: 0.6, high: 0.4, ms: 1000 },
+      // case 11 asks for pad 9 and must produce NO call at all
+    ];
+    const problems = [];
+    if (rr.trap || rr.fields.lua_ok === 0) {
+      problems.push(`cart did not run: ${rr.trap || 'lua error'}`);
+    }
+    if (rr.rumbles.length !== want.length) {
+      problems.push(`${rr.rumbles.length} host calls, expected ${want.length} ` +
+        `(an out-of-range pad number must not reach the host)`);
+    }
+    for (let i = 0; i < Math.min(want.length, rr.rumbles.length); i++) {
+      const got = rr.rumbles[i], w = want[i];
+      const same = got.id === w.id && (w.stop
+        ? got.stop === true
+        : !got.stop && Math.abs(got.low - w.low) < 1e-5 &&
+          Math.abs(got.high - w.high) < 1e-5 && got.ms === w.ms);
+      if (!same) problems.push(`call ${i}: got ${JSON.stringify(got)} want ${JSON.stringify(w)}`);
+    }
+    const capLog = rr.logs.find(l => l.startsWith('cap1='));
+    if (capLog !== 'cap1=true') problems.push(`hasVibration() = ${capLog}, expected cap1=true`);
+    if (!rr.logs.includes('cap2=false')) problems.push('hasVibration(2) should be false');
+    if (!rr.logs.includes('get=0.60,0.40')) problems.push('getVibration did not report the last request');
+    if (!rr.logs.includes('bad=false')) problems.push('setVibration(9,...) should return false');
+    if (problems.length) {
+      console.log('\nFAIL  rumble');
+      for (const p of problems) console.log(`      ${p}`);
+      failed++;
+    } else {
+      console.log(`\nok    rumble       ${rr.rumbles.length} host calls, ids + ms conversion exact`);
+    }
+
+    // Control: a host that reports no rumble at all must still see the calls
+    // (they are documented no-ops host-side), and hasVibration must flip. If
+    // this does not move, the capability query is not wired to the host.
+    const rr2 = await runCart(ENGINE, rumbleDir, 12, { rumblePads: [] });
+    if (!rr2.logs.includes('cap1=false')) {
+      console.log('\nFAIL  rumble control: hasVibration() stayed true with a host that has no motors');
+      failed++;
+    } else {
+      console.log('ok    rumble-ctl   capability query tracks the host');
     }
   }
 

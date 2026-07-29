@@ -35,6 +35,17 @@ function love.update(dt)
   coro_state = ok and v or -1
   love.debugValue(0, t)
   love.debugValue(1, coro_state % 100000)
+
+  -- Rumble is re-armed every frame it is wanted: the host runs its own
+  -- shutoff timer, so a cart that stops calling (or crashes) leaves the
+  -- motors quiet rather than buzzing forever.
+  local weak = love.pad.isDown("a") and 1 or 0
+  local strong = love.pad.isDown("b") and 1 or 0
+  if weak > 0 or strong > 0 then
+    love.pad.setVibration(strong, weak, 0.1)
+  else
+    love.pad.stopVibration()
+  end
 end
 
 local function panel(x, y, w, h, label)
@@ -134,6 +145,13 @@ function love.draw()
     love.graphics.setColor(0, 0, 0)
     love.graphics.print(nm, 82 + col * 110, 545 + row * 60)
   end
+
+  -- 8b: rumble. Capability is per-DEVICE, so ask rather than assume; a
+  -- keyboard-only setup reports none and the calls below become no-ops.
+  love.graphics.setColor(0.55, 0.65, 0.85)
+  love.graphics.print(love.pad.hasVibration()
+    and "pad 1 rumbles: hold A (weak) or B (strong)"
+    or  "pad 1 has no rumble motors", 70, 650)
 
   -- 9: deterministic RNG + math
   panel(660, 480, 580, 200, "deterministic RNG + love.math.noise")

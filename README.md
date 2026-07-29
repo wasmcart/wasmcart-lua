@@ -148,6 +148,11 @@ love.pad.isDown(2, "a")            -- pad 2 held
 love.pad.wasPressed("a")           -- edge, this frame
 love.pad.wasReleased("start")
 love.pad.axis("leftx")             -- -1..1 analog
+
+love.pad.hasVibration()            -- does pad 1 have motors?
+love.pad.setVibration(0.6, 0.2, 0.3)   -- strong, weak, SECONDS (pad 1)
+love.pad.setVibration(2, 1, 0, 0.3)    -- pad 2: the 4-argument form
+love.pad.stopVibration()
 ```
 
 Buttons: `a b x y l r start select up down left right l3 r3`.

@@ -96,6 +96,36 @@ love.pad.axis(3, "lefty")
 
 Buttons: `a b x y l r start select up down left right l3 r3`.
 
+### Rumble
+
+```lua
+love.pad.hasVibration()             -- pad 1: does this device have motors?
+love.pad.hasVibration(2)
+love.pad.setVibration(0.5, 0.25, 0.4)     -- pad 1: strong, weak, seconds
+love.pad.setVibration(2, 1, 0, 0.4)       -- pad 2 (the 4-argument form)
+love.pad.setVibration()                   -- stop pad 1
+love.pad.stopVibration(2)                 -- stop pad 2
+love.pad.getVibration()                   -- last strengths asked for
+```
+
+`left` is the low-frequency ("strong") motor and `right` the high-frequency
+("weak") one, both `0..1` and clamped. Duration is in SECONDS and capped at 5;
+passing `0` uses the cap.
+
+Both forms are all numbers, so the pad number is recognised by argument count:
+only the four-argument call names a pad, which means the explicit form has to
+pass a duration. Pads are numbered 1-4 as everywhere else in `love.pad`.
+
+Rumble is capability-gated per DEVICE, not per platform: a keyboard-only setup
+reports none, and calls to a pad without motors are silent no-ops, so the query
+is worth making but not required. The host runs its own shutoff timer, so for
+sustained rumble re-arm every frame; a cart that stops calling leaves the
+motors quiet.
+
+`Joystick:setVibration(left, right, duration)`,
+`Joystick:isVibrationSupported()` and `Joystick:getVibration()` are the same
+thing on the joystick objects.
+
 ## love.keyboard / love.joystick
 
 Provided for porting; both are mapped onto the pads.

@@ -38,7 +38,9 @@ const fs = require('fs');
 const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
-const ENGINE = path.join(ROOT, 'build', 'engine.wasm');
+// The CPU comparator: this bench measures the software rasterizer, and the GL
+// build needs a real GL context this headless harness cannot provide.
+const ENGINE = path.join(ROOT, 'build', 'engine-cpu.wasm');
 const APP = path.join(ROOT, 'test', 'bench');
 const FRAME_BUDGET_MS = 1000 / 60;
 
@@ -83,6 +85,10 @@ async function main() {
         new Uint8Array(mem.buffer, d, len).set(b.subarray(0, len));
         return len;
       },
+      // no pads in a headless run, so rumble is a no-op the engine can still call
+      wc_pad_has_rumble: () => 0,
+      wc_pad_rumble: () => {},
+      wc_pad_rumble_stop: () => {},
       wc_debug_mark: () => {},
       emscripten_notify_memory_growth: () => {},
     },

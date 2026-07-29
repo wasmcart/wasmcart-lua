@@ -564,6 +564,75 @@ function pad.axis(n, which)
   return v / 32767
 end
 
+-- ── rumble ─────────────────────────────────────────────────────────
+--
+-- LOVE's Joystick:setVibration idiom: left/right motor strength 0..1 and a
+-- duration in SECONDS. The wasmcart ABI wants milliseconds and 0-based pad
+-- ids, so both conversions happen here and nowhere else.
+--
+-- Capability is per-DEVICE (a keyboard-only setup has none), so ask with
+-- hasVibration rather than assuming. Calls to a pad without motors are
+-- silent no-ops, so skipping the query is safe if wasteful. The host stops
+-- the motors on its own timer; for sustained rumble, re-arm each frame.
+local RUMBLE_MAX_SEC = 5.0   -- WC_RUMBLE_MAX_MS; the host caps this too
+
+-- last strengths handed to each pad, so getVibration can report them the way
+-- LOVE does (the ABI is write-only, the host never reports motor state back)
+local vibration = {}
+for i = 1, 4 do vibration[i] = { 0, 0 } end
+
+function pad.hasVibration(n)
+  return wc.pad_has_rumble((n or 1) - 1)
+end
+
+-- setVibration(left, right, duration) targets pad 1, matching LOVE.
+-- setVibration(n, left, right, duration) names the pad.
+--
+-- Both forms are all-numbers, so unlike pad.isDown there is no type to
+-- dispatch on: the pad number is recognised by ARGUMENT COUNT, and the
+-- explicit form therefore has to pass a duration (0 = the host's cap).
+function pad.setVibration(...)
+  local argc = select("#", ...)
+  local pn, left, right, dur
+  if argc >= 4 then
+    pn, left, right, dur = ...
+  else
+    pn = 1
+    left, right, dur = ...
+  end
+  left, right, dur = left or 0, right or 0, dur or 0
+  if type(pn) ~= "number" or pn < 1 or pn > 4 then return false end
+  left = math.max(0, math.min(1, left))
+  right = math.max(0, math.min(1, right))
+  if left <= 0 and right <= 0 then
+    wc.pad_rumble_stop(pn - 1)
+    vibration[pn][1], vibration[pn][2] = 0, 0
+    return true
+  end
+  if dur <= 0 or dur > RUMBLE_MAX_SEC then dur = RUMBLE_MAX_SEC end
+  wc.pad_rumble(pn - 1, left, right, math.floor(dur * 1000 + 0.5))
+  vibration[pn][1], vibration[pn][2] = left, right
+  return true
+end
+
+function pad.stopVibration(n)
+  n = n or 1
+  wc.pad_rumble_stop(n - 1)
+  if vibration[n] then vibration[n][1], vibration[n][2] = 0, 0 end
+end
+
+function pad.getVibration(n)
+  local v = vibration[n or 1]
+  if not v then return 0, 0 end
+  return v[1], v[2]
+end
+
+function Joystick:setVibration(l, r, d)
+  return pad.setVibration(self.n, l or 0, r or 0, d or 0)
+end
+function Joystick:isVibrationSupported() return pad.hasVibration(self.n) end
+function Joystick:getVibration() return pad.getVibration(self.n) end
+
 -- ── love.mouse ─────────────────────────────────────────────────────
 --
 -- Backed by the wasmcart pointer ABI (unified mouse/touch), so it works on

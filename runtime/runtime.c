@@ -1279,6 +1279,24 @@ static int l_pointer(lua_State *S) {
     return 4;
 }
 
+/* Rumble. pad_id is 0-based at the ABI boundary; the prelude does the
+ * 1-based -> 0-based conversion so love.pad numbering stays uniform. */
+static int l_pad_has_rumble(lua_State *S) {
+    lua_pushboolean(S, wc_pad_has_rumble((unsigned int)ARGI(1)) != 0);
+    return 1;
+}
+
+static int l_pad_rumble(lua_State *S) {
+    wc_pad_rumble((unsigned int)ARGI(1), (float)ARGD(2), (float)ARGD(3),
+                  (unsigned int)ARGI(4));
+    return 0;
+}
+
+static int l_pad_rumble_stop(lua_State *S) {
+    wc_pad_rumble_stop((unsigned int)ARGI(1));
+    return 0;
+}
+
 static int l_asset_exists(lua_State *S) {
     const char *path = luaL_checkstring(S, 1);
     lua_pushboolean(S, wc_asset_size(path, (unsigned int)strlen(path)) >= 0);
@@ -1321,6 +1339,9 @@ static const luaL_Reg wc_lib[] = {
     {"asset_read",  l_asset_read},
     {"asset_exists", l_asset_exists},
     {"pointer",     l_pointer},
+    {"pad_has_rumble",  l_pad_has_rumble},
+    {"pad_rumble",      l_pad_rumble},
+    {"pad_rumble_stop", l_pad_rumble_stop},
     {NULL, NULL}
 };
 
