@@ -36,6 +36,13 @@ typedef struct {
 } wc_pad_t;
 
 // Time struct (20 bytes, 8-byte aligned)
+//
+// delta_ms is CLAMPED by the host (250ms in the reference hosts). Any stall
+// inflates a raw delta -- a GC pause, a disk hit, a breakpoint, a backgrounded
+// tab -- and integrating velocity by an unclamped dt moves an object a stall's
+// worth of distance in one step, through whatever it should have hit. Every
+// engine caps this for the same reason. time_ms stays consistent with the
+// deltas you were actually handed, and never runs backwards.
 typedef struct {
     double  time_ms;
     double  delta_ms;
@@ -241,6 +248,115 @@ extern int wc_pad_name(unsigned int pad_id, char* buf, unsigned int buf_len);
 static inline int wc_pad_name(unsigned int pad_id, char* buf, unsigned int buf_len) {
     (void)pad_id; (void)buf; (void)buf_len; return 0;
 }
+#endif
+
+// --- Text input (ABI v3) ---
+// For name entry, chat, seeds -- anything where the player types CHARACTERS
+// rather than pressing game buttons.
+//
+// The raw keyboard ABI (WC_FLAG_KEYBOARD, wc_kb_on_down) reports HID
+// scancodes: physical key positions. That is right for gameplay and wrong for
+// text, because a scancode is not a character. Shift+2 is "@" on a US layout
+// and a quote mark on several European ones; e-acute has no scancode at all.
+// Rather than have every cart reimplement keyboard layouts, the host hands
+// over text the OS has ALREADY composed -- layout, shift, dead keys, compose
+// sequences and IME commits all applied.
+//
+// Cart export (optional):
+//   void wc_on_text(const char* utf8, uint32_t len);
+// The pointer is valid only for the duration of the call: copy what you need.
+// `utf8` is NOT null-terminated, and one call may carry several codepoints (an
+// IME commits a whole word at once), so always honour `len`.
+//
+// Host imports:
+//   void wc_text_input_begin(void);   start receiving text
+//   void wc_text_input_end(void);     stop
+//   unsigned int wc_text_input_active(void);
+//
+// Text input is OFF until the cart asks for it, and that is load-bearing on
+// two counts. On mobile it is what raises and dismisses the on-screen
+// keyboard. And while it is active a host suppresses gameplay key bindings --
+// otherwise typing "w" into a chat box also walks the player forward.
+//
+// Editing keys stay on the keyboard ABI: backspace, arrows and enter are key
+// presses, not characters, so a cart drawing its own text field reads those
+// through wc_kb_on_down and appends characters from wc_on_text.
+#ifdef __wasm__
+__attribute__((import_module("env"), import_name("wc_text_input_begin")))
+extern void wc_text_input_begin(void);
+__attribute__((import_module("env"), import_name("wc_text_input_end")))
+extern void wc_text_input_end(void);
+__attribute__((import_module("env"), import_name("wc_text_input_active")))
+extern unsigned int wc_text_input_active(void);
+#else
+static inline void wc_text_input_begin(void) {}
+static inline void wc_text_input_end(void) {}
+static inline unsigned int wc_text_input_active(void) { return 0; }
+#endif
+
+// --- Lifecycle (ABI v3) ---
+// Optional cart exports. Export any subset; the host skips the ones you omit.
+//
+//   void wc_on_suspend(void);       host is about to STOP calling wc_render
+//   void wc_on_resume(void);        host is about to start calling it again
+//   void wc_on_focus_lost(void);    still running, no longer the active window
+//   void wc_on_focus_gained(void);  active window again
+//
+// Suspend and focus are deliberately separate. Minimizing a window or hiding a
+// tab suspends the cart -- it stops running entirely. Alt-tabbing only takes
+// focus: the cart keeps rendering, which is what lets a game pause gameplay
+// without going dark. Conflating them means a game either cannot auto-pause on
+// alt-tab, or wrongly freezes when it should still be drawing.
+//
+// The host owns suspension. While suspended it does not call wc_render at all,
+// so a cart that exports NONE of these still behaves correctly -- it is simply
+// not running. You never have to handle lifecycle to be correct; you handle it
+// to be polite (pause audio, drop a netplay connection, flush state).
+//
+// The host also rebases the clock across a suspend, so the first resumed frame
+// reports a normal wc_time_t.delta_ms rather than the whole gap. Without that a
+// ten-minute background stint would arrive as a 600000ms delta and teleport
+// anything integrating velocity by dt straight through the world.
+//
+// Ordering is guaranteed: suspending emits wc_on_focus_lost before
+// wc_on_suspend, and resuming emits wc_on_resume before wc_on_focus_gained, so
+// the focus pair is always balanced across a round trip.
+//
+// Declare them like any other export:
+//   __attribute__((export_name("wc_on_suspend")))
+//   void wc_on_suspend(void) { audio_pause(); }
+
+// --- Loop inversion (ABI v3) ---
+// For engines ported from native code that own their main loop: they run
+// `while (running) { ... }` internally and never return, while wasmcart expects
+// wc_render() back once per frame.
+//
+// Build the cart with binaryen's asyncify pass targeting this import:
+//   emcc ... -s ASYNCIFY=1 -s ASYNCIFY_IMPORTS=wc_frame_yield
+// then call wc_frame_yield() once per iteration of your own loop. The host
+// unwinds the whole engine stack out of wc_render() and rewinds back to exactly
+// that point next frame: your loop never notices, and the host gets its frame.
+//
+// A cart using this MUST also export wc_yield_buffer(), returning a pointer to
+// a pre-initialized asyncify stack descriptor -- a {current, end} uint32 pair
+// pointing at a stack area big enough for the deepest yield. For example:
+//
+//   static uint8_t  yield_stack[4096];
+//   static uint32_t yield_desc[2];
+//   __attribute__((export_name("wc_yield_buffer")))
+//   uint32_t wc_yield_buffer(void) {
+//       yield_desc[0] = (uint32_t)yield_stack;
+//       yield_desc[1] = (uint32_t)yield_stack + sizeof(yield_stack);
+//       return (uint32_t)yield_desc;
+//   }
+//
+// A cart that does not export the asyncify functions never triggers any of
+// this; the call is a no-op. Hosts always provide the import.
+#ifdef __wasm__
+__attribute__((import_module("env"), import_name("wc_frame_yield")))
+extern void wc_frame_yield(void);
+#else
+static inline void wc_frame_yield(void) {}
 #endif
 
 // --- Rumble (ABI v3) ---
