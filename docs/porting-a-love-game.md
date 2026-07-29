@@ -113,7 +113,7 @@ These error loudly rather than silently no-op, so you'll find them fast:
 | LÖVE feature | Here |
 |---|---|
 | `love.graphics.newShader` | **available** — GLES 3.0 / WebGL2 only; see below |
-| `love.graphics.newMesh` | not implemented; use `polygon()` |
+| `love.graphics.newMesh` | **available** — LÖVE's default vertex format only; see below |
 | `love.thread.*` | single wasm instance, no threads |
 | `love.physics.*` | **available** — Box2D v3 with wasm SIMD; see below |
 | `love.graphics.newVideo` | out of scope |
@@ -144,6 +144,34 @@ What a port usually has to change:
 
 See `examples/shaders/` for a working cart and `docs/api.md` for the full
 surface, the `send` types, and the limits.
+
+## 6a-bis. Meshes work, in LÖVE's default vertex format
+
+`newMesh` and the `Mesh` methods are implemented on the GL2D renderer. A
+LÖVE mesh ports unchanged **if it uses the default vertex format**,
+`{x, y, u, v, r, g, b, a}` — which is most of them, because that is what
+`newMesh(vertices)` gives you without asking.
+
+What a port usually has to change:
+
+- **Drop custom vertex formats.** `newMesh(vertexformat, ...)` is refused.
+  The renderer has one vertex layout, shared by every program including your
+  own shaders through a single VAO, so an extra attribute has nowhere to go.
+  Most uses of a custom format here are carrying one extra float that can
+  live in an unused channel of the default format instead.
+- **Replace the `"points"` draw mode** with `love.graphics.points`, or a
+  `"triangles"` mesh of small quads.
+- **Do not lean on meshes for batching.** In LÖVE a mesh is the way to make
+  many quads one draw call. Here the batcher already merges every sprite in
+  the frame into one draw, while a *mesh* is its own draw call, because the
+  batcher is hardwired to quads. A hundred small meshes is a hundred draws;
+  merge them into one mesh, or just use sprites.
+- **A mesh is GPU-only.** If the renderer falls back to the software
+  rasterizer, `newMesh` and `draw(mesh, ...)` fail loudly rather than
+  drawing nothing.
+
+`setColor` tints a mesh, multiplying its per-vertex colours, exactly as it
+does a sprite. See `examples/mesh/` for a working cart.
 
 ## 6b. Physics works, via Box2D v3
 

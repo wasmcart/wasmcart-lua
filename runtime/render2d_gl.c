@@ -1509,6 +1509,110 @@ int wcl_r2d_sprite(const void *pixels, int sw, int sh,
     return 1;
 }
 
+/* ── meshes ────────────────────────────────────────────────────────────
+ *
+ * Arbitrary triangles, so this does NOT use the batcher. flush_batches()
+ * first (draw order), fill a scratch buffer, one glDrawArrays -- the same
+ * shape wcl_r2d_poly uses, with two differences that matter:
+ *
+ *   * no triangle cap. A polygon is capped at 64 points because ear clipping
+ *     is O(n^3); a mesh arrives already triangulated, so the only limit is
+ *     how much fits in one upload, and the draw is CHUNKED rather than
+ *     refused past that.
+ *   * textured. u_textured mode 1 with the atlas bound, which is where the
+ *     uv remap comes in.
+ *
+ * The remap: a cart writes uv in 0..1 against ITS OWN image, LOVE's contract.
+ * Sprites here live in a shared 2048^2 atlas, so 0..1 would address the whole
+ * atlas -- every other image in the cart, at the wrong scale. The image's
+ * sub-rect is (atlas_x, atlas_y, w, h), so the correct sample is
+ *     atlas_uv = (atlas_xy + uv * wh) / ATLAS_SIZE
+ * A wrong remap here does not look blank; it looks like a garbled crop of a
+ * NEIGHBOURING sprite, which is why the example draws a recognisable image.
+ *
+ * A Canvas is its own texture, so 0..1 is already right there -- but an FBO
+ * has GL's bottom-left origin against the cart's top-left, so V flips. Same
+ * rule wcl_r2d_sprite applies, expressed as v -> 1-v because a mesh's uv is
+ * normalized rather than a texel rect. */
+#define MESH_CHUNK 1024   /* vertices per upload; a multiple of 3 */
+static vertex_t mesh_scratch[MESH_CHUNK];
+
+int wcl_r2d_mesh(const float *verts, int count,
+                 const void *pixels, int tw, int th,
+                 uint32_t tint, int alpha) {
+    if (!wcl_r2d_active() || !verts || count < 3) return 0;
+    count -= count % 3;
+
+    /* Resolve the texture BEFORE flushing: get_texture may itself flush and
+     * upload, and doing that mid-draw would interleave the atlas upload with
+     * this mesh's own vertices. */
+    GLuint tex = 0;
+    int mode = 0;              /* u_textured: 0 solid, 1 RGBA texture */
+    float ax = 0, ay = 0, aw = 1, ah = 1;   /* uv -> atlas transform */
+    int flip_v = 0;
+    if (pixels) {
+        target_t *tgt = target_find(pixels);
+        if (tgt) {
+            if (tgt == current_target) return 0;   /* cannot sample the target
+                                                      it is drawing into */
+            tex = tgt->tex;
+            flip_v = 1;                            /* FBO origin is bottom-left */
+        } else {
+            texture_t *t = get_texture(pixels, tw, th);
+            if (!t) return 0;                      /* atlas full: caller reports */
+            tex = atlas_texture;
+            ax = (float)t->atlas_x / (float)ATLAS_SIZE;
+            ay = (float)t->atlas_y / (float)ATLAS_SIZE;
+            aw = (float)t->w / (float)ATLAS_SIZE;
+            ah = (float)t->h / (float)ATLAS_SIZE;
+        }
+        mode = 1;
+    }
+
+    flush_batches();
+
+    /* The mesh's own colours are per-vertex; the current draw colour
+     * MODULATES them, which is what LOVE does (setColor tints a mesh). */
+    const float tr = (float)((tint >> 16) & 255) / 255.0f;
+    const float tg = (float)((tint >> 8) & 255) / 255.0f;
+    const float tb = (float)(tint & 255) / 255.0f;
+    const float ta = (float)alpha / 255.0f;
+
+    /* Blending stays on unless every vertex is opaque. Cheaper to just ask
+     * for it: a mesh is one draw, so there is no batch to split. */
+    int opaque = (alpha >= 255);
+    if (opaque) {
+        for (int i = 0; i < count; i++)
+            if (verts[i * 8 + 7] < 1.0f) { opaque = 0; break; }
+    }
+    set_blend(!opaque);
+    if (mode) bind_texture(tex);
+    set_textured(mode);
+    glBindBuffer(GL_ARRAY_BUFFER, buffer);
+
+    for (int base = 0; base < count; base += MESH_CHUNK) {
+        int n = count - base;
+        if (n > MESH_CHUNK) n = MESH_CHUNK;
+        for (int i = 0; i < n; i++) {
+            const float *s = &verts[(base + i) * 8];
+            vertex_t *v = &mesh_scratch[i];
+            ndc(s[0], s[1], &v->x, &v->y);
+            v->u = ax + s[2] * aw;
+            v->v = flip_v ? (1.0f - s[3]) : (ay + s[3] * ah);
+            v->r = s[4] * tr; v->g = s[5] * tg; v->b = s[6] * tb;
+            v->a = s[7] * ta;
+            v->rad = 0;
+        }
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(vertex_t) * n),
+                     mesh_scratch, GL_DYNAMIC_DRAW);
+        glDrawArrays(GL_TRIANGLES, 0, n);
+        frame_stats.draws++;
+        frame_stats.upload_bytes += (uint32_t)(sizeof(vertex_t) * n);
+        frame_stats.quads += (uint32_t)(n / 3);
+    }
+    return 1;
+}
+
 static target_t *target_find(const void *key) {
     for (int i = 0; i < MAX_TARGETS; i++)
         if (targets[i].used && targets[i].key == key) return &targets[i];

@@ -1,6 +1,6 @@
 # Examples
 
-Seven carts, each exercising a different part of the engine. All are
+Eight carts, each exercising a different part of the engine. All are
 verified rendering (not just "runs without crashing").
 
 | example | what it demonstrates |
@@ -12,11 +12,13 @@ verified rendering (not just "runs without crashing").
 | `particles` | 900 particles, canvases, blend modes, stress test |
 | `kitchen-sink` | every v1 API in one screen; the contract example |
 | `shaders` | `newShader` / `setShader` / `send`; split-screen so a wrong result is obvious |
+| `mesh` | `newMesh`; each panel sits next to a reference it must match, so a wrong uv remap is visible |
 
-`shaders` is the one cart here that **needs a GL host**: a shader is a GPU
-program, so `newShader` refuses rather than pretending on a host with no GL
-context. `test/run.js` therefore gates it against a real WebGL2 context
-instead of running it on the CPU comparator like the rest.
+`shaders` and `mesh` are the two carts here that **need a GL host**: a shader
+is a GPU program and a mesh is GPU geometry, so `newShader` and `newMesh`
+refuse rather than pretending on a host with no GL context. `test/run.js`
+therefore gates both against a real WebGL2 context instead of running them on
+the CPU comparator like the rest.
 
 Run one:
 

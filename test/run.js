@@ -180,7 +180,10 @@ async function main() {
   // a host with no GL rather than pretending -- so running it against
   // engine-cpu.wasm would report a Lua error for behaving correctly. It is
   // gated separately below, against a real GL context.
-  const GL_ONLY_EXAMPLES = new Set(['shaders']);
+  // `mesh` joins it for the same reason: a mesh is GPU geometry, newMesh
+  // refuses on a host with no GL rather than pretending, and the software
+  // rasterizer has no textured per-vertex-coloured triangle to fall back to.
+  const GL_ONLY_EXAMPLES = new Set(['shaders', 'mesh']);
 
   for (const name of names) {
     if (GL_ONLY_EXAMPLES.has(name)) {
@@ -396,6 +399,156 @@ async function main() {
           console.log('FAIL  shader-ctl   the control PASSED: the shader gate cannot see failure');
           failed++;
         }
+      }
+    }
+  }
+
+  // ── meshes ────────────────────────────────────────────────────────
+  //
+  // Same three-gate shape as shaders, for the same reason: a mesh that never
+  // draws leaves the frame count perfect and a hole in the screen, and the
+  // uniformity check above cannot see that because examples/mesh draws
+  // plenty of text and sprites besides.
+  //
+  //  1. gl-mesh-verify on examples/mesh. Its strongest assertion is the
+  //     ATLAS UV REMAP: the cart draws a textured mesh and the SAME image as
+  //     an ordinary sprite directly beneath it, and the two must agree pixel
+  //     for pixel. A mesh's uv is 0..1 over its own image while sprites live
+  //     in a shared 2048^2 atlas, so the remap is the one piece of arithmetic
+  //     that is easy to get wrong and hard to see -- a wrong offset renders a
+  //     crop of a NEIGHBOURING image, which still looks like "a mesh drew".
+  //     It also asserts per-vertex colour interpolates, and that "triangles"
+  //     and "fan" differ on an identical vertex list.
+  //  2. a control copy with the mesh draw removed, which MUST fail.
+  //  3. test/meshfail in-engine: newMesh must REFUSE what this engine cannot
+  //     express, rather than silently approximating it.
+  if (fs.existsSync(glEngine)) {
+    const { execFileSync } = require('child_process');
+    const os = require('os');
+    const tool = path.join(ROOT, 'tools', 'gl-mesh-verify.mjs');
+    const meshEx = path.join(ROOT, 'examples', 'mesh');
+    const runTool = (dir) => execFileSync(process.execPath, [tool, glEngine, dir, '3'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+
+    if (fs.existsSync(meshEx)) {
+      let glMissing = false;
+      try {
+        runTool(meshEx);
+        console.log('\nok    mesh         textured mesh matches its sprite reference ' +
+                    '(atlas uv remap exact)');
+      } catch (err) {
+        const txt = (err.stdout || '') + (err.stderr || '');
+        if (/Cannot find|ERR_MODULE_NOT_FOUND|createWebGL2Context/.test(txt)) {
+          console.log('\nskip  mesh         no GL context available on this machine');
+          glMissing = true;
+        } else {
+          console.log('\nFAIL  mesh         the mesh did not render, or rendered wrong');
+          for (const l of txt.trim().split('\n').slice(-8)) console.log(`      ${l}`);
+          failed++;
+        }
+      }
+
+      // the control: the SAME cart with the textured mesh never drawn. If
+      // this passes, the gate above is blind.
+      if (!glMissing) {
+        const ctl = fs.mkdtempSync(path.join(os.tmpdir(), 'wcl-mesh-ctl-'));
+        fs.cpSync(path.join(meshEx, 'app'), path.join(ctl, 'app'), { recursive: true });
+        const mainPath = path.join(ctl, 'app', 'main.lua');
+        fs.writeFileSync(mainPath, fs.readFileSync(mainPath, 'utf8')
+          .replace('love.graphics.draw(texMesh, 40, 56)', '-- control: not drawn'));
+        let caught = false;
+        try { runTool(ctl); } catch { caught = true; }
+        fs.rmSync(ctl, { recursive: true, force: true });
+        if (caught) {
+          console.log('ok    mesh-ctl     undrawn control correctly detected');
+        } else {
+          console.log('FAIL  mesh-ctl     the control PASSED: the mesh gate cannot see failure');
+          failed++;
+        }
+      }
+    }
+  }
+
+  // A mesh cannot ride the quad batcher, so each one is its own
+  // glDrawArrays. That is the accepted trade; this keeps it from getting
+  // worse. 12 meshes must be 12 draws, not 24, and must never re-bind the
+  // program.
+  if (fs.existsSync(glEngine) &&
+      fs.existsSync(path.join(ROOT, 'test', 'meshcost', 'main.lua'))) {
+    const { execFileSync } = require('child_process');
+    try {
+      const out = execFileSync(process.execPath,
+        [path.join(ROOT, 'tools', 'gl-call-count.mjs'), glEngine,
+         path.join(ROOT, 'test', 'meshcost'), '10',
+         '--max-useprogram', '0', '--max-drawarrays', '12'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      const m = out.match(/TOTAL\s+([\d.]+)/);
+      console.log(`ok    mesh-cost    12 meshes = 12 draws, 0 glUseProgram ` +
+                  `(${m ? m[1] : '?'} GL calls/frame total)`);
+    } catch (err) {
+      const txt = (err.stdout || '') + (err.stderr || '');
+      if (/Cannot find|ERR_MODULE_NOT_FOUND|createWebGL2Context/.test(txt)) {
+        console.log('skip  mesh-cost    no GL context available on this machine');
+      } else {
+        console.log('FAIL  mesh-cost    a mesh draw costs more GL calls than it should');
+        for (const l of txt.trim().split('\n').slice(-4)) console.log(`      ${l}`);
+        failed++;
+      }
+    }
+  }
+
+  // newMesh must REFUSE what this engine cannot express -- a custom vertex
+  // format, the "points" draw mode, an unknown mode or usage -- rather than
+  // approximate it. Run against a REAL GL context: without one every newMesh
+  // is refused for having no GL at all, which would make the gate green
+  // without the actual refusal paths ever being reached.
+  const mfDir = path.join(ROOT, 'test', 'meshfail');
+  if (fs.existsSync(path.join(mfDir, 'main.lua')) && fs.existsSync(glEngine)) {
+    const { execFileSync } = require('child_process');
+    try {
+      const out = execFileSync(process.execPath,
+        [path.join(ROOT, 'tools', 'gl-mesh-verify.mjs'), '--logs', glEngine, mfDir, '3'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      const lines = out.split('\n');
+      const refusals = lines.filter(l => /^LOG: REFUSED/.test(l)).length;
+      const leaks = lines.filter(l => /^LOG: ACCEPTED/.test(l));
+      // the 1-based/0-based index round-trips. An off-by-one there is
+      // invisible on screen (a mesh drawn from vertex 2 still looks like a
+      // mesh), so it has to be asserted by value.
+      const badValues = lines.filter(l => /^LOG: BADVALUE/.test(l));
+      const semantics = lines.some(l => /^LOG: ok mesh index semantics/.test(l));
+      const noGl = lines.some(l => /software rasterizer/.test(l));
+      if (noGl) {
+        console.log('\nFAIL  meshfail     ran without GL, so the refusals prove nothing');
+        failed++;
+      } else if (badValues.length) {
+        console.log('\nFAIL  meshfail     mesh index/getter semantics are wrong:');
+        for (const l of badValues) console.log(`      ${l}`);
+        failed++;
+      } else if (!semantics) {
+        console.log('\nFAIL  meshfail     the index-semantics block never ran ' +
+                    '(the cart errored partway through)');
+        for (const l of lines.slice(-6)) console.log(`      ${l}`);
+        failed++;
+      } else if (leaks.length) {
+        console.log('\nFAIL  meshfail     newMesh ACCEPTED something it cannot render:');
+        for (const l of leaks) console.log(`      ${l}`);
+        failed++;
+      } else if (refusals < 5) {
+        console.log(`\nFAIL  meshfail     only ${refusals} refusals, expected >= 5`);
+        for (const l of lines.slice(0, 12)) console.log(`      ${l}`);
+        failed++;
+      } else {
+        console.log(`\nok    meshfail     ${refusals} unsupported mesh forms refused loudly`);
+      }
+    } catch (err) {
+      const txt = (err.stdout || '') + (err.stderr || '');
+      if (/Cannot find|ERR_MODULE_NOT_FOUND|createWebGL2Context/.test(txt)) {
+        console.log('\nskip  meshfail     no GL context available on this machine');
+      } else {
+        console.log('\nFAIL  meshfail     the cart did not run');
+        for (const l of txt.trim().split('\n').slice(-6)) console.log(`      ${l}`);
+        failed++;
       }
     }
   }

@@ -144,10 +144,11 @@ function graphics.polygon(mode, ...)
   wc.polygon(mode == "fill" and 1 or 0, out)
 end
 
--- Forward declaration: graphics.draw() dispatches on SpriteBatch, which is
--- defined further down. Without this the reference inside draw would bind
--- to a global (nil) instead of the local table.
+-- Forward declaration: graphics.draw() dispatches on SpriteBatch and Mesh,
+-- both defined further down. Without this the reference inside draw would
+-- bind to a global (nil) instead of the local table.
 local SpriteBatch
+local Mesh
 
 -- Image / Quad / Canvas objects
 local Image = {}
@@ -214,6 +215,21 @@ function graphics.draw(img, a, b, c, d, e, f, g, h)
       if it.quad then qx, qy, qw, qh = it.quad.x, it.quad.y, it.quad.w, it.quad.h end
       wc.image_draw(batchImg.id, px, py, it.r + trot,
                     it.sx * tsx, it.sy * tsy, it.ox, it.oy, qx, qy, qw, qh)
+    end
+    return
+  end
+
+  -- a Mesh carries its own geometry; draw() supplies only the placement,
+  -- composed with the transform stack exactly as it is for an image
+  if getmetatable(img) == Mesh then
+    local x, y, r, sx, sy, ox, oy = a, b, c, d, e, f, g
+    x = x or 0; y = y or 0; r = r or 0
+    sx = sx or 1; sy = sy or sx; ox = ox or 0; oy = oy or 0
+    local px, py = apply(x, y)
+    if not wc.mesh_draw(img.id, px, py, r + trot, sx * tsx, sy * tsy, ox, oy) then
+      error("love.graphics.draw(mesh): this run is on the software rasterizer " ..
+            "(no GL context, or a draw used a feature the GL backend does not " ..
+            "implement), so the mesh could not be rendered. See the cart log.", 2)
     end
     return
   end
@@ -569,8 +585,199 @@ end
 
 function graphics.getShader() return cur_shader end
 
--- deliberate v1 cuts, each loud
-graphics.newMesh     = err("love.graphics.newMesh", "meshes arrive with the GL renderer; use polygon() for now")
+-- ── meshes ─────────────────────────────────────────────────────────
+--
+-- LOVE's default vertex format, and ONLY that format:
+--
+--   { x, y, u, v, r, g, b, a }   -- colour 0..1, defaulting to opaque white
+--
+-- which is not a shortcut, it is the whole reason meshes fit this engine.
+-- The GL backend's vertex is
+--     struct { float x, y, u, v, r, g, b, a, rad; }
+-- so a LOVE default-format vertex IS an engine vertex (rad is the circle
+-- rule's extra, zero for a mesh). No repacking, no second vertex layout, no
+-- second VAO.
+--
+-- A CUSTOM vertex format -- newMesh(vertexformat, ...) -- is refused, not
+-- approximated. The vertex layout is fixed at engine init by one shared VAO
+-- that every program, including every cart shader, is bound against; an
+-- arbitrary attribute set would need its own buffer, its own VAO and a
+-- shader contract this engine does not have. Saying so is better than
+-- silently dropping the cart's extra attributes and rendering something
+-- that looks nearly right.
+--
+-- The vertices live in C (see l_mesh_new in runtime.c), not in this table: a
+-- mesh is redrawn every frame and marshalling its floats across the boundary
+-- each time would cost more than the draw.
+--
+-- Meshes are GL-only. There is no software path that rasterizes a textured,
+-- per-vertex-coloured triangle, and rather than invent an approximate one
+-- that disagrees with GL, newMesh refuses on a host with no GL -- the same
+-- rule newShader follows.
+
+Mesh = {}
+Mesh.__index = Mesh
+function Mesh:type() return "Mesh" end
+
+local MESH_MODES = { fan = 0, strip = 1, triangles = 2 }
+
+-- setVertex(i, x, y, u, v, r, g, b, a) | setVertex(i, {x, y, u, v, r, g, b, a})
+function Mesh:setVertex(i, a, b, c, d, e, f, g, h)
+  if type(a) == "table" then
+    a, b, c, d, e, f, g, h = a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]
+  end
+  wc.mesh_set_vertex(self.id, i - 1, a or 0, b or 0, c or 0, d or 0,
+                     e or 1, f or 1, g or 1, h or 1)
+end
+
+function Mesh:getVertex(i)
+  return wc.mesh_get_vertex(self.id, i - 1)
+end
+
+function Mesh:getVertexCount() return self.n end
+
+-- setVertices(vertices, [startindex])
+function Mesh:setVertices(verts, start)
+  start = start or 1
+  for k = 1, #verts do
+    local v = verts[k]
+    local i = start + k - 1
+    if i > self.n then break end
+    wc.mesh_set_vertex(self.id, i - 1, v[1] or 0, v[2] or 0, v[3] or 0, v[4] or 0,
+                       v[5] or 1, v[6] or 1, v[7] or 1, v[8] or 1)
+  end
+end
+
+function Mesh:setTexture(img)
+  if img == nil then
+    self.tex = nil
+    wc.mesh_set_texture(self.id, nil)
+    return
+  end
+  if type(img) ~= "table" or not img.id then
+    error("Mesh:setTexture: expected an Image or a Canvas, got " .. type(img), 2)
+  end
+  self.tex = img
+  wc.mesh_set_texture(self.id, img.id)
+end
+
+function Mesh:getTexture() return self.tex end
+
+-- setVertexMap(map) | setVertexMap(a, b, c, ...) -- LOVE's indices are
+-- 1-BASED and C's are 0-based, so the conversion happens once, here.
+function Mesh:setVertexMap(a, ...)
+  if a == nil then
+    wc.mesh_set_map(self.id, nil)
+    return
+  end
+  local src = (type(a) == "table") and a or { a, ... }
+  local out = {}
+  for i = 1, #src do out[i] = src[i] - 1 end
+  wc.mesh_set_map(self.id, out)
+end
+
+function Mesh:getVertexMap()
+  local m = wc.mesh_get_map(self.id)
+  if not m then return nil end
+  for i = 1, #m do m[i] = m[i] + 1 end
+  return m
+end
+
+-- setDrawRange(start, count) | setDrawRange() to clear
+function Mesh:setDrawRange(start, count)
+  if start == nil then
+    wc.mesh_set_range(self.id, nil)
+    return
+  end
+  wc.mesh_set_range(self.id, start - 1, count)
+end
+
+function Mesh:getDrawRange()
+  local s, c = wc.mesh_get_range(self.id)
+  if not s then return nil end
+  return s + 1, c
+end
+
+function Mesh:getDrawMode() return self.mode end
+function Mesh:release()
+  wc.mesh_release(self.id)
+  return true
+end
+
+-- Attributes are a custom-vertex-format concept, so they are refused for the
+-- same reason the format itself is.
+Mesh.attachAttribute = err("Mesh:attachAttribute",
+  "this engine's vertex layout is fixed (x,y,u,v,r,g,b,a), so there are no " ..
+  "extra attributes to attach")
+Mesh.getVertexFormat = function()
+  return { {"VertexPosition", "float", 2},
+           {"VertexTexCoord", "float", 2},
+           {"VertexColor",    "byte",  4} }
+end
+
+-- newMesh(vertices) | newMesh(vertexcount) | newMesh(..., mode[, usage])
+function graphics.newMesh(a, b, c)
+  if type(a) == "table" and type(a[1]) == "table" and type(a[1][1]) == "string" then
+    error("love.graphics.newMesh: a custom vertex format is not supported by " ..
+          "this engine. The renderer has one fixed vertex layout " ..
+          "(x, y, u, v, r, g, b, a), shared by every program including cart " ..
+          "shaders, so extra attributes have nowhere to go. Use the default " ..
+          "format: newMesh({{x,y,u,v,r,g,b,a}, ...}, mode).", 2)
+  end
+
+  local verts, count
+  if type(a) == "number" then
+    count = math.floor(a)
+    if count < 1 then error("love.graphics.newMesh: vertex count must be >= 1", 2) end
+  elseif type(a) == "table" then
+    verts = a
+    count = #verts
+    if count < 1 then
+      error("love.graphics.newMesh: the vertex list is empty", 2)
+    end
+  else
+    error("love.graphics.newMesh: expected a vertex table or a vertex count, " ..
+          "got " .. type(a), 2)
+  end
+
+  local modename = b or "fan"
+  if modename == "points" then
+    error("love.graphics.newMesh: the \"points\" draw mode is not supported " ..
+          "by this engine (the renderer draws triangles; there is no point " ..
+          "primitive on the batched path). Use love.graphics.points, or a " ..
+          "\"triangles\" mesh of small quads.", 2)
+  end
+  local mode = MESH_MODES[modename]
+  if not mode then
+    error("love.graphics.newMesh: unknown draw mode '" .. tostring(modename) ..
+          "'. Supported: \"fan\" (the default), \"strip\", \"triangles\".", 2)
+  end
+  -- `usage` (c) is "static"/"dynamic"/"stream", a GPU buffer hint. Every mesh
+  -- here uploads its vertices on the draw that uses them, so the hint has
+  -- nothing to select; accepted and ignored rather than erroring, because
+  -- ported code passes it constantly.
+  if c ~= nil and c ~= "static" and c ~= "dynamic" and c ~= "stream" then
+    error("love.graphics.newMesh: unknown usage '" .. tostring(c) ..
+          "'. Supported: \"static\", \"dynamic\", \"stream\".", 2)
+  end
+
+  local id, why = wc.mesh_new(count, mode)
+  if not id then
+    if why == "nogl" then
+      error("love.graphics.newMesh: this run is on the software rasterizer " ..
+            "(no GL context, or a draw used a feature the GL backend does " ..
+            "not implement), and meshes are GL-only -- there is no software " ..
+            "path that rasterizes a textured, per-vertex-coloured triangle. " ..
+            "See the cart log.", 2)
+    end
+    error("love.graphics.newMesh: out of mesh slots (32 max), or the vertex " ..
+          "count exceeds this engine's 4096-per-mesh limit", 2)
+  end
+  local m = setmetatable({ id = id, n = count, mode = modename }, Mesh)
+  if verts then m:setVertices(verts) end
+  return m
+end
+
 graphics.newVideo    = err("love.graphics.newVideo", "video playback is out of scope for this engine")
 
 -- ── love.audio ─────────────────────────────────────────────────────

@@ -100,6 +100,40 @@ int  wcl_r2d_shader_has_uniform(int handle, const char *name);
  * express from silently rendering unshaded on the CPU path. */
 int  wcl_r2d_shader_active(void);
 
+/* ── meshes (love.graphics.newMesh) ───────────────────────────────────
+ *
+ * A mesh is ARBITRARY triangles, so it cannot ride the batcher: that path is
+ * hardwired to quads (it draws (count/4)*6 indices from a static quad index
+ * buffer). A mesh draw therefore flushes and issues its own glDrawArrays,
+ * the same shape wcl_r2d_poly already uses -- but textured, and with no
+ * 64-triangle cap.
+ *
+ * The vertex a cart supplies is LOVE's default format, which is already this
+ * engine's vertex_t minus `rad`:
+ *     VertexPosition vec2   -> x, y
+ *     VertexTexCoord vec2   -> u, v
+ *     VertexColor    vec4   -> r, g, b, a
+ * so there is no repacking, only a coordinate-space conversion (cart pixels
+ * to clip space) and, for a textured mesh, the atlas remap below.
+ *
+ * `verts` is 8 floats per vertex in that order, x/y already world-transformed
+ * by Lua and u/v in LOVE's 0..1 texture space. `count` is the number of
+ * vertices, which must be a multiple of 3 (the caller expands fan/strip into
+ * triangles, so this entry point only ever sees a triangle list).
+ *
+ * `pixels` is the texture's RGBA payload (the same atlas cache key sprites
+ * use) or NULL for an untextured mesh. THE UV REMAP IS THE WHOLE TRAP HERE:
+ * sprites live in a shared 2048^2 atlas, so a cart's 0..1 uv addresses the
+ * whole atlas rather than its own image. This function maps 0..1 onto the
+ * image's atlas sub-rect. A Canvas is its own texture and needs no remap,
+ * only the V flip an FBO's bottom-left origin requires.
+ *
+ * Returns 0 when the mesh could not be drawn (no GL, no atlas room, the
+ * texture is the current render target), so the caller can report it. */
+int  wcl_r2d_mesh(const float *verts, int count,
+                  const void *pixels, int tw, int th,
+                  uint32_t tint, int alpha);
+
 /* Draw one baked TTF glyph. `atlas` is stb_truetype's 8-bit coverage bitmap
  * and doubles as the cache key, so a font uploads once and every glyph after
  * that is a quad in the same batch. Coverage modulates alpha, exactly as the
@@ -171,6 +205,10 @@ static inline int wcl_r2d_shader_has_uniform(int h, const char *n) {
     (void)h; (void)n; return 0;
 }
 static inline int wcl_r2d_shader_active(void) { return 0; }
+static inline int wcl_r2d_mesh(const float *v, int c, const void *p, int tw, int th,
+                               uint32_t tint, int a) {
+    (void)v; (void)c; (void)p; (void)tw; (void)th; (void)tint; (void)a; return 0;
+}
 
 #endif /* WCL_ENABLE_GL2D */
 #endif /* WCL_RENDER2D_GL_H */

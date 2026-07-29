@@ -146,6 +146,67 @@ A vertex shader defines
 A compile or link failure raises a Lua error, and the driver's own info log
 is written to the cart log so you see the real message.
 
+### Meshes
+
+Arbitrary textured, per-vertex-coloured triangles, on the GL2D renderer.
+
+```lua
+local m = love.graphics.newMesh({
+  --  x    y    u  v   r  g  b  a
+  {   0,   0,  0, 0,  1, 0, 0, 1 },
+  { 180,   0,  1, 0,  0, 1, 0, 1 },
+  { 180, 180,  1, 1,  0, 0, 1, 1 },
+  {   0, 180,  0, 1,  1, 1, 1, 1 },
+}, "fan")
+m:setTexture(myImage)                 -- optional
+
+love.graphics.draw(m, 40, 56)         -- x, y, r, sx, sy, ox, oy
+```
+
+The vertex is LÖVE's default format, `{x, y, u, v, r, g, b, a}`, with colour
+in 0..1 and defaulting to opaque white. `u`/`v` are 0..1 over **your own
+image**, and the engine remaps that into the shared atlas for you.
+
+| Function | Notes |
+|---|---|
+| `newMesh(vertices, [mode], [usage])` | |
+| `newMesh(vertexcount, [mode], [usage])` | vertices default to white at (0,0) |
+| `Mesh:setVertices(verts, [start])` | `start` is 1-based |
+| `Mesh:setVertex(i, x, y, u, v, r, g, b, a)` | also accepts a single table |
+| `Mesh:getVertex(i)` | returns all 8 components |
+| `Mesh:getVertexCount()` | |
+| `Mesh:setTexture(img)` / `getTexture()` | an `Image` or a `Canvas`; `nil` clears |
+| `Mesh:setVertexMap(map)` / `getVertexMap()` | 1-based indices, like LÖVE |
+| `Mesh:setDrawRange(start, count)` / `getDrawRange()` | 1-based; no args clears |
+| `Mesh:getDrawMode()` | |
+
+Draw modes: `"fan"` (the default), `"strip"`, `"triangles"`.
+
+**What is different from LÖVE, and why:**
+
+- **The vertex format is fixed** at `{x, y, u, v, r, g, b, a}`, and
+  `newMesh(vertexformat, ...)` is **refused**. The renderer has one vertex
+  layout, shared by every program including your own shaders through a single
+  VAO, so extra attributes have nowhere to go. Accepting the call and
+  dropping them would render something that looks nearly right.
+- **`"points"` is refused.** There is no point primitive on this path.
+  Use `love.graphics.points`, or a `"triangles"` mesh of small quads.
+- **`usage` is accepted and ignored.** `"static"`/`"dynamic"`/`"stream"` is a
+  GPU buffer hint; every mesh here uploads on the draw that uses it, so there
+  is nothing for the hint to select. A *misspelled* usage is still an error.
+- **A mesh is its own draw call.** The batcher is hardwired to quads, and a
+  mesh is arbitrary triangles, so each `draw(mesh, ...)` is one
+  `glDrawArrays`. Batching a hundred small meshes is not free the way a
+  hundred sprites are; put them in one mesh instead.
+- **`love.graphics.setColor` tints a mesh**, multiplying its per-vertex
+  colours, exactly as it does a sprite.
+- **Meshes need GL.** `newMesh` fails on a host with no GL context, and
+  `draw` fails if the renderer has fallen back to the software rasterizer.
+  There is no software path that rasterizes a textured, per-vertex-coloured
+  triangle, and inventing an approximate one that disagreed with GL would be
+  worse than saying so.
+- **Limits:** 32 meshes, 4096 vertices each.
+
 ### Transforms
 
 ```lua

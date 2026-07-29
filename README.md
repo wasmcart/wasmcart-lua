@@ -138,6 +138,7 @@ on a 1280x720 **top-left origin** canvas. Colors are 0..1 floats.
 | `print(text,x,y)` / `printf(text,x,y,limit,align)` | `"center"`, `"right"` |
 | `push` `pop` `translate` `rotate` `scale` `origin` | full transform stack |
 | `newShader(code)` / `setShader(s)` / `Shader:send(...)` | GLSL ES 3.00; applies to solids, sprites, text and circles alike |
+| `newMesh(verts,mode)` / `Mesh:setTexture` / `setVertexMap` | textured, per-vertex-coloured triangles; `"fan"`, `"strip"`, `"triangles"` |
 | `setScissor(x,y,w,h)` · `setBlendMode("alpha"\|"add")` | |
 | `getWidth()` `getHeight()` | 1280 x 720 |
 
@@ -233,7 +234,8 @@ rather than silently doing nothing:
 
 | Missing | Why / what to do |
 |---|---|
-| meshes | not implemented; use `polygon()` |
+| custom mesh vertex formats | the renderer has one fixed vertex layout; use the default `{x,y,u,v,r,g,b,a}` |
+| the `"points"` mesh draw mode | no point primitive on this path; use `points()` |
 | threads | the engine is a single wasm instance |
 | video playback | out of scope |
 | real filesystem | carts have no files; use cart assets + the save region |
@@ -316,6 +318,20 @@ never bound, which must fail. `test/shaderfail` then asserts `newShader`
 *refuses* four differently-broken shaders with the driver's own message.
 `tools/gl-call-count.mjs` holds the performance line: a cart that never calls
 `setShader` must issue **zero** `glUseProgram` per frame.
+
+Meshes get the same treatment, for the same reason: a mesh that never draws
+leaves the frame count perfect and a hole in the screen. `examples/mesh`
+draws a textured mesh and **the same image as an ordinary sprite** directly
+beneath it, and `tools/gl-mesh-verify.mjs` asserts they agree — the two go
+through completely different atlas arithmetic, so agreement is a real
+statement about the uv remap rather than a tautology. It also asserts
+per-vertex colour interpolates instead of rendering flat, and that
+`"triangles"` and `"fan"` differ on an *identical* six-vertex list. The
+**control** is the same cart with the mesh draw removed, which must fail.
+`test/meshfail` asserts `newMesh` *refuses* six unsupported forms and that
+LÖVE's 1-based indices round-trip (an off-by-one there is invisible on
+screen — a mesh drawn from vertex 2 still looks like a mesh).
+`test/meshcost` holds the call budget: 12 meshes must be 12 draws.
 
 `test/determinism.js` proves the determinism claim two ways: the same seed
 must give a byte-identical framebuffer, and for carts whose visuals depend on

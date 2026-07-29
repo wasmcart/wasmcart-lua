@@ -1417,6 +1417,270 @@ static int l_shader_send_bool(lua_State *S) {
     return 1;
 }
 
+/* ── meshes ────────────────────────────────────────────────────────────
+ *
+ * The vertex data lives HERE, in C, not in a Lua table.
+ *
+ * A mesh is drawn every frame and its vertices rarely change, so marshalling
+ * a Lua table across the boundary per frame would dominate the feature: a
+ * 3000-vertex mesh is 24000 lua_rawgeti calls a frame to produce geometry
+ * that did not move. Keeping the floats in a C array means a draw is one
+ * call, and setVertex/setVertices write into that array directly. This is
+ * also what LOVE does (a Mesh owns a GPU buffer), so the API shape follows
+ * from it rather than being worked around.
+ *
+ * Layout is LOVE's default vertex format, 8 floats:
+ *     x, y, u, v, r, g, b, a
+ * which is the GL backend's vertex_t minus `rad`, so wcl_r2d_mesh does no
+ * repacking at all.
+ *
+ * The draw expands the mesh's draw MODE (fan/strip/triangles) and its vertex
+ * map into a triangle list here rather than in Lua, for the same reason.
+ */
+#define MAX_MESHES 32
+/* Per-mesh vertex cap. The expansion buffer below is the real cost: a fan of
+ * N vertices becomes 3*(N-2) triangle vertices, so the scratch is ~3x this
+ * at 32 bytes each. 4096 keeps that at 1.5 MB, which is nothing against the
+ * 64 MB heap and is far more geometry than a 2D cart draws in one mesh. */
+#define MESH_MAX_VERTS 4096
+typedef struct {
+    float *verts;        /* 8 floats per vertex */
+    int n;               /* vertex count */
+    uint16_t *map;       /* vertex map (index buffer), or NULL */
+    int map_n;
+    int mode;            /* 0 fan, 1 strip, 2 triangles, 3 points */
+    int tex;             /* image id, or -1 */
+    int range_start, range_count;   /* -1 = the whole thing */
+    int active;
+} mesh_t;
+static mesh_t meshes[MAX_MESHES];
+
+/* Expanded triangle list. Sized for the worst case a single draw can ask
+ * for: a fan or strip of MESH_MAX_VERTS makes (n-2) triangles. */
+static float mesh_tris[MESH_MAX_VERTS * 3 * 8];
+
+static mesh_t *mesh_by_id(int id) {
+    if (id < 0 || id >= MAX_MESHES || !meshes[id].active) return NULL;
+    return &meshes[id];
+}
+
+static int l_mesh_new(lua_State *S) {
+    int n = ARGI(1);
+    int mode = ARGI(2);
+    if (n < 1 || n > MESH_MAX_VERTS) { lua_pushnil(S); return 1; }
+    /* Meshes are GL-only, and a cart must find that out at newMesh rather
+     * than by getting an empty screen. Same rule newShader follows: refusing
+     * up front beats rendering nothing and reporting success. Reported as a
+     * distinct return so the prelude can name the actual reason. */
+    if (!wcl_r2d_active()) {
+        lua_pushnil(S);
+        lua_pushstring(S, "nogl");
+        return 2;
+    }
+    int slot = -1;
+    for (int i = 0; i < MAX_MESHES; i++) if (!meshes[i].active) { slot = i; break; }
+    if (slot < 0) { lua_pushnil(S); return 1; }
+    mesh_t *m = &meshes[slot];
+    m->verts = (float *)calloc((size_t)n * 8, sizeof(float));
+    if (!m->verts) { lua_pushnil(S); return 1; }
+    /* LOVE's default vertex is white and opaque, and a cart that supplies
+     * only x,y,u,v relies on that. calloc would give transparent black, so a
+     * mesh built from positions alone would render nothing at all. */
+    for (int i = 0; i < n; i++) {
+        m->verts[i * 8 + 4] = 1.0f; m->verts[i * 8 + 5] = 1.0f;
+        m->verts[i * 8 + 6] = 1.0f; m->verts[i * 8 + 7] = 1.0f;
+    }
+    m->n = n; m->mode = mode; m->tex = -1; m->active = 1;
+    m->map = NULL; m->map_n = 0;
+    m->range_start = -1; m->range_count = -1;
+    lua_pushinteger(S, slot);
+    return 1;
+}
+
+/* set_vertex(id, index0, x, y, u, v, r, g, b, a) - index is 0-BASED here;
+ * the prelude does the 1-based conversion, once, where LOVE's API is. */
+static int l_mesh_set_vertex(lua_State *S) {
+    mesh_t *m = mesh_by_id(ARGI(1));
+    int i = ARGI(2);
+    if (!m || i < 0 || i >= m->n) return 0;
+    float *v = &m->verts[i * 8];
+    for (int k = 0; k < 8; k++) v[k] = (float)ARGD(3 + k);
+    return 0;
+}
+
+static int l_mesh_get_vertex(lua_State *S) {
+    mesh_t *m = mesh_by_id(ARGI(1));
+    int i = ARGI(2);
+    if (!m || i < 0 || i >= m->n) return 0;
+    const float *v = &m->verts[i * 8];
+    for (int k = 0; k < 8; k++) lua_pushnumber(S, v[k]);
+    return 8;
+}
+
+static int l_mesh_set_texture(lua_State *S) {
+    mesh_t *m = mesh_by_id(ARGI(1));
+    if (!m) return 0;
+    m->tex = lua_isnoneornil(S, 2) ? -1 : ARGI(2);
+    return 0;
+}
+
+/* set_map(id, {i0, i1, ...}) with 0-based indices, or nil to clear. */
+static int l_mesh_set_map(lua_State *S) {
+    mesh_t *m = mesh_by_id(ARGI(1));
+    if (!m) return 0;
+    free(m->map); m->map = NULL; m->map_n = 0;
+    if (lua_isnoneornil(S, 2)) return 0;
+    luaL_checktype(S, 2, LUA_TTABLE);
+    int n = (int)lua_rawlen(S, 2);
+    if (n < 1) return 0;
+    if (n > MESH_MAX_VERTS * 3) n = MESH_MAX_VERTS * 3;
+    m->map = (uint16_t *)malloc((size_t)n * sizeof(uint16_t));
+    if (!m->map) return 0;
+    for (int i = 0; i < n; i++) {
+        lua_rawgeti(S, 2, i + 1);
+        int v = (int)lua_tointeger(S, -1);
+        lua_pop(S, 1);
+        if (v < 0) v = 0;
+        if (v >= m->n) v = m->n - 1;
+        m->map[i] = (uint16_t)v;
+    }
+    m->map_n = n;
+    return 0;
+}
+
+static int l_mesh_get_map(lua_State *S) {
+    mesh_t *m = mesh_by_id(ARGI(1));
+    if (!m || !m->map) { lua_pushnil(S); return 1; }
+    lua_createtable(S, m->map_n, 0);
+    for (int i = 0; i < m->map_n; i++) {
+        lua_pushinteger(S, m->map[i]);
+        lua_rawseti(S, -2, i + 1);
+    }
+    return 1;
+}
+
+static int l_mesh_set_range(lua_State *S) {
+    mesh_t *m = mesh_by_id(ARGI(1));
+    if (!m) return 0;
+    if (lua_isnoneornil(S, 2)) { m->range_start = -1; m->range_count = -1; return 0; }
+    m->range_start = ARGI(2);
+    m->range_count = ARGI(3);
+    return 0;
+}
+
+static int l_mesh_get_range(lua_State *S) {
+    mesh_t *m = mesh_by_id(ARGI(1));
+    if (!m || m->range_start < 0) { lua_pushnil(S); return 1; }
+    lua_pushinteger(S, m->range_start);
+    lua_pushinteger(S, m->range_count);
+    return 2;
+}
+
+static int l_mesh_release(lua_State *S) {
+    mesh_t *m = mesh_by_id(ARGI(1));
+    if (!m) return 0;
+    free(m->verts); free(m->map);
+    m->verts = NULL; m->map = NULL; m->active = 0;
+    return 0;
+}
+
+/* mesh_draw(id, x, y, rot, sx, sy, ox, oy)
+ *
+ * The transform is applied HERE rather than in Lua: the whole point of
+ * keeping the vertices in C is not to walk them from Lua every frame, and
+ * transforming them in Lua would walk them twice. The parameters arrive
+ * already composed with the transform stack by the prelude, exactly as
+ * image_draw's do.
+ *
+ * Returns false when the mesh could not be rendered, so the prelude can say
+ * why rather than leaving an empty screen.
+ */
+static int l_mesh_draw(lua_State *S) {
+    mesh_t *m = mesh_by_id(ARGI(1));
+    if (!m || m->n < 1) { lua_pushboolean(S, 0); return 1; }
+    const double x = ARGD(2), y = ARGD(3), rot = ARGD(4);
+    const double sx = ARGD(5), sy = ARGD(6), ox = ARGD(7), oy = ARGD(8);
+
+    /* Which vertices, in which order. A vertex map replaces the implicit
+     * 0,1,2,... sequence; the draw range then selects a window of THAT
+     * sequence, which is LOVE's rule (the range indexes the map when there
+     * is one, not the vertex array). */
+    const int seq_n = m->map ? m->map_n : m->n;
+    int start = 0, cnt = seq_n;
+    if (m->range_start >= 0) {
+        start = m->range_start;
+        cnt = m->range_count;
+        if (start < 0) start = 0;
+        if (start > seq_n) start = seq_n;
+        if (cnt < 0 || start + cnt > seq_n) cnt = seq_n - start;
+    }
+    if (cnt < 3) { lua_pushboolean(S, 1); return 1; }   /* nothing to draw is
+                                                           not a failure */
+
+#define MESH_SEQ(k) (m->map ? (int)m->map[start + (k)] : (start + (k)))
+
+    /* Expand the draw mode into a triangle list. "points" is refused in the
+     * prelude, so only these three arrive. */
+    int tri_n = 0;
+    int idx[3];
+    const int cap = MESH_MAX_VERTS * 3;
+    float *out = mesh_tris;
+
+    const double c = cos(rot), s = sin(rot);
+    /* Emit one vertex: apply origin, scale, rotation and translation, in
+     * LOVE's order, then copy uv and colour through unchanged. */
+    #define MESH_EMIT(vi) do {                                           \
+        if (tri_n + 1 <= cap) {                                          \
+            const float *src = &m->verts[(vi) * 8];                      \
+            double px = ((double)src[0] - ox) * sx;                      \
+            double py = ((double)src[1] - oy) * sy;                      \
+            double rx = px * c - py * s;                                 \
+            double ry = px * s + py * c;                                 \
+            float *d = &out[tri_n * 8];                                  \
+            d[0] = (float)(rx + x); d[1] = (float)(ry + y);              \
+            for (int k = 2; k < 8; k++) d[k] = src[k];                   \
+            tri_n++;                                                     \
+        }                                                                \
+    } while (0)
+
+    if (m->mode == 0) {                     /* fan */
+        for (int i = 1; i + 1 < cnt; i++) {
+            idx[0] = MESH_SEQ(0); idx[1] = MESH_SEQ(i); idx[2] = MESH_SEQ(i + 1);
+            for (int k = 0; k < 3; k++) MESH_EMIT(idx[k]);
+        }
+    } else if (m->mode == 1) {              /* strip */
+        for (int i = 0; i + 2 < cnt; i++) {
+            /* Winding alternates so every triangle faces the same way. There
+             * is no backface culling here, so this does not change what is
+             * drawn -- but it keeps the geometry identical to LOVE's, which
+             * matters the moment a cart's own shader reads gl_FrontFacing. */
+            if (i & 1) {
+                idx[0] = MESH_SEQ(i + 1); idx[1] = MESH_SEQ(i); idx[2] = MESH_SEQ(i + 2);
+            } else {
+                idx[0] = MESH_SEQ(i); idx[1] = MESH_SEQ(i + 1); idx[2] = MESH_SEQ(i + 2);
+            }
+            for (int k = 0; k < 3; k++) MESH_EMIT(idx[k]);
+        }
+    } else {                                /* triangles */
+        for (int i = 0; i + 2 < cnt; i += 3) {
+            idx[0] = MESH_SEQ(i); idx[1] = MESH_SEQ(i + 1); idx[2] = MESH_SEQ(i + 2);
+            for (int k = 0; k < 3; k++) MESH_EMIT(idx[k]);
+        }
+    }
+#undef MESH_EMIT
+#undef MESH_SEQ
+
+    if (tri_n < 3) { lua_pushboolean(S, 1); return 1; }
+    dbg_draw_calls++;
+
+    image_t *im = (m->tex >= 0) ? image_by_id(m->tex) : NULL;
+    lua_pushboolean(S, wcl_r2d_mesh(mesh_tris, tri_n,
+                                    im ? im->rgba : NULL,
+                                    im ? im->w : 0, im ? im->h : 0,
+                                    cur_rgb(), cur_a));
+    return 1;
+}
+
 static int l_asset_exists(lua_State *S) {
     const char *path = luaL_checkstring(S, 1);
     lua_pushboolean(S, wc_asset_size(path, (unsigned int)strlen(path)) >= 0);
@@ -1464,6 +1728,16 @@ static const luaL_Reg wc_lib[] = {
     {"shader_send", l_shader_send},
     {"shader_send_image", l_shader_send_image},
     {"shader_send_bool",  l_shader_send_bool},
+    {"mesh_new",        l_mesh_new},
+    {"mesh_set_vertex", l_mesh_set_vertex},
+    {"mesh_get_vertex", l_mesh_get_vertex},
+    {"mesh_set_texture", l_mesh_set_texture},
+    {"mesh_set_map",    l_mesh_set_map},
+    {"mesh_get_map",    l_mesh_get_map},
+    {"mesh_set_range",  l_mesh_set_range},
+    {"mesh_get_range",  l_mesh_get_range},
+    {"mesh_draw",       l_mesh_draw},
+    {"mesh_release",    l_mesh_release},
     {"shader_has_uniform", l_shader_has_uniform},
     {"pad_has_rumble",  l_pad_has_rumble},
     {"pad_rumble",      l_pad_rumble},

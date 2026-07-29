@@ -22,7 +22,18 @@ const W = 1280, H = 720;
 const args = process.argv.slice(2);
 const flagIdx = args.indexOf('--max-useprogram');
 const MAX_USE = flagIdx >= 0 ? +args[flagIdx + 1] : null;
-const positional = args.filter((a, i) => i !== flagIdx && i !== flagIdx + 1);
+/* --max-drawarrays bounds the NON-BATCHED draws. Meshes, polygons and lines
+ * each issue their own glDrawArrays because none of them is a quad, so this
+ * is the number that moves if a mesh draw starts splitting itself across
+ * several uploads or re-uploading geometry that did not change. */
+const drawIdx = args.indexOf('--max-drawarrays');
+const MAX_DRAW = drawIdx >= 0 ? +args[drawIdx + 1] : null;
+/* Guard the -1 case explicitly: `flagIdx + 1` is 0 when the flag is absent,
+ * which would silently eat the engine path (the first positional). */
+const skip = new Set();
+if (flagIdx >= 0) { skip.add(flagIdx); skip.add(flagIdx + 1); }
+if (drawIdx >= 0) { skip.add(drawIdx); skip.add(drawIdx + 1); }
+const positional = args.filter((a, i) => !skip.has(i));
 
 const enginePath = positional[0] || 'build/engine.wasm';
 const cartDir = positional[1] || 'test/gl2d';
@@ -112,5 +123,17 @@ if (MAX_USE !== null && usePerFrame > MAX_USE) {
               `budget of ${MAX_USE}. The default (no custom shader) path must not ` +
               're-bind the program.');
   process.exit(1);
+}
+
+const drawPerFrame = (counts.glDrawArrays || 0) / FRAMES;
+if (MAX_DRAW !== null) {
+  console.log(`glDrawArrays per frame: ${drawPerFrame.toFixed(2)}`);
+  if (drawPerFrame > MAX_DRAW) {
+    console.log(`\nFAILED: ${drawPerFrame.toFixed(2)} glDrawArrays per frame exceeds ` +
+                `the budget of ${MAX_DRAW}. A non-batched draw (mesh, polygon, line) ` +
+                'is issuing more calls than it should -- most likely one mesh being ' +
+                'split across several uploads.');
+    process.exit(1);
+  }
 }
 console.log('\nOK');

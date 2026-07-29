@@ -130,6 +130,59 @@ function love.load()
              "newShader failed without naming itself: " .. tostring(res))
     end
   end)
+  -- api.md: meshes.
+  --
+  -- Same two-branch shape as the shader block above, and for the same
+  -- reason: api.md documents newMesh as FAILING on a host with no GL rather
+  -- than pretending, so this cart (which runs on the CPU comparator) asserts
+  -- whichever branch applies. A build that silently handed back a mesh with
+  -- no GL to draw it would fail here.
+  T("meshes", function()
+    local ok_, res = pcall(love.graphics.newMesh, {
+      {   0,   0,  0, 0,  1, 0, 0, 1 },
+      { 180,   0,  1, 0,  0, 1, 0, 1 },
+      { 180, 180,  1, 1,  0, 0, 1, 1 },
+      {   0, 180,  0, 1,  1, 1, 1, 1 },
+    }, "fan")
+    if ok_ then
+      -- a GL host: the whole documented surface must be there
+      assert(res:type() == "Mesh", "newMesh returned a non-Mesh")
+      assert(res:getVertexCount() == 4, "getVertexCount wrong")
+      assert(res:getDrawMode() == "fan", "getDrawMode wrong")
+      res:setVertex(1, 1, 2, 0, 0, 1, 1, 1, 1)
+      res:setVertex(2, { 3, 4, 0, 0, 1, 1, 1, 1 })
+      local x, y = res:getVertex(1)
+      assert(x == 1 and y == 2, "setVertex/getVertex did not round-trip")
+      res:setVertices({ { 5, 6, 0, 0, 1, 1, 1, 1 } }, 3)
+      res:setVertexMap({ 1, 2, 3, 1, 3, 4 })
+      assert(#res:getVertexMap() == 6, "getVertexMap wrong")
+      res:setVertexMap(nil)
+      res:setDrawRange(1, 3)
+      assert(select(1, res:getDrawRange()) == 1, "getDrawRange wrong")
+      res:setDrawRange()
+      local cv = love.graphics.newCanvas(32, 32)
+      res:setTexture(cv)
+      assert(res:getTexture() == cv, "getTexture did not report setTexture")
+      res:setTexture(nil)
+      love.graphics.draw(res, 0, 0)
+      -- a count-built mesh defaults to opaque white, as documented
+      local m2 = love.graphics.newMesh(3, "triangles")
+      local _, _, _, _, r = m2:getVertex(1)
+      assert(r == 1, "newMesh(count) did not default to white")
+      m2:release()
+      res:release()
+      -- the documented refusals
+      assert(not pcall(love.graphics.newMesh, { { 0, 0 } }, "points"),
+             "\"points\" mode should be refused")
+      assert(not pcall(love.graphics.newMesh,
+             { { "VertexPosition", "float", 2 } }, 4, "fan"),
+             "a custom vertex format should be refused")
+    else
+      -- a host with no GL: the failure is required to be loud and to say why
+      assert(tostring(res):find("newMesh"),
+             "newMesh failed without naming itself: " .. tostring(res))
+    end
+  end)
   -- api.md: debug + logging
   T("debug", function() love.log("x", 1); love.debugValue(0, 5); love.mark(7) end)
   -- api.md: window/system/event
