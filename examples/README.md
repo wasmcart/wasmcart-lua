@@ -5,7 +5,7 @@ verified rendering (not just "runs without crashing").
 
 | example | what it demonstrates |
 |---|---|
-| `pong` | two-player pads, rectangles, deterministic RNG, beeps |
+| `ping` | two-player pads, rectangles, deterministic RNG, beeps |
 | `breakout` | save data (persisted high score), game states, brick collision |
 | `platformer` | `require` of a lib, tile collision, gravity, scrolling camera |
 | `shmup` | coroutine-scripted waves, entity pools, additive blending |
@@ -23,7 +23,7 @@ the CPU comparator like the rest.
 Run one:
 
 ```bash
-cd examples/pong
+cd examples/ping
 cp ../../build/engine.wasm main.wasm
 npx wasmcart .
 ```
@@ -32,5 +32,5 @@ Or pack it:
 
 ```bash
 npx wasmcart pack --wasm ../../build/engine.wasm --assets app \
-  --name pong --width 1280 --height 720 -o pong.wasc
+  --name ping --width 1280 --height 720 -o ping.wasc
 ```

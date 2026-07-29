@@ -140,7 +140,7 @@ Measured headless (V8, no host pacing), 180 frames each:
 
 | example | fps headless | draw calls/frame | gc |
 |---|---|---|---|
-| pong | ~16800 | 22 | 124 KB |
+| ping | ~16800 | 22 | 124 KB |
 | shmup | ~7900 | 87 | 137 KB |
 | breakout | ~4600 | 73 | 143 KB |
 | platformer | ~4800 | 224 | 132 KB |
@@ -152,7 +152,7 @@ Per-frame cost of real carts, which is the number that matters (measure with
 
 | cart | median frame | share of a 60fps budget |
 |---|---|---|
-| pong / shmup / platformer | 0.07 - 0.19 ms | ~1% |
+| ping / shmup / platformer | 0.07 - 0.19 ms | ~1% |
 | particles, kitchen-sink | 0.4 - 0.6 ms | ~3% |
 | the Cavern port | 5.5 ms | 33% |
 
@@ -413,7 +413,7 @@ Measured on the real carts, 300 frames each, AMD 890M via native-gles:
 | cart | GL2D | software | |
 |---|---|---|---|
 | **the Cavern port** | 0.118 ms | 5.666 ms | **47.9x** |
-| pong | 0.024 | 0.049 | 2.07x |
+| ping | 0.024 | 0.049 | 2.07x |
 | breakout | 0.054 | 0.098 | 1.82x |
 | shmup | 0.060 | 0.107 | 1.78x |
 | platformer | 0.132 | 0.187 | 1.41x |

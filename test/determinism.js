@@ -33,7 +33,7 @@ const ENGINE = path.join(ROOT, 'build', 'engine-cpu.wasm');
 const CARTS = [
   { name: 'shmup',      seedSensitive: true,  frames: 150 }, // enemy drift + bursts
   { name: 'particles',  seedSensitive: true,  frames: 150 }, // random emitter velocities
-  { name: 'pong',       seedSensitive: true,  frames: 150 }, // random launch vector
+  { name: 'ping',       seedSensitive: true,  frames: 150 }, // random launch vector
   { name: 'platformer', seedSensitive: false, frames: 150 }, // fixed map + physics
   { name: 'breakout',   seedSensitive: false, frames: 150 }, // fixed layout + physics
 ];

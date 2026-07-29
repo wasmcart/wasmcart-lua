@@ -1,5 +1,5 @@
 {
-  "name": "pong",
+  "name": "ping",
   "version": "1.0.0",
   "abi": 3,
   "entry": "main.wasm",

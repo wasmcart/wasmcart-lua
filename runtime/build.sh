@@ -103,10 +103,10 @@ build_engine ../build/engine-cpu.wasm
 cp ../build/engine.wasm ../template/main.wasm
 
 # pack the flagship example as a ready-to-run demo cart
-if [ -d ../examples/pong/app ]; then
+if [ -d ../examples/ping/app ]; then
   node "$WASMCART_REPO/bin/wasmcart-pack.js" \
-    --wasm ../build/engine.wasm --assets ../examples/pong/app \
-    --name pong --width 1280 --height 720 \
-    -o ../build/pong.wasc > /dev/null
-  echo "packed ../build/pong.wasc"
+    --wasm ../build/engine.wasm --assets ../examples/ping/app \
+    --name ping --width 1280 --height 720 \
+    -o ../build/ping.wasc > /dev/null
+  echo "packed ../build/ping.wasc"
 fi

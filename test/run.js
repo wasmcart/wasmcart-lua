@@ -13,7 +13,7 @@
  * is indistinguishable from a suite that cannot see red.
  *
  *   node test/run.js            # all examples
- *   node test/run.js pong       # one example
+ *   node test/run.js ping       # one example
  */
 const fs = require('fs');
 const path = require('path');

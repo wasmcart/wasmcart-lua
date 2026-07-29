@@ -1,4 +1,4 @@
--- pong: two-player paddle game.
+-- ping: two-player paddle game.
 -- Demonstrates: love.update/draw, love.pad for two players, rectangles,
 -- deterministic love.math.random, sound via love.audio.beep.
 

@@ -277,7 +277,7 @@ GL2D against the software rasterizer, same cart, same frames, on an AMD 890M:
 | cart | GL2D | software | |
 |---|---|---|---|
 | the Cavern port | 0.118 ms | 5.666 ms | **47.9x** |
-| pong | 0.024 | 0.049 | 2.07x |
+| ping | 0.024 | 0.049 | 2.07x |
 | breakout | 0.054 | 0.098 | 1.82x |
 | shmup | 0.060 | 0.107 | 1.78x |
 | platformer | 0.132 | 0.187 | 1.41x |
