@@ -189,6 +189,19 @@ async function main() {
   let failed = 0;
   console.log('engine:', (fs.statSync(ENGINE).size / 1024).toFixed(1) + ' KB\n');
 
+  // runtime/wasmcart.h is a copy of the spec's header, and a quoted #include
+  // makes the copy win over build.sh's -I "$WASMCART_REPO/include" regardless
+  // of flag order. A stale copy therefore builds the engine against the old
+  // ABI with no warning, so check it before anything else runs.
+  {
+    const { spawnSync } = require('child_process');
+    const r = spawnSync('node', [path.join(ROOT, 'tools', 'abi-drift.mjs')],
+      { encoding: 'utf8' });
+    process.stdout.write(r.stdout || '');
+    process.stderr.write(r.stderr || '');
+    if (r.status !== 0) failed++;
+  }
+
   // Examples that CANNOT run on the CPU comparator, because the feature they
   // demonstrate is a GPU program. `shaders` calls newShader, which refuses on
   // a host with no GL rather than pretending -- so running it against
