@@ -1,9 +1,13 @@
 #!/bin/bash
 # Build the wasmcart Lua engine -> ../build/engine.wasm
-# Needs: emcc, curl, a wasmcart checkout for include/wc_cart.h + wc_pcm_mixer.h
-# (WASMCART_REPO, default sibling).
+# Needs: emcc, curl, and the `wasmcart` npm package (npm install) for
+# include/wc_cart.h + wc_pcm_mixer.h and the packer. $WASMCART_REPO overrides
+# with a checkout; the sibling-checkout default remains the last fallback.
 set -e
 cd "$(dirname "$0")"
+if [ -z "${WASMCART_REPO:-}" ]; then
+  WASMCART_REPO="$(node -e "console.log(require('path').dirname(require.resolve('wasmcart')))" 2>/dev/null || true)"
+fi
 WASMCART_REPO="${WASMCART_REPO:-../../wasmcart}"
 LUA_VERSION=5.4.7
 BOX2D_TAG=v3.2.0

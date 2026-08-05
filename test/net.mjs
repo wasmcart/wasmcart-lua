@@ -30,11 +30,21 @@ import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync, rmSync, copyFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createRequire } from 'node:module';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
-const WASMCART = process.env.WASMCART_REPO
-  || join(process.env.HOME ?? '', 'code', 'cliemu', 'wasmcart');
+// Resolve the spec package: env override first (a checkout, for developing
+// against unreleased wasmcart), then the installed npm package.
+function resolveWasmcart() {
+  if (process.env.WASMCART_REPO) return process.env.WASMCART_REPO;
+  try {
+    return dirname(createRequire(import.meta.url).resolve('wasmcart'));
+  } catch {
+    return join(process.env.HOME ?? '', 'code', 'cliemu', 'wasmcart');
+  }
+}
+const WASMCART = resolveWasmcart();
 const ENGINE = join(ROOT, 'build', 'engine-cpu.wasm');
 const WORK = join(HERE, '.net-work');
 const PORT = Number(process.env.WC_NET_TEST_PORT || 8791);
@@ -105,10 +115,12 @@ async function main() {
     process.exit(1);
   }
   const hostEntry = join(WASMCART, 'index.js');
-  const wsserver = join(WASMCART, 'test', 'wsserver.mjs');
-  if (!existsSync(hostEntry) || !existsSync(wsserver)) {
-    console.log(`skip  net          no wasmcart checkout at ${WASMCART} ` +
-      `(set WASMCART_REPO to run the networking tests)`);
+  // The WS test server is VENDORED (test/wsserver.mjs): the npm package does
+  // not ship its test/ directory, and the server is dependency-free.
+  const wsserver = join(HERE, 'wsserver.mjs');
+  if (!existsSync(hostEntry)) {
+    console.log(`skip  net          no wasmcart package or checkout at ${WASMCART} ` +
+      `(npm install, or set WASMCART_REPO)`);
     return;
   }
   const { CartHost } = await import(pathToFileURL(hostEntry).href);

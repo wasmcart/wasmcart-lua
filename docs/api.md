@@ -287,7 +287,7 @@ Mapped keys: `left right up down` and `w a s d` → dpad, `z`→a, `x`→b, `c`�
 `v`→y, `space`→a, `return`/`enter`→start, `escape`/`backspace`/`tab`→select,
 `lshift`/`rshift`→l/r, `lctrl`/`rctrl`→l/r.
 
-## love.mouse
+## love.mouse (and touch)
 
 ```lua
 love.mouse.getPosition()   -- pointer, or the virtual cursor on pad-only hosts
@@ -296,7 +296,30 @@ love.mouse.isDown(1, 2)    -- button 1 also mirrors pad R / A
 ```
 
 Callbacks: `love.mousepressed(x, y, button)` and `love.mousereleased(...)`.
-Requires packing with `--pointer`.
+No pack flag is involved: the engine declares `WC_FLAG_POINTER` itself, and
+that flag is the only gate (the old `--pointer` pack flag is a warning no-op).
+
+**Touch.** `love.mouse` reads pointer slot 0, which is the MOUSE. Touch
+fingers arrive in slots 1-9 of the wasmcart pointer ABI, one slot per finger
+for as long as it stays down. Read them with the engine-level binding:
+
+```lua
+for slot = 0, 9 do
+  local x, y, buttons, active = wc.pointer(slot)
+  if active and buttons ~= 0 then
+    -- slot 0 = mouse drag, slots 1+ = touch contacts
+  end
+end
+```
+
+A game that reads only `love.mouse` works perfectly on desktop and ignores
+every touch on a phone -- that is the #1 pointer portability trap. Poll all
+ten slots (the loop is free) unless the game genuinely wants only a cursor.
+`examples/breakout` draws a per-slot stroke trace showing exactly this.
+
+For hosts that draw ON-SCREEN touch pads, pack with an advisory `controls`
+hint (`wasmcart-pack --controls dpad,a,b,start`) so the overlay shows only
+what the game reads. Presentation-only: the full pad is always delivered.
 
 ```lua
 for _, joy in ipairs(love.joystick.getJoysticks()) do
@@ -494,7 +517,7 @@ too.
 draws ALL randomness from that one host-provided seed. A current wasmcart
 host seeds it with fresh entropy on every normal load (different shuffle
 every power-on) and pins it only for `--seed` / `deterministic` replay
-runs. On hosts older than 2026-08 the normal-load seeding is missing —
+runs. On hosts older than wasmcart 0.17.0 the normal-load seeding is missing —
 every boot then replays the same "random" sequence. Carts that must behave
 on old hosts can stir human input timing into their own PRNG (nobody
 presses a button on the same frame twice); see cardtable/cards.lua in the

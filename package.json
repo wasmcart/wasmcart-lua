@@ -22,5 +22,8 @@
     "docs/",
     "README.md",
     "LICENSE"
-  ]
+  ],
+  "devDependencies": {
+    "wasmcart": "^0.17.0"
+  }
 }

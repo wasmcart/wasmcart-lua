@@ -16,12 +16,14 @@
  *
  *   node tools/abi-drift.mjs [--wasmcart <path-to-wasmcart-checkout>]
  *
- * Resolution order: --wasmcart, $WASMCART_REPO, $WASMCART_DIR, ../wasmcart.
+ * Resolution order: --wasmcart, $WASMCART_REPO, $WASMCART_DIR, the installed
+ * `wasmcart` npm package, ../wasmcart.
  * Skips with a clear message if none resolve, so this never fails a machine
  * that simply lacks a checkout.
  */
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -31,8 +33,17 @@ const VENDORED = path.join(ROOT, 'runtime', 'wasmcart.h');
 function specDir() {
   const i = process.argv.indexOf('--wasmcart');
   if (i >= 0 && process.argv[i + 1]) return process.argv[i + 1];
-  return process.env.WASMCART_REPO || process.env.WASMCART_DIR
-    || path.join(ROOT, '..', 'wasmcart');
+  if (process.env.WASMCART_REPO) return process.env.WASMCART_REPO;
+  if (process.env.WASMCART_DIR) return process.env.WASMCART_DIR;
+  // The installed npm package ships include/, so a plain `npm install` is
+  // enough to run this check. (require.resolve('wasmcart/package.json') is
+  // blocked by the package's exports map; resolve the main entry instead --
+  // index.js sits at the package root.)
+  try {
+    const require = createRequire(import.meta.url);
+    return path.dirname(require.resolve('wasmcart'));
+  } catch { /* no package installed; fall through to the sibling checkout */ }
+  return path.join(ROOT, '..', 'wasmcart');
 }
 
 const dir = specDir();

@@ -13,9 +13,11 @@ fragment shader. A software rasterizer is built into the same binary and
 renders anything GL2D does not, so the engine never depends on a feature being
 implemented twice.
 
-wasmcart games are **gamepad games**: design for d-pad + face buttons + sticks
-and they'll feel right on every device (desktop testing maps arrows/z/x onto
-the pad for you).
+wasmcart games are **gamepad games first**: design for d-pad + face buttons +
+sticks and they'll feel right on every device (desktop testing maps
+arrows/z/x onto the pad for you). Mouse and multitouch are there when a game
+wants them -- `love.mouse` for the cursor, `wc.pointer(slot)` for touch
+fingers (see docs/api.md).
 
 ```lua
 local x, y = 640, 360
@@ -120,7 +122,9 @@ Anything that transpiles to Lua rides along for free: **Teal**, **Fennel**,
 > because Lua-games-as-open-cartridges is a good idea.
 
 Everything happens in `love.update(dt)` and `love.draw()`, 60 times a second,
-on a 1280x720 **top-left origin** canvas. Colors are 0..1 floats.
+on a **top-left origin** canvas -- 1280x720 by default, or up to 1920x1080 if
+the game ships a `conf.lua` (`love.conf(t)` sets `t.window.width/height`).
+Colors are 0..1 floats.
 
 ### love.graphics
 
@@ -140,7 +144,7 @@ on a 1280x720 **top-left origin** canvas. Colors are 0..1 floats.
 | `newShader(code)` / `setShader(s)` / `Shader:send(...)` | GLSL ES 3.00; applies to solids, sprites, text and circles alike |
 | `newMesh(verts,mode)` / `Mesh:setTexture` / `setVertexMap` | textured, per-vertex-coloured triangles; `"fan"`, `"strip"`, `"triangles"` |
 | `setScissor(x,y,w,h)` · `setBlendMode("alpha"\|"add")` | |
-| `getWidth()` `getHeight()` | 1280 x 720 |
+| `getWidth()` `getHeight()` | 1280 x 720 unless conf.lua chose otherwise |
 
 ### Input (gamepad-first)
 
@@ -294,7 +298,9 @@ build/       engine.wasm (GL2D) + engine-cpu.wasm (comparator) + .wasc carts
 Only needed if you're changing the engine itself; games use the prebuilt wasm.
 
 ```bash
-cd runtime && ./build.sh      # needs emcc + a wasmcart checkout
+cd runtime && ./build.sh      # needs emcc + `npm install` (headers + packer
+                              # come from the wasmcart npm package; set
+                              # WASMCART_REPO to build against a checkout)
 ```
 
 The build fetches and pins Lua 5.4.7, applies two small source guards
@@ -379,8 +385,10 @@ round-trips a 10-byte payload with an embedded NUL through an echo endpoint,
 **two** carts exchange payloads through a relay room, and a cart packed with no
 `--ws` grant is refused despite identical code. The peer-id assertion registers
 a host-side peer at id 77 first, so id and enumeration index are different
-numbers and an engine that confused them fails instead of coinciding. Needs a
-wasmcart checkout (`WASMCART_REPO`); skips cleanly without one.
+numbers and an engine that confused them fails instead of coinciding. The
+reference host comes from the installed `wasmcart` npm package (or a
+`WASMCART_REPO` checkout), and the WS test server is vendored at
+test/wsserver.mjs; skips cleanly if neither host source resolves.
 
 `test/determinism.js` proves the determinism claim two ways: the same seed
 must give a byte-identical framebuffer, and for carts whose visuals depend on
