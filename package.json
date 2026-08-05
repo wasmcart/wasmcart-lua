@@ -18,6 +18,8 @@
   ],
   "files": [
     "runtime/",
+    "!runtime/vendor/",
+    "!runtime/prelude.inc",
     "template/",
     "docs/",
     "README.md",
