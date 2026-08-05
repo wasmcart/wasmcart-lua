@@ -16,7 +16,8 @@
 local W, H = __WC_WIDTH, __WC_HEIGHT
 __WC_WIDTH, __WC_HEIGHT = nil, nil
 
-love = {}
+-- conf.lua may already have populated love (love.conf lives there); keep it.
+love = love or {}
 local love = love
 
 -- ── internal state ─────────────────────────────────────────────────

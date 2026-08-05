@@ -5,7 +5,8 @@
  * and write Lua in app/. The engine embeds a full Lua VM (real Lua: closures,
  * coroutines, metatables, GC, require) and runs a game written against a
  * LOVE-style API: love.load / love.update(dt) / love.draw, top-left origin,
- * 1280x720, 60 fps fixed step.
+ * 1280x720 by default -- a cart's conf.lua can pick up to 1920x1080.
+ * 60 fps fixed step.
  *
  * NOT LOVE: LOVE is an independent zlib-licensed project. This is an
  * unaffiliated engine with a LOVE-style API surface on the open wasmcart
@@ -60,11 +61,20 @@ void wcl_open_physics(lua_State *L);
 
 #define DEFAULT_WIDTH  1280
 #define DEFAULT_HEIGHT 720
-#define MAX_WIDTH  1280
-#define MAX_HEIGHT 720
+#define MAX_WIDTH  1920
+#define MAX_HEIGHT 1080
 #define AUDIO_CAP 4096
 
 WC_CART_BUFFERS;
+
+/* The cart's ACTUAL resolution, chosen once at boot. Defaults hold unless the
+ * cart ships a conf.lua whose love.conf(t) sets t.window.width/height (the
+ * LOVE idiom), clamped to MAX_*. The buffers above are MAX-sized, so this is
+ * only ever a stride/extent -- never a reallocation. Everything below must
+ * index the framebuffer with scr_w, not DEFAULT_WIDTH: the host reads the
+ * frame as scr_w * scr_h contiguous pixels. */
+static int scr_w = DEFAULT_WIDTH;
+static int scr_h = DEFAULT_HEIGHT;
 
 /* ── GL presentation (opt-in: -DWCL_USE_GL) ───────────────────────────
  *
@@ -95,7 +105,7 @@ static uint8_t gl_rgba[MAX_WIDTH * MAX_HEIGHT * 4];
 static void gl_present(void) {
     const uint32_t *src = wc_framebuffer;
     uint8_t *dst = gl_rgba;
-    for (int i = 0; i < DEFAULT_WIDTH * DEFAULT_HEIGHT; i++) {
+    for (int i = 0; i < scr_w * scr_h; i++) {
         const uint32_t px = src[i];
         dst[0] = (uint8_t)(px >> 16);  /* R */
         dst[1] = (uint8_t)(px >> 8);   /* G */
@@ -103,7 +113,7 @@ static void gl_present(void) {
         dst[3] = 255;                  /* X is unused: present opaque */
         dst += 4;
     }
-    wc_gl_blit(gl_rgba, DEFAULT_WIDTH, DEFAULT_HEIGHT);
+    wc_gl_blit(gl_rgba, scr_w, scr_h);
 }
 #endif
 
@@ -150,8 +160,8 @@ static int cur_r = 255, cur_g = 255, cur_b = 255, cur_a = 255;
 static int sc_on = 0, sc_x = 0, sc_y = 0, sc_w = 0, sc_h = 0;
 static int blend_add = 0;
 
-static inline int dest_w(void) { return rt_buf ? rt_w : DEFAULT_WIDTH; }
-static inline int dest_h(void) { return rt_buf ? rt_h : DEFAULT_HEIGHT; }
+static inline int dest_w(void) { return rt_buf ? rt_w : scr_w; }
+static inline int dest_h(void) { return rt_buf ? rt_h : scr_h; }
 
 /* top-left origin throughout (LOVE convention) */
 static inline void blend_px(int x, int y, uint32_t rgb, int a) {
@@ -177,7 +187,7 @@ static inline void blend_px(int x, int y, uint32_t rgb, int a) {
         p[3] = (uint8_t)oa;
         return;
     }
-    uint32_t *p = &wc_framebuffer[y * DEFAULT_WIDTH + x];
+    uint32_t *p = &wc_framebuffer[y * scr_w + x];
     uint32_t d = *p;
     if (blend_add) {
         int nr = (int)((d >> 16) & 0xFF) + (int)(sr * a / 255); if (nr > 255) nr = 255;
@@ -274,7 +284,7 @@ static void blend_span(int x0, int x1, int y, uint32_t rgb, int a) {
         return;
     }
 
-    uint32_t *p = &wc_framebuffer[y * DEFAULT_WIDTH + x0];
+    uint32_t *p = &wc_framebuffer[y * scr_w + x0];
     if (blend_add) {
         for (int x = x0; x < x1; x++, p++) {
             const uint32_t d = *p;
@@ -336,7 +346,7 @@ static void raster_line(int x0, int y0, int x1, int y1, uint32_t c, int a) {
 
     for (;;) {
         if (simple && x0 >= 0 && x0 < dw_ && y0 >= 0 && y0 < dh_) {
-            uint32_t *p = &wc_framebuffer[y0 * DEFAULT_WIDTH + x0];
+            uint32_t *p = &wc_framebuffer[y0 * scr_w + x0];
             if (a >= 255) {
                 *p = c;
             } else {
@@ -502,8 +512,8 @@ static int canvas_new(int w, int h) {
     int slot = -1;
     for (int i = 0; i < MAX_IMAGES; i++) if (!images[i].active) { slot = i; break; }
     if (slot < 0) return -1;
-    if (w < 1) w = DEFAULT_WIDTH;
-    if (h < 1) h = DEFAULT_HEIGHT;
+    if (w < 1) w = scr_w;
+    if (h < 1) h = scr_h;
     if (w > 2048) w = 2048;
     if (h > 2048) h = 2048;
     image_t *im = &images[slot];
@@ -603,7 +613,7 @@ static void draw_image(image_t *im, double x, double y, double rot,
     for (int yy = y0; yy < y1; yy++) {
         const double py = yy + 0.5 - y;
         const double py_sn = py * sn, py_cs = py * cs;
-        uint32_t *const row  = fast_dst ? &wc_framebuffer[yy * DEFAULT_WIDTH] : NULL;
+        uint32_t *const row  = fast_dst ? &wc_framebuffer[yy * scr_w] : NULL;
         uint8_t  *const crow = fast_cnv ? &rt_buf[yy * rt_w * 4] : NULL;
 
         int row_iy = 0;
@@ -1020,7 +1030,7 @@ static int l_clear(lua_State *S) {
             rt_buf[i * 4 + 2] = (uint8_t)b; rt_buf[i * 4 + 3] = 255;
         }
     } else {
-        for (int i = 0; i < DEFAULT_WIDTH * DEFAULT_HEIGHT; i++) wc_framebuffer[i] = c;
+        for (int i = 0; i < scr_w * scr_h; i++) wc_framebuffer[i] = c;
     }
     return 0;
 }
@@ -2010,6 +2020,55 @@ static int run_source(const char *name) {
     return lua_guard(name, st) ? -1 : 0;
 }
 
+/* conf.lua: the cart picks its resolution, LOVE's way.
+ *
+ * Runs BEFORE the prelude (which captures __WC_WIDTH/__WC_HEIGHT into locals
+ * and nils them) and before the renderer initializes, so everything downstream
+ * sees the chosen size. The asset is optional; so is defining love.conf inside
+ * it. Only t.window.width/height are honored, clamped to the MAX_* buffers --
+ * the engine's buffers are statically sized, so this is a choice of extent,
+ * never an allocation. */
+static void apply_conf(void) {
+    if (wc_asset_size("conf.lua", 8) <= 0) return;
+    /* LOVE's conf.lua writes `function love.conf(t)`, so `love` must exist
+     * before it runs. The prelude later does `love = love or {}`, keeping
+     * whatever conf.lua defined. */
+    lua_getglobal(L, "love");
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        lua_newtable(L);
+        lua_setglobal(L, "love");
+    } else {
+        lua_pop(L, 1);
+    }
+    if (run_source("conf.lua") != 0) return;
+    static const char *ASK =
+        "local t = { window = { width = ..., height = select(2, ...) } }\n"
+        "if type(love) == 'table' and type(love.conf) == 'function' then\n"
+        "  love.conf(t)\n"
+        "end\n"
+        "return t.window and t.window.width, t.window and t.window.height\n";
+    int st = luaL_loadbuffer(L, ASK, strlen(ASK), "conf-query");
+    if (st == LUA_OK) {
+        lua_pushinteger(L, scr_w);
+        lua_pushinteger(L, scr_h);
+        st = lua_pcall(L, 2, 2, 0);
+    }
+    if (lua_guard("love.conf", st)) return;
+    int w = (int)lua_tointeger(L, -2);
+    int h = (int)lua_tointeger(L, -1);
+    lua_pop(L, 2);
+    if (w >= 1 && h >= 1) {
+        scr_w = w > MAX_WIDTH  ? MAX_WIDTH  : w;
+        scr_h = h > MAX_HEIGHT ? MAX_HEIGHT : h;
+        /* Stamp the live struct too: hosts call wc_get_info() BEFORE wc_init
+         * and then re-read the struct MEMORY afterward, so an on-call override
+         * inside wc_get_info alone would never reach them. */
+        wc_info.width  = (uint32_t)scr_w;
+        wc_info.height = (uint32_t)scr_h;
+    }
+}
+
 WC_EXPORT wc_info_t *wc_get_info(void) {
     /* WC_FLAG_NET_PEER is the cart-side half of the networking gate. The
      * other half is the manifest's `net` grant, which the packager writes -
@@ -2017,6 +2076,11 @@ WC_EXPORT wc_info_t *wc_get_info(void) {
      * not been given a domain to allow. */
     WC_FILL_INFO(WC_FLAG_DEBUG | WC_FLAG_DETERMINISTIC | WC_FLAG_POINTER |
                  WC_FLAG_NET_PEER);
+    /* WC_FILL_INFO stamps the compile-time DEFAULTs; the cart's conf.lua may
+     * have chosen otherwise. The host re-reads this struct after wc_init
+     * precisely so a boot-time resolution choice can land. */
+    wc_info.width  = (uint32_t)scr_w;
+    wc_info.height = (uint32_t)scr_h;
     wc_info.audio_sample_rate = 48000;
 #ifdef WCL_USE_GL
     wc_info.gpu_api = 1;  /* WebGL2/GLES3: we present via wc_gl_blit */
@@ -2043,9 +2107,12 @@ WC_EXPORT_INIT void wc_init(void) {
      * windfield-shaped collider API on top of it */
     wcl_open_physics(L);
 
+    /* the cart's resolution choice, before anything captures the dims */
+    apply_conf();
+
     /* screen dims for the prelude */
-    lua_pushinteger(L, DEFAULT_WIDTH);  lua_setglobal(L, "__WC_WIDTH");
-    lua_pushinteger(L, DEFAULT_HEIGHT); lua_setglobal(L, "__WC_HEIGHT");
+    lua_pushinteger(L, scr_w);  lua_setglobal(L, "__WC_WIDTH");
+    lua_pushinteger(L, scr_h);  lua_setglobal(L, "__WC_HEIGHT");
 
     int prelude_ok;
     if (wc_asset_size("prelude.lua", 11) > 0) {
@@ -2062,7 +2129,7 @@ WC_EXPORT_INIT void wc_init(void) {
      * art in a canvas during load; with the backend not yet initialized
      * wcl_r2d_target failed, tripped the sticky fallback, and the cart ran
      * on the software rasterizer for its whole life. */
-    wcl_r2d_init(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+    wcl_r2d_init(scr_w, scr_h);
 #endif
 
     if (run_source("main.lua") != 0) return;
@@ -2077,7 +2144,7 @@ WC_EXPORT_RENDER void wc_render(void) {
     dbg_draw_calls = 0;
 
 #ifdef WCL_ENABLE_GL2D
-    wcl_r2d_init(DEFAULT_WIDTH, DEFAULT_HEIGHT);   /* no-op after the first */
+    wcl_r2d_init(scr_w, scr_h);   /* no-op after the first */
     /* Returns 0 in sticky cpu_mode, in which case every draw below takes the
      * software path and wcl_r2d_end blits the finished framebuffer. */
     if (wcl_r2d_begin(frame_clear_color)) {
@@ -2117,7 +2184,7 @@ WC_EXPORT_RENDER void wc_render(void) {
         /* CPU-drawn, so the frame has to be presented via the blit path. */
         wcl_r2d_disable();
         /* LOVE-style error screen: blue, readable, keeps the cart alive */
-        for (int i = 0; i < DEFAULT_WIDTH * DEFAULT_HEIGHT; i++)
+        for (int i = 0; i < scr_w * scr_h; i++)
             wc_framebuffer[i] = 0x00201F6E;
         cur_r = 255; cur_g = 255; cur_b = 255; cur_a = 255;
         draw_bitfont(48, 48, "LUA ERROR - SEE LOG", 4, 0x00FFFFFF, 255);

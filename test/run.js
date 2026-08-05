@@ -112,6 +112,12 @@ async function runCart(wasmPath, appDir, frames, opts = {}) {
   const t0 = process.hrtime.bigint();
   try {
     e.wc_init();
+    // Re-read the info struct, exactly as the real host does: a cart may pick
+    // its resolution during wc_init (conf.lua), and reading the pre-init
+    // values here would score the histogram over the wrong extent.
+    info.w = dv().getUint32(infoPtr + 4, true);
+    info.h = dv().getUint32(infoPtr + 8, true);
+    info.fbPtr = dv().getUint32(infoPtr + 12, true);
     for (let i = 0; i < frames; i++) {
       if (opts.input) opts.input(i, new DataView(mem.buffer), infoPtr);
       e.wc_render();
@@ -249,6 +255,40 @@ async function main() {
       failed++;
     } else {
       console.log(`\nok    unit         ${unitTotal} assertions passed in-engine`);
+    }
+  }
+
+  // ── conf.lua resolution selection ─────────────────────────────────
+  // A cart that ships conf.lua picks its own resolution (up to 1920x1080);
+  // everything else stays at the 1280x720 default (the unit cart above and
+  // every example assert that side). This cart asks for 1600x900 and the
+  // checks are ordered to localize a break: reported dims first, then the
+  // cart's own Lua-visible dims, then a corner-pixel probe that only passes
+  // if the framebuffer STRIDE matches the reported width.
+  {
+    const rc = await runCart(ENGINE, path.join(ROOT, 'test', 'confres'), 2);
+    const w = rc.info.w, h = rc.info.h;
+    const px = new Uint32Array(rc.fb.buffer, rc.fb.byteOffset, w * h);
+    const corner = px[(h - 1) * w + (w - 1)] & 0xffffff;   // inside the marker
+    const inside = px[850 * w + 1550] & 0xffffff;          // marker center
+    const bg     = px[0] & 0xffffff;                       // top-left: background
+    if (rc.trap || rc.fields.lua_ok === 0) {
+      console.log(`\nFAIL  confres      did not run: ${rc.trap || 'lua error'}`);
+      for (const l of rc.logs.slice(0, 10)) console.log(`      ${l}`);
+      failed++;
+    } else if (w !== 1600 || h !== 900) {
+      console.log(`\nFAIL  confres      conf.lua ignored: info reports ${w}x${h}, want 1600x900`);
+      failed++;
+    } else if (rc.fields.score > 0) {
+      console.log(`\nFAIL  confres      ${rc.fields.score}/${rc.fields.aux} in-cart assertions failed`);
+      for (const l of rc.logs.filter(l => l.includes('FAIL'))) console.log(`      ${l}`);
+      failed++;
+    } else if (corner !== inside || corner === bg) {
+      console.log(`\nFAIL  confres      stride mismatch: corner=#${corner.toString(16)} ` +
+        `marker=#${inside.toString(16)} bg=#${bg.toString(16)}`);
+      failed++;
+    } else {
+      console.log(`ok    confres      cart chose 1600x900; stride and dims agree`);
     }
   }
 

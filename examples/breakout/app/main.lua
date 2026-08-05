@@ -117,7 +117,69 @@ function love.update(dt)
   love.debugValue(1, lives)
 end
 
+-- ── Pointer trace (romdev playtest verification) ─────────────────────────
+-- Dot where a pointer is pressed, line while it drags. Draws EVERY pointer
+-- slot, not just slot 0: slot 0 is the mouse, slots 1-9 are touch fingers, so
+-- a multi-finger drag shows several strokes at once. That is the whole point
+-- of drawing it -- a cart that only reads pointer[0] looks fine with a mouse
+-- and ignores every touch on a phone.
+local strokes = {}          -- finished strokes, kept so the marks persist
+local live = {}             -- slot -> stroke currently being drawn
+local SLOT_HUE = { [0] = { 1, 0.35, 0.35 }, { 0.4, 1, 0.5 }, { 0.4, 0.7, 1 },
+                   { 1, 0.9, 0.3 }, { 1, 0.5, 1 }, { 0.5, 1, 1 },
+                   { 1, 0.7, 0.4 }, { 0.7, 0.6, 1 }, { 0.6, 1, 0.8 }, { 1, 1, 1 } }
+
+local function trace_pointers()
+  for slot = 0, 9 do
+    local px, py, buttons, active = wc.pointer(slot)
+    local down = active and buttons ~= 0
+    if down then
+      local s = live[slot]
+      if not s then
+        s = { slot = slot, pts = { { px, py } } }
+        live[slot] = s
+        strokes[#strokes + 1] = s
+        -- Keep the canvas from filling up over a long session.
+        if #strokes > 40 then table.remove(strokes, 1) end
+      else
+        local last = s.pts[#s.pts]
+        -- Only record real movement, so a held-still click stays a dot.
+        if math.abs(px - last[1]) > 1 or math.abs(py - last[2]) > 1 then
+          s.pts[#s.pts + 1] = { px, py }
+        end
+      end
+    else
+      live[slot] = nil
+    end
+  end
+end
+
+local function draw_pointer_trace()
+  for _, s in ipairs(strokes) do
+    local c = SLOT_HUE[s.slot] or { 1, 1, 1 }
+    love.graphics.setColor(c[1], c[2], c[3])
+    if #s.pts == 1 then
+      -- A click that never moved: a dot.
+      love.graphics.circle("fill", s.pts[1][1], s.pts[1][2], 9)
+    else
+      -- A drag: the path it took, plus a dot at the start so the origin is
+      -- still visible.
+      love.graphics.circle("fill", s.pts[1][1], s.pts[1][2], 6)
+      for i = 2, #s.pts do
+        local a, b = s.pts[i - 1], s.pts[i]
+        love.graphics.line(a[1], a[2], b[1], b[2])
+      end
+      local tip = s.pts[#s.pts]
+      love.graphics.circle("fill", tip[1], tip[2], 4)
+    end
+  end
+end
+
 function love.draw()
+  -- Sampled here rather than in love.update: both run once per frame, and
+  -- these locals are declared above love.draw but below love.update.
+  trace_pointers()
+
   for _, b in ipairs(bricks) do
     if b.alive then
       love.graphics.setColor(0.4 + b.hue * 0.6, 0.9 - b.hue * 0.5, 1 - b.hue * 0.4)
@@ -137,4 +199,8 @@ function love.draw()
   elseif state == "won" then
     love.graphics.print("CLEARED! - press A to play again", W / 2 - 280, H / 2)
   end
+
+  -- ABSOLUTELY LAST: the trace must sit on top of everything, including the
+  -- game-over text, or a click behind an overlay looks like it did nothing.
+  draw_pointer_trace()
 end

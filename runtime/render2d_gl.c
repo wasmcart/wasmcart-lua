@@ -119,7 +119,7 @@ static GLint rad_attr;
 
 #define MAX_TEXTURES 64
 static texture_t textures[MAX_TEXTURES];
-#define ATLAS_SIZE 2048
+#define ATLAS_SIZE 4096   /* 2048 (4.2M px) was sized for 720p; a 1080p cart's art set exceeds it */
 static GLuint atlas_texture;
 static int atlas_x, atlas_y, atlas_row_h;
 
@@ -976,7 +976,12 @@ int wcl_r2d_begin(uint32_t clear_color) {
 }
 
 /* XRGB u32 framebuffer -> RGBA bytes for the fallback blit texture. */
-static uint32_t blit_rgba[1280 * 720];
+/* Sized from the engine's max resolution (runtime.c MAX_WIDTH/MAX_HEIGHT).
+ * Hardcoding 1280*720 here silently capped every cart at 720p. */
+#ifndef WCL_MAX_PIXELS
+#define WCL_MAX_PIXELS (1920 * 1080)
+#endif
+static uint32_t blit_rgba[WCL_MAX_PIXELS];
 
 void wcl_r2d_end(const uint32_t *fb) {
     if (wcl_r2d_active()) {
@@ -1362,8 +1367,11 @@ static texture_t *get_texture(const void *pixels, int w, int h) {
         WC_LOG("atlas-upload");
         glTexSubImage2D(GL_TEXTURE_2D, 0, atlas_x, atlas_y, w, h,
                         GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-        atlas_x += w;
-        if (h > atlas_row_h) atlas_row_h = h;
+        /* 2px gutter: packed edge-to-edge, bilinear sampling at a sprite's
+         * border blends in the NEIGHBORING entry's texels (visible as a
+         * colored fringe around alpha-soft art, e.g. portrait vignettes). */
+        atlas_x += w + 2;
+        if (h + 2 > atlas_row_h) atlas_row_h = h + 2;
         return t;
     }
     return NULL;

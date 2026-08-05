@@ -4,8 +4,20 @@ Every function the engine provides. Anything not listed here does not exist;
 if it exists in LÖVE and not here, calling it either errors loudly or is
 absent. See the README for the v1 cut list.
 
-Screen is **1280x720**, **top-left origin**, y grows down. Colors are
-**0..1 floats**.
+Screen is **1280x720** by default, **top-left origin**, y grows down. Colors
+are **0..1 floats**. A cart can pick its own resolution (up to **1920x1080**)
+by shipping an `app/conf.lua`, LOVE's way:
+
+```lua
+-- conf.lua: runs before the prelude and before love.load
+function love.conf(t)
+  t.window.width  = 1920
+  t.window.height = 1080
+end
+```
+
+The choice is made once at boot; `love.window.setMode` at runtime is still
+accepted-and-ignored.
 
 ## Callbacks
 
@@ -474,9 +486,19 @@ love.math.noise(x, [y])     -- value noise, 0..1
 love.math.setRandomSeed()   -- no-op: the HOST owns the seed
 ```
 
-`math.random` is replaced with the same deterministic generator, and
-`math.randomseed` is a no-op, so library code that uses the stdlib RNG is
-deterministic too.
+`math.random` is replaced with the same generator, and `math.randomseed`
+is a no-op, so library code that uses the stdlib RNG follows the host seed
+too.
+
+**Where the seed comes from.** The engine exports `wc_set_seed(u32)` and
+draws ALL randomness from that one host-provided seed. A current wasmcart
+host seeds it with fresh entropy on every normal load (different shuffle
+every power-on) and pins it only for `--seed` / `deterministic` replay
+runs. On hosts older than 2026-08 the normal-load seeding is missing —
+every boot then replays the same "random" sequence. Carts that must behave
+on old hosts can stir human input timing into their own PRNG (nobody
+presses a button on the same frame twice); see cardtable/cards.lua in the
+casino carts for the pattern.
 
 ## love.timer
 
@@ -530,7 +552,8 @@ with `wasm({op:'debugState'})` — no vision required.
 ```lua
 love.window.getWidth() / getHeight() / getDimensions()
 love.window.setTitle(s)     -- accepted, ignored
-love.window.setMode(...)    -- accepted, ignored; resolution is fixed
+love.window.setMode(...)    -- accepted, ignored; resolution is chosen once
+                            -- at boot by conf.lua (see the top of this file)
 love.system.getOS()         -- "wasmcart"
 love.event.quit()           -- logged and ignored: cartridges don't exit
 ```
