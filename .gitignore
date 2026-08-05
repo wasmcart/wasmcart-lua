@@ -17,6 +17,9 @@ runtime/prelude.inc
 
 # packed carts are per-user output, not source
 build/*.wasc
+
+# the networking suite's scratch dir (cleaned per run; survives a crash)
+test/.net-work/
 examples/*/*.wasc
 examples/*/main.wasm
 ports/*/*.wasc
