@@ -1350,6 +1350,29 @@ void wcl_r2d_shader_use(int handle) {
 
 int wcl_r2d_shader_active(void) { return active_shader >= 0; }
 
+/* Re-establish the bound shader's sampler units.
+ *
+ * A texture unit's binding is GLOBAL state, not program state, so anything
+ * that binds a texture between Shader:send and the draw silently steals the
+ * unit -- and every 3D mesh draw binds its own texture on unit 0, while a
+ * render target bind or an atlas upload can touch others. The 2D path
+ * re-establishes these on every program switch; a 3D mesh draw never
+ * switches programs, so it needs to ask for the same thing explicitly.
+ *
+ * The symptom this fixes is brutal to chase: the pixels are right, the UVs
+ * are right, the uniform is bound and sent, and the sampler still reads the
+ * wrong texture. 3DreamEngine hits it on every textured mesh. */
+void wcl_r2d__rebind_samplers(void) {
+    if (active_shader < 0) return;
+    for (int i = 0; i < SHADER_TEX_UNITS; i++) {
+        shader_sampler_t *s = &shader_samplers[active_shader][i];
+        if (!s->used) continue;
+        glActiveTexture((GLenum)(GL_TEXTURE0 + s->unit));
+        glBindTexture(s->textarget ? s->textarget : GL_TEXTURE_2D, s->tex);
+    }
+    glActiveTexture(GL_TEXTURE0);
+}
+
 /* Uniform writes go to the named program, which must be current for the call
  * to land, so the previous program is restored afterwards. LOVE lets a cart
  * send to a shader that is not bound, and games do exactly that during load. */
@@ -1468,6 +1491,7 @@ int wcl_r2d_shader_send_image(int handle, const char *name,
      * and it is reported rather than silently sampling the whole atlas. */
     target_t *tgt = target_find(pixels);
     GLuint tex;
+
     if (tgt) {
         tex = tgt->tex;
     } else {
@@ -1510,6 +1534,7 @@ int wcl_r2d_shader_send_image(int handle, const char *name,
     s->tex = tex;
     s->unit = idx + 1;
     s->used = 1;
+
 
     flush_batches();   /* a pending batch was queued with the old binding */
     glUseProgram(sh->program);
@@ -2508,6 +2533,16 @@ int wcl_r2d_mesh(const float *verts, int count,
     set_blend(!opaque);
     if (mode) bind_texture(tex);
     set_textured(mode);
+    /* A texture unit's binding is GLOBAL, and bind_texture just claimed unit
+     * 0. Every mesh drawn this frame does the same, so by the time a cart's
+     * shader runs, the sampler units it was given at Shader:send time may be
+     * bound to someone else's texture. Re-establish them here.
+     *
+     * 3DreamEngine hits this on every textured mesh: it sends its material
+     * samplers once per material switch and then draws many meshes, so all
+     * but the first sample whatever was bound last. The symptom is a
+     * correctly lit, correctly UV-mapped, SOLID WHITE surface. */
+    wcl_r2d__rebind_samplers();
     glBindBuffer(GL_ARRAY_BUFFER, buffer);
 
     for (int base = 0; base < count; base += MESH_CHUNK) {
@@ -2625,6 +2660,20 @@ void wcl_r2d_forget(const void *key) {
     if (t) { t->used = 0; t->key = NULL; }
     for (int i = 0; i < MAX_TEXTURES; i++)
         if (textures[i].used && textures[i].pixels == key) textures[i].used = 0;
+    /* Shader SAMPLER textures are a SECOND cache, also keyed by the pixel
+     * pointer, and forgetting only the draw-path cache left them stale
+     * forever: an ImageData painted with setPixel and then handed to a
+     * shader kept sampling whatever the texture held when it was first
+     * uploaded -- for a freshly allocated ImageData, solid white. The pixels
+     * were right, the UVs were right, and the picture was blank. */
+    for (int i = 0; i < MAX_SAMPLER_TEX; i++) {
+        if (sampler_texs[i].used && sampler_texs[i].key == key) {
+            glDeleteTextures(1, &sampler_texs[i].tex);
+            sampler_texs[i].used = 0;
+            sampler_texs[i].key = NULL;
+            sampler_texs[i].tex = 0;
+        }
+    }
 }
 
 /* Scissor. glScissor's origin is bottom-left, the cart's is top-left, so the

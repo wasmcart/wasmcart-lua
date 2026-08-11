@@ -36,6 +36,7 @@
 extern void   wcl_r2d__flush_for_3d(void);
 extern GLuint wcl_r2d__active_program(void);
 extern void   wcl_r2d__rebind_2d_state(void);
+extern void   wcl_r2d__rebind_samplers(void);
 extern void   wcl_r2d__invalidate_texture_binding(void);
 extern GLuint wcl_r2d__upload_standalone(const void *pixels, int w, int h);
 extern int    wcl_r2d_active(void);
@@ -1025,6 +1026,15 @@ static int mesh_draw_common(int handle, uint32_t tint, int alpha, int instances)
         glBindTexture(GL_TEXTURE_2D, m->tex);
         wcl_r2d__invalidate_texture_binding();
     }
+
+    /* A texture unit's binding is GLOBAL, so anything that bound a texture
+     * since Shader:send -- including the unit-0 bind just above, and every
+     * other mesh drawn this frame -- can have stolen a unit out from under
+     * the cart's samplers. Re-establish them immediately before the draw.
+     * Without this a textured 3D mesh samples whatever happens to be bound,
+     * which renders as a solid white (or last-texture) surface with no
+     * error anywhere. */
+    wcl_r2d__rebind_samplers();
 
     /* The three engine-supplied uniforms, looked up once per program rather
      * than three times per draw. glGetUniformLocation is a string lookup and

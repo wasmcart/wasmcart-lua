@@ -297,6 +297,31 @@ async function main() {
     }
   }
 
+  // ── a shader sampler must see setPixel writes ─────────────────────
+  // Sampler textures are a SECOND pointer-keyed cache; forgetting only the
+  // draw-path one left an edited ImageData sampling as solid white. Gated on
+  // real pixels because every intermediate signal looked healthy.
+  if (fs.existsSync(GL_ENGINE)) {
+    const { execFileSync } = require('child_process');
+    try {
+      const out = execFileSync(process.execPath,
+        [path.join(ROOT, 'tools', 'gl-samplerupdate-verify.mjs'),
+         GL_ENGINE, path.join(ROOT, 'test', 'samplerupdate'), '6'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      const m = out.match(/red=(\d+)/);
+      console.log(`ok    samplerupd   a repainted ImageData re-uploads (${m ? m[1] : '?'} px)`);
+    } catch (err) {
+      const txt = (err.stdout || '') + (err.stderr || '');
+      if (/Cannot find|ERR_MODULE_NOT_FOUND|createWebGL2Context/.test(txt)) {
+        console.log('skip  samplerupd   no GL context available on this machine');
+      } else {
+        console.log('\nFAIL  samplerupd   a shader sampler is showing a stale texture');
+        for (const l of txt.trim().split('\n').slice(-4)) console.log(`      ${l}`);
+        failed++;
+      }
+    }
+  }
+
   // ── conf.lua resolution selection ─────────────────────────────────
   // A cart that ships conf.lua picks its own resolution (up to 1920x1080);
   // everything else stays at the 1280x720 default (the unit cart above and

@@ -1,0 +1,9 @@
+{
+  "name": "samplerupdate",
+  "version": "1.0.0",
+  "abi": 3,
+  "entry": "../../build/engine.wasm",
+  "assets": "./",
+  "width": 640,
+  "height": 360
+}
