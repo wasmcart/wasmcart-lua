@@ -155,7 +155,19 @@ local function writeField(self, byteOffset, ctype, value)
   -- Integer formats reject a float, which is exactly the case a caller hits
   -- when it stores a computed index; floor rather than error, matching what
   -- a C assignment does.
-  if sc.fmt ~= "f" and sc.fmt ~= "d" then value = math.floor(value or 0) end
+  if sc.fmt ~= "f" and sc.fmt ~= "d" then
+    value = value or 0
+    -- NaN and the infinities floor to themselves, and string.pack rejects
+    -- them for an integer format. Real geometry produces them (a tangent at
+    -- a sphere's pole is a 0/0), and C would store SOME byte rather than
+    -- abort, so clamp instead of throwing from deep inside a vertex loop.
+    if value ~= value then
+      value = 0
+    else
+      value = math.floor(value)
+      if value ~= value or value == math.huge or value == -math.huge then value = 0 end
+    end
+  end
   local packed = string.pack("<" .. sc.fmt, value or 0)
   for i = 1, sc.size do
     self.data[byteOffset + i] = packed:byte(i)

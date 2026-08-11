@@ -280,6 +280,23 @@ async function main() {
     }
   }
 
+  // ── ffi shim: non-finite values into integer fields ───────────────
+  const nanDir = path.join(ROOT, 'test', 'ffinan');
+  if (fs.existsSync(path.join(nanDir, 'main.lua'))) {
+    const rn = await runCart(ENGINE, nanDir, 2);
+    if (rn.trap || rn.fields.lua_ok === 0) {
+      console.log(`\nFAIL  ffinan did not run: ${rn.trap || 'lua error'}`);
+      for (const l of rn.logs.slice(0, 10)) console.log(`      ${l}`);
+      failed++;
+    } else if (rn.fields.score > 0) {
+      console.log(`\nFAIL  ffinan  ${rn.fields.score}/${rn.fields.aux} assertions failed`);
+      for (const l of rn.logs.filter(l => l.startsWith('FAIL'))) console.log(`      ${l}`);
+      failed++;
+    } else {
+      console.log(`ok    ffinan       ${rn.fields.aux} non-finite writes handled`);
+    }
+  }
+
   // ── conf.lua resolution selection ─────────────────────────────────
   // A cart that ships conf.lua picks its own resolution (up to 1920x1080);
   // everything else stays at the 1280x720 default (the unit cart above and
