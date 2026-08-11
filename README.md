@@ -179,9 +179,10 @@ love.audio.beep(440)                               -- generated square, no asset
 
 ### love.physics (Box2D v3)
 
-Real rigid-body physics: **Box2D 3.2.0** compiled with wasm SIMD
-(`-msimd128 -msse2`, so the solver is genuinely vectorized, not scalar
-fallback). Two APIs over the same engine:
+Real rigid-body physics: **Box2D v3** (pinned by SHA — no released tag has
+the API this binds) compiled with SIMD: `-msimd128` for wasm, NEON on
+arm64, AVX2 on x86_64, so the solver is genuinely vectorized rather than
+scalar fallback. Two APIs over the same engine:
 
 ```lua
 -- windfield-style (what most LOVE games use), provided natively as `wf`
@@ -200,6 +201,35 @@ love.physics.stats()               -- { simd = "wasm-simd128", bodies = n }
 
 Multiple independent worlds are supported (a zero-gravity gameplay world
 alongside a gravity world for debris is a common real pattern).
+
+### b3 (Box3D)
+
+3D rigid bodies, from Erin Catto's Box3D, bound as the global `b3` and
+shaped like the 2D binding — same handles, same pixels/meter, same
+argument order.
+
+```lua
+local w    = b3.world_new(0, -640, 0)        -- gravity in px/s^2
+local ball = b3.body_new(w, 0, 500, 0)       -- dynamic by default
+b3.shape_sphere(ball, 30)
+b3.world_step(w, 1/60)
+local x, y, z = b3.body_position(ball)
+
+b3.info()   -- { simd = "neon", threads = true, workers = 12 }
+```
+
+**Threads are real where the build has them.** One worker pool serves both
+libraries (their task contracts are identical): pthreads natively, and a
+serial solver under plain wasm, where worker threads would need
+SharedArrayBuffer and a host willing to provide it. Results are identical
+either way — `examples/physics` asserts the same numbers on both targets.
+
+**Rendering 3D is not solved yet.** The renderer is 2D: vertex positions
+are `vec2`, there is no depth buffer, and custom vertex formats are
+refused. A cart can project `b3` positions itself and draw sorted sprites
+or meshes (2.5D, and genuinely playable), but true depth-tested 3D needs
+renderer work that has not happened. Full API in
+[docs/api.md](docs/api.md#b3-box3d).
 
 ### love.net (multiplayer)
 

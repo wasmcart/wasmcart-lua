@@ -443,6 +443,52 @@ loads a PNG instead. That cart exists precisely because a cart which trips
 the fallback measures the software path on **both** engines and reports a
 perfect match while proving nothing -- `test/prims` does exactly that.
 
+## Physics: two libraries, one worker pool
+
+Box2D v3 (`physics.c` -> the global `b2`) and Box3D (`physics3d.c` -> `b3`)
+are both plain C with opaque-handle APIs, which is exactly why they are
+good embedding targets. Both are pinned by **SHA, not tag**: `physics.c`
+calls `b2Body_SetMotionLocks` and Box3D has no releases at all, so a tag
+pin here was silently broken for anyone without a stale `vendor/` — it
+built only where an old archive happened to sit.
+
+Their task contracts are identical (`enqueue(task, ctx, userCtx)` returning
+a handle, `finish(handle, userCtx)` blocking on it), so `wc_taskpool.c` is
+one pool serving both:
+
+- **native**: real pthreads, one worker per hardware thread.
+- **wasm**: serial. Worker threads need SharedArrayBuffer and a host that
+  can hand it over, so `enqueue` runs the task inline and returns NULL —
+  which both libraries define as "already ran it, don't wait". Correct, and
+  measurably identical: `examples/physics` asserts the same numbers on both
+  targets.
+
+The pool never blocks a worker on another task. The thread waiting inside
+`finish` drains pending work itself, so a step that waits on its own
+sub-tasks cannot starve or deadlock the way a naive job system does.
+
+Both libraries time their own solver stages with `clock_gettime`, which
+emscripten lowers to the WASI import `clock_time_get`. A cart must import
+only `env` (see above), so `build.sh` patches that clock out for wasm
+builds and the profile fields read zero. The test harness catches this
+class of regression on its own: it fails any cart that touches WASI.
+
+## What the renderer cannot do yet: 3D
+
+Worth stating plainly now that `b3` can simulate 3D. The renderer is 2D:
+
+- vertex positions are `vec2`; the format is fixed `{x, y, u, v, r, g, b, a}`
+- there is no depth attachment and no depth test, on screen or on canvases
+- `newMesh(vertexformat, ...)` is refused, because one VAO is shared by
+  every program including cart shaders, so extra attributes (normals, a z)
+  have nowhere to go
+
+A cart can project 3D positions itself and draw back-to-front sprites or
+meshes — 2.5D, and enough for real games. True depth-tested 3D would need
+a z in the vertex, a depth buffer, exposed depth/cull state, and a second
+vertex layout. That is a change to the single-VAO assumption this file
+documents above, not a bolt-on.
+
 ## Input: gamepad first, always
 
 **wasmcart is a gamepad platform.** The host synthesizes a pad from the

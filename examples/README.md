@@ -13,6 +13,7 @@ verified rendering (not just "runs without crashing").
 | `kitchen-sink` | every v1 API in one screen; the contract example |
 | `shaders` | `newShader` / `setShader` / `send`; split-screen so a wrong result is obvious |
 | `mesh` | `newMesh`; each panel sits next to a reference it must match, so a wrong uv remap is visible |
+| `physics` | `b2` and `b3` from Lua; 18 self-checks over gravity, resting contact, impulses, shapes, quaternions and raycasts, printed as PASS/FAIL and drawn on screen |
 
 `shaders` and `mesh` are the two carts here that **need a GL host**: a shader
 is a GPU program and a mesh is GPU geometry, so `newShader` and `newMesh`
