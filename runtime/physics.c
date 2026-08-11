@@ -537,6 +537,237 @@ static int l_stats(lua_State *L) {
     return 1;
 }
 
+/* ── joints ─────────────────────────────────────────────────────────────
+ *
+ * Box2D's whole constraint vocabulary was unreachable from Lua: no hinge,
+ * no rope, no slider, no weld. That rules out most of what a 2D physics
+ * game is actually made of (ragdolls, vehicles, bridges, chains), so the
+ * five general-purpose joints are bound here.
+ *
+ * This Box2D uses local FRAMES (b2Transform) rather than the older plain
+ * anchor points, so the anchors a cart passes in world pixels are
+ * converted to each body's local space here. A cart should not have to
+ * know that detail to hang a door on a hinge. */
+#define MAX_JOINTS 2048
+typedef struct { b2JointId id; int active; int world; } joint_slot_t;
+static joint_slot_t joints[MAX_JOINTS];
+
+static int joint_alloc(b2JointId id, int world) {
+    for (int i = 0; i < MAX_JOINTS; i++) {
+        if (!joints[i].active) {
+            joints[i].id = id; joints[i].active = 1; joints[i].world = world;
+            return i + 1;
+        }
+    }
+    return 0;
+}
+
+static b2JointId joint_get(lua_State *L, int i) {
+    int h = (int)luaL_checkinteger(L, i);
+    if (h < 1 || h > MAX_JOINTS || !joints[h - 1].active)
+        luaL_error(L, "physics: invalid joint handle (%d)", h);
+    return joints[h - 1].id;
+}
+
+/* Fill the shared base of every joint def: the two bodies, and each
+ * body's local frame derived from a world-space anchor in pixels. */
+static void joint_base_from(lua_State *L, b2JointDef *base,
+                            int bodyA, int bodyB, int argAnchor) {
+    body_slot_t *ba = &bodies[bodyA - 1];
+    body_slot_t *bb = &bodies[bodyB - 1];
+    base->bodyIdA = ba->id;
+    base->bodyIdB = bb->id;
+    b2Vec2 anchor;
+    anchor.x = px2m(luaL_optnumber(L, argAnchor, 0));
+    anchor.y = px2m(luaL_optnumber(L, argAnchor + 1, 0));
+    base->localFrameA.p = b2Body_GetLocalPoint(ba->id, anchor);
+    base->localFrameA.q = b2Rot_identity;
+    base->localFrameB.p = b2Body_GetLocalPoint(bb->id, anchor);
+    base->localFrameB.q = b2Rot_identity;
+    base->collideConnected = lua_toboolean(L, argAnchor + 2);
+}
+
+static int two_bodies(lua_State *L, int *a, int *b) {
+    *a = (int)luaL_checkinteger(L, 2);
+    *b = (int)luaL_checkinteger(L, 3);
+    if (*a < 1 || *a > MAX_BODIES || !bodies[*a - 1].active)
+        return luaL_error(L, "physics: invalid body handle (%d)", *a);
+    if (*b < 1 || *b > MAX_BODIES || !bodies[*b - 1].active)
+        return luaL_error(L, "physics: invalid body handle (%d)", *b);
+    return 0;
+}
+
+/* b2.joint_revolute(world, bodyA, bodyB, ax, ay [, collide]) -> handle
+ * A hinge: the two bodies share a pivot point. */
+static int l_joint_revolute(lua_State *L) {
+    int wh = (int)luaL_checkinteger(L, 1);
+    b2WorldId world = world_get(L, wh);
+    int a, b; two_bodies(L, &a, &b);
+    b2RevoluteJointDef def = b2DefaultRevoluteJointDef();
+    joint_base_from(L, &def.base, a, b, 4);
+    int h = joint_alloc(b2CreateRevoluteJoint(world, &def), wh);
+    if (!h) return luaL_error(L, "physics: too many joints (max %d)", MAX_JOINTS);
+    lua_pushinteger(L, h);
+    return 1;
+}
+
+/* b2.joint_distance(world, bodyA, bodyB, ax, ay, length [, collide]) */
+static int l_joint_distance(lua_State *L) {
+    int wh = (int)luaL_checkinteger(L, 1);
+    b2WorldId world = world_get(L, wh);
+    int a, b; two_bodies(L, &a, &b);
+    b2DistanceJointDef def = b2DefaultDistanceJointDef();
+    joint_base_from(L, &def.base, a, b, 4);
+    /* A distance joint measures between the two local frames, so unlike a
+     * hinge the frames must NOT be the same world point: anchoring both at
+     * one spot leaves a zero-length separation and the rest length has
+     * nothing to act on (the bodies just hold their initial spacing).
+     * Frame A stays at the given anchor; frame B rides body B's origin. */
+    def.base.localFrameB.p = (b2Vec2){ 0.0f, 0.0f };
+    def.length = px2m(luaL_optnumber(L, 6, 32.0));
+    if (def.length < 0.005f) def.length = 0.005f;
+    int h = joint_alloc(b2CreateDistanceJoint(world, &def), wh);
+    if (!h) return luaL_error(L, "physics: too many joints (max %d)", MAX_JOINTS);
+    lua_pushinteger(L, h);
+    return 1;
+}
+
+/* b2.joint_prismatic(world, bodyA, bodyB, ax, ay, axisX, axisY [, collide])
+ * A slider along an axis. */
+static int l_joint_prismatic(lua_State *L) {
+    int wh = (int)luaL_checkinteger(L, 1);
+    b2WorldId world = world_get(L, wh);
+    int a, b; two_bodies(L, &a, &b);
+    b2PrismaticJointDef def = b2DefaultPrismaticJointDef();
+    joint_base_from(L, &def.base, a, b, 4);
+    /* The slide axis is encoded as the local frames' rotation. */
+    float ax = (float)luaL_optnumber(L, 6, 1.0);
+    float ay = (float)luaL_optnumber(L, 7, 0.0);
+    float len = sqrtf(ax * ax + ay * ay);
+    if (len < 1e-6f) { ax = 1.0f; ay = 0.0f; len = 1.0f; }
+    b2Vec2 unit = { ax / len, ay / len };
+    b2Rot r = b2MakeRotFromUnitVector(unit);
+    def.base.localFrameA.q = b2InvMulRot(b2Body_GetRotation(bodies[a - 1].id), r);
+    def.base.localFrameB.q = b2InvMulRot(b2Body_GetRotation(bodies[b - 1].id), r);
+    int h = joint_alloc(b2CreatePrismaticJoint(world, &def), wh);
+    if (!h) return luaL_error(L, "physics: too many joints (max %d)", MAX_JOINTS);
+    lua_pushinteger(L, h);
+    return 1;
+}
+
+/* b2.joint_weld(world, bodyA, bodyB, ax, ay [, collide]) — rigid glue */
+static int l_joint_weld(lua_State *L) {
+    int wh = (int)luaL_checkinteger(L, 1);
+    b2WorldId world = world_get(L, wh);
+    int a, b; two_bodies(L, &a, &b);
+    b2WeldJointDef def = b2DefaultWeldJointDef();
+    joint_base_from(L, &def.base, a, b, 4);
+    int h = joint_alloc(b2CreateWeldJoint(world, &def), wh);
+    if (!h) return luaL_error(L, "physics: too many joints (max %d)", MAX_JOINTS);
+    lua_pushinteger(L, h);
+    return 1;
+}
+
+/* b2.joint_motor(world, bodyA, bodyB [, collide]) — drives B toward a
+ * target offset from A; the usual top-down "move this body" constraint. */
+static int l_joint_motor(lua_State *L) {
+    int wh = (int)luaL_checkinteger(L, 1);
+    b2WorldId world = world_get(L, wh);
+    int a, b; two_bodies(L, &a, &b);
+    b2MotorJointDef def = b2DefaultMotorJointDef();
+    def.base.bodyIdA = bodies[a - 1].id;
+    def.base.bodyIdB = bodies[b - 1].id;
+    def.base.collideConnected = lua_toboolean(L, 4);
+    int h = joint_alloc(b2CreateMotorJoint(world, &def), wh);
+    if (!h) return luaL_error(L, "physics: too many joints (max %d)", MAX_JOINTS);
+    lua_pushinteger(L, h);
+    return 1;
+}
+
+static int l_joint_destroy(lua_State *L) {
+    int h = (int)luaL_checkinteger(L, 1);
+    if (h < 1 || h > MAX_JOINTS || !joints[h - 1].active) return 0;
+    b2DestroyJoint(joints[h - 1].id, true);
+    joints[h - 1].active = 0;
+    return 0;
+}
+
+/* Reaction force/torque: how hard a joint is working. A rope bridge that
+ * snaps under load needs this. */
+static int l_joint_force(lua_State *L) {
+    b2Vec2 f = b2Joint_GetConstraintForce(joint_get(L, 1));
+    lua_pushnumber(L, m2px(f.x));
+    lua_pushnumber(L, m2px(f.y));
+    return 2;
+}
+static int l_joint_torque(lua_State *L) {
+    lua_pushnumber(L, b2Joint_GetConstraintTorque(joint_get(L, 1)));
+    return 1;
+}
+
+/* ── post-creation shape material ──────────────────────────────────────
+ * shape_def_from() covers creation time, but a cart that wants ice to get
+ * slippery mid-level, or a ball to lose its bounce, had no way to say so. */
+static b2ShapeId shape_get_id(lua_State *L, int i) {
+    int h = (int)luaL_checkinteger(L, i);
+    if (h < 1 || h > MAX_SHAPES || !shapes[h - 1].active)
+        luaL_error(L, "physics: invalid shape handle (%d)", h);
+    return shapes[h - 1].id;
+}
+static int l_shape_set_friction(lua_State *L) {
+    b2Shape_SetFriction(shape_get_id(L, 1), (float)luaL_checknumber(L, 2));
+    return 0;
+}
+static int l_shape_get_friction(lua_State *L) {
+    lua_pushnumber(L, b2Shape_GetFriction(shape_get_id(L, 1)));
+    return 1;
+}
+static int l_shape_set_restitution(lua_State *L) {
+    b2Shape_SetRestitution(shape_get_id(L, 1), (float)luaL_checknumber(L, 2));
+    return 0;
+}
+static int l_shape_get_restitution(lua_State *L) {
+    lua_pushnumber(L, b2Shape_GetRestitution(shape_get_id(L, 1)));
+    return 1;
+}
+static int l_shape_set_density2(lua_State *L) {
+    b2Shape_SetDensity(shape_get_id(L, 1), (float)luaL_checknumber(L, 2), true);
+    return 0;
+}
+
+/* ── body angular surface (2D counterpart of the b3 additions) ───────── */
+static int l_body_angular_velocity(lua_State *L) {
+    lua_pushnumber(L, b2Body_GetAngularVelocity(body_get(L, (int)luaL_checkinteger(L, 1))->id));
+    return 1;
+}
+static int l_body_set_angular_velocity(lua_State *L) {
+    b2Body_SetAngularVelocity(body_get(L, (int)luaL_checkinteger(L, 1))->id,
+                              (float)luaL_checknumber(L, 2));
+    return 0;
+}
+static int l_body_apply_torque(lua_State *L) {
+    b2Body_ApplyTorque(body_get(L, (int)luaL_checkinteger(L, 1))->id,
+                       (float)luaL_checknumber(L, 2), true);
+    return 0;
+}
+static int l_body_set_angular_damping(lua_State *L) {
+    b2Body_SetAngularDamping(body_get(L, (int)luaL_checkinteger(L, 1))->id,
+                             (float)luaL_checknumber(L, 2));
+    return 0;
+}
+static int l_body_is_awake(lua_State *L) {
+    lua_pushboolean(L, b2Body_IsAwake(body_get(L, (int)luaL_checkinteger(L, 1))->id));
+    return 1;
+}
+static int l_body_set_awake(lua_State *L) {
+    b2Body_SetAwake(body_get(L, (int)luaL_checkinteger(L, 1))->id, lua_toboolean(L, 2));
+    return 0;
+}
+static int l_body_enable_sleep(lua_State *L) {
+    b2Body_EnableSleep(body_get(L, (int)luaL_checkinteger(L, 1))->id, lua_toboolean(L, 2));
+    return 0;
+}
+
 static const luaL_Reg b2_lib[] = {
     { "world_new",        l_world_new },
     { "world_destroy",    l_world_destroy },
@@ -571,6 +802,29 @@ static const luaL_Reg b2_lib[] = {
     { "shape_segment",    l_shape_segment },
     { "shape_filter",     l_shape_filter },
     { "shape_is_sensor",  l_shape_set_sensor },
+
+    { "shape_set_friction",    l_shape_set_friction },
+    { "shape_get_friction",    l_shape_get_friction },
+    { "shape_set_restitution", l_shape_set_restitution },
+    { "shape_get_restitution", l_shape_get_restitution },
+    { "shape_set_density",     l_shape_set_density2 },
+
+    { "body_angular_velocity",     l_body_angular_velocity },
+    { "body_set_angular_velocity", l_body_set_angular_velocity },
+    { "body_apply_torque",         l_body_apply_torque },
+    { "body_set_angular_damping",  l_body_set_angular_damping },
+    { "body_is_awake",             l_body_is_awake },
+    { "body_set_awake",            l_body_set_awake },
+    { "body_enable_sleep",         l_body_enable_sleep },
+
+    { "joint_revolute",   l_joint_revolute },
+    { "joint_distance",   l_joint_distance },
+    { "joint_prismatic",  l_joint_prismatic },
+    { "joint_weld",       l_joint_weld },
+    { "joint_motor",      l_joint_motor },
+    { "joint_destroy",    l_joint_destroy },
+    { "joint_force",      l_joint_force },
+    { "joint_torque",     l_joint_torque },
 
     { "query_circle",     l_query_circle },
     { "query_box",        l_query_box },

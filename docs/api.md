@@ -731,8 +731,39 @@ c:destroy()
 ```
 
 Up to 4 independent worlds. Contacts are polled per step (`:enter` after
-`world:update`), not delivered by callback. Joints, ray casts, and
+`world:update`), not delivered by callback. Ray casts and
 preSolve/postSolve are not implemented and error clearly.
+
+### Joints and post-creation material (raw `b2`)
+
+Joints are reachable from the raw `b2` table (the `wf` collider wrapper
+does not expose them). Anchors are world-space pixels.
+
+```lua
+local j = b2.joint_revolute(world, bodyA, bodyB, ax, ay [, collide])
+local j = b2.joint_distance(world, bodyA, bodyB, ax, ay, length [, collide])
+local j = b2.joint_prismatic(world, bodyA, bodyB, ax, ay, axisX, axisY [, collide])
+local j = b2.joint_weld(world, bodyA, bodyB, ax, ay [, collide])
+local j = b2.joint_motor(world, bodyA, bodyB [, collide])
+b2.joint_destroy(j)
+b2.joint_force(j)    -- -> fx, fy   (how hard the constraint is working)
+b2.joint_torque(j)
+
+-- material after creation, not just in the shape def
+b2.shape_set_friction(shape, f)      b2.shape_get_friction(shape)
+b2.shape_set_restitution(shape, r)   b2.shape_get_restitution(shape)
+b2.shape_set_density(shape, d)
+
+b2.body_angular_velocity(body)       b2.body_set_angular_velocity(body, w)
+b2.body_apply_torque(body, t)        b2.body_set_angular_damping(body, d)
+b2.body_is_awake(body)               b2.body_set_awake(body, bool)
+b2.body_enable_sleep(body, bool)
+```
+
+A distance joint measures between the two bodies' local frames, so its
+anchor sets frame A while frame B rides body B's origin: passing one world
+point for both would leave zero separation and the rest length would have
+nothing to act on.
 
 ## b3 (Box3D)
 
@@ -766,6 +797,50 @@ b3.body_mass(body)
 b3.shape_box(body, hx, hy, hz [, density])       -- HALF-extents
 b3.shape_sphere(body, radius [, density])
 b3.shape_capsule(body, halfHeight, radius [, density])   -- along local Y
+b3.shape_destroy(shape)
+
+-- surface material. Box3D's defaults are friction 0.6, restitution 0,
+-- rolling resistance 0: a sensible crate, but NOT a ball. Without these a
+-- struck ball neither bounces off a wall nor ever coasts to a stop.
+b3.shape_set_material(shape, friction, restitution [, rollingResistance])
+b3.shape_set_friction(shape, f)            b3.shape_get_friction(shape)
+b3.shape_set_restitution(shape, r)         b3.shape_get_restitution(shape)
+b3.shape_set_rolling_resistance(shape, r)  b3.shape_get_rolling_resistance(shape)
+b3.shape_set_density(shape, d)             b3.shape_get_density(shape)
+
+-- damping bleeds speed the way cloth or air does
+b3.body_set_linear_damping(body, d)   b3.body_get_linear_damping(body)
+b3.body_set_angular_damping(body, d)  b3.body_get_angular_damping(body)
+
+b3.body_angular_velocity(body)               -- -> wx, wy, wz (rad/s)
+b3.body_set_angular_velocity(body, wx,wy,wz)
+b3.body_apply_torque(body, tx, ty, tz)
+b3.body_apply_angular_impulse(body, ix, iy, iz)
+b3.body_apply_impulse_at(body, ix,iy,iz, px,py,pz)   -- off-centre: english
+
+-- sleep answers "has everything settled?" -- how a turn-based physics game
+-- knows the shot is over
+b3.body_is_awake(body)             b3.body_set_awake(body, bool)
+b3.body_enable_sleep(body, bool)
+b3.body_set_sleep_threshold(body, pxPerSec)
+b3.body_get_sleep_threshold(body)
+
+b3.body_set_type(body, t)          b3.body_get_type(body)
+b3.body_set_bullet(body, bool)     b3.body_is_bullet(body)
+b3.body_set_gravity_scale(body, s) b3.body_get_gravity_scale(body)
+
+-- contact events. Hit events are OFF by default: opt each shape in, then
+-- read them once per step. `speed` is the approach speed in px/s, which is
+-- what a collision sound's volume should scale with.
+b3.shape_enable_hit_events(shape, bool)
+b3.shape_enable_contact_events(shape, bool)
+b3.world_set_hit_threshold(world, pxPerSec)  -- below this, no hit event
+b3.world_set_gravity(world, gx, gy, gz)
+
+local ev = b3.contact_events(world)
+-- ev.hits   = { {a=shape, b=shape, x=,y=,z=, nx=,ny=,nz=, speed=}, ... }
+-- ev.begins = { {a=shape, b=shape}, ... }
+-- ev.ends   = { {a=shape, b=shape}, ... }
 
 -- nil when nothing is hit
 local hx,hy,hz, nx,ny,nz, frac = b3.raycast(w, ox,oy,oz, dx,dy,dz)

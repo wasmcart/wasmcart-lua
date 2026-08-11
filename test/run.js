@@ -258,6 +258,28 @@ async function main() {
     }
   }
 
+  // ── b3 surface material / damping / sleep / contact events ────────
+  // Behavioural, not just presence: each case is one a pre-extension
+  // binding passes vacuously (restitution 0.9 and 0.0 bounced identically
+  // because neither was reachable from Lua).
+  const b3Dir = path.join(ROOT, 'test', 'b3mat');
+  if (fs.existsSync(path.join(b3Dir, 'main.lua'))) {
+    const rb = await runCart(ENGINE, b3Dir, 2);
+    const bFails = rb.fields.score;
+    const bTotal = rb.fields.aux;
+    if (rb.trap || rb.fields.lua_ok === 0) {
+      console.log(`\nFAIL  b3mat did not run: ${rb.trap || 'lua error'}`);
+      for (const l of rb.logs.slice(0, 12)) console.log(`      ${l}`);
+      failed++;
+    } else if (bFails > 0) {
+      console.log(`\nFAIL  b3mat  ${bFails}/${bTotal} assertions failed`);
+      for (const l of rb.logs.filter(l => l.startsWith('FAIL'))) console.log(`      ${l}`);
+      failed++;
+    } else {
+      console.log(`ok    b3mat        ${bTotal} physics assertions passed in-engine`);
+    }
+  }
+
   // ── conf.lua resolution selection ─────────────────────────────────
   // A cart that ships conf.lua picks its own resolution (up to 1920x1080);
   // everything else stays at the 1280x720 default (the unit cart above and

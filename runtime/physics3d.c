@@ -251,6 +251,13 @@ static int shape_store(lua_State *L, b3ShapeId id, int bodyHandle) {
     return 1;
 }
 
+static shape_slot *shape_at(lua_State *L, int i) {
+    int h = (int)luaL_checkinteger(L, i);
+    if (h < 1 || h > MAX_SHAPES || !shapes[h - 1].active)
+        luaL_error(L, "b3: bad shape handle %d", h);
+    return &shapes[h - 1];
+}
+
 /* b3.shape_box(body, hx, hy, hz [, density]) — half-extents, like Box2D's */
 static int l_shape_box(lua_State *L) {
     body_slot *b = body_at(L, 1);
@@ -290,6 +297,278 @@ static int l_shape_capsule(lua_State *L) {
     def.density = (float)luaL_optnumber(L, 4, 1.0);
     b3ShapeId id = b3CreateCapsuleShape(b->id, &def, &c);
     return shape_store(L, id, (int)luaL_checkinteger(L, 1));
+}
+
+/* ── surface material ───────────────────────────────────────────────────
+ *
+ * Box3D's shape defaults are friction 0.6, restitution 0, rolling
+ * resistance 0. That is a sensible crate; it is NOT a billiard ball, which
+ * needs a real bounce off a cushion and needs to eventually STOP rolling.
+ * Without these three the solver is technically correct and the game is
+ * unplayable, so they are part of the base surface, not an extra.
+ *
+ * rollingResistance has no standalone setter in Box3D — it lives in the
+ * material struct — so all three go through get/modify/set on the whole
+ * material rather than the individual Set* calls. */
+static int l_shape_set_friction(lua_State *L) {
+    b3Shape_SetFriction(shape_at(L, 1)->id, (float)luaL_checknumber(L, 2));
+    return 0;
+}
+static int l_shape_get_friction(lua_State *L) {
+    lua_pushnumber(L, b3Shape_GetFriction(shape_at(L, 1)->id));
+    return 1;
+}
+static int l_shape_set_restitution(lua_State *L) {
+    b3Shape_SetRestitution(shape_at(L, 1)->id, (float)luaL_checknumber(L, 2));
+    return 0;
+}
+static int l_shape_get_restitution(lua_State *L) {
+    lua_pushnumber(L, b3Shape_GetRestitution(shape_at(L, 1)->id));
+    return 1;
+}
+/* b3.shape_set_rolling_resistance(shape, r) — the reason a struck ball
+ * coasts to a stop instead of rolling forever on a frictionless plane. */
+static int l_shape_set_rolling(lua_State *L) {
+    b3ShapeId id = shape_at(L, 1)->id;
+    b3SurfaceMaterial m = b3Shape_GetSurfaceMaterial(id);
+    m.rollingResistance = (float)luaL_checknumber(L, 2);
+    b3Shape_SetSurfaceMaterial(id, m);
+    return 0;
+}
+static int l_shape_get_rolling(lua_State *L) {
+    lua_pushnumber(L, b3Shape_GetSurfaceMaterial(shape_at(L, 1)->id).rollingResistance);
+    return 1;
+}
+/* b3.shape_set_material(shape, friction, restitution [, rolling]) — the
+ * common case in one call, since these three are almost always set together. */
+static int l_shape_set_material(lua_State *L) {
+    b3ShapeId id = shape_at(L, 1)->id;
+    b3SurfaceMaterial m = b3Shape_GetSurfaceMaterial(id);
+    m.friction          = (float)luaL_checknumber(L, 2);
+    m.restitution       = (float)luaL_checknumber(L, 3);
+    m.rollingResistance = (float)luaL_optnumber(L, 4, m.rollingResistance);
+    b3Shape_SetSurfaceMaterial(id, m);
+    return 0;
+}
+static int l_shape_set_density(lua_State *L) {
+    /* updateBodyMass=true: otherwise the body keeps the mass it computed at
+     * create time and the new density silently does nothing. */
+    b3Shape_SetDensity(shape_at(L, 1)->id, (float)luaL_checknumber(L, 2), true);
+    return 0;
+}
+static int l_shape_get_density(lua_State *L) {
+    lua_pushnumber(L, b3Shape_GetDensity(shape_at(L, 1)->id));
+    return 1;
+}
+static int l_shape_destroy(lua_State *L) {
+    int h = (int)luaL_checkinteger(L, 1);
+    if (h < 1 || h > MAX_SHAPES || !shapes[h - 1].active) return 0;
+    b3DestroyShape(shapes[h - 1].id, true);
+    shapes[h - 1].active = 0;
+    return 0;
+}
+/* Hit events are OFF by default in Box3D. A cart that wants collision
+ * sounds must opt the shape in, and then read b3.contact_events(). */
+static int l_shape_enable_hit_events(lua_State *L) {
+    b3Shape_EnableHitEvents(shape_at(L, 1)->id, lua_toboolean(L, 2));
+    return 0;
+}
+static int l_shape_enable_contact_events(lua_State *L) {
+    b3Shape_EnableContactEvents(shape_at(L, 1)->id, lua_toboolean(L, 2));
+    return 0;
+}
+
+/* ── damping, sleep, and the rest of the body surface ──────────────────
+ *
+ * Damping is what makes a rolling ball lose speed to the cloth; sleep is
+ * what lets the game know the table has settled and it is the next
+ * player's turn. Neither was reachable from Lua. */
+static int l_body_set_linear_damping(lua_State *L) {
+    b3Body_SetLinearDamping(body_at(L, 1)->id, (float)luaL_checknumber(L, 2));
+    return 0;
+}
+static int l_body_get_linear_damping(lua_State *L) {
+    lua_pushnumber(L, b3Body_GetLinearDamping(body_at(L, 1)->id));
+    return 1;
+}
+static int l_body_set_angular_damping(lua_State *L) {
+    b3Body_SetAngularDamping(body_at(L, 1)->id, (float)luaL_checknumber(L, 2));
+    return 0;
+}
+static int l_body_get_angular_damping(lua_State *L) {
+    lua_pushnumber(L, b3Body_GetAngularDamping(body_at(L, 1)->id));
+    return 1;
+}
+static int l_body_angular_velocity(lua_State *L) {
+    b3Vec3 w = b3Body_GetAngularVelocity(body_at(L, 1)->id);
+    lua_pushnumber(L, w.x); lua_pushnumber(L, w.y); lua_pushnumber(L, w.z);
+    return 3;
+}
+/* radians/sec, so NOT scaled by pixels_per_meter */
+static int l_body_set_angular_velocity(lua_State *L) {
+    b3Vec3 w;
+    w.x = (float)luaL_optnumber(L, 2, 0);
+    w.y = (float)luaL_optnumber(L, 3, 0);
+    w.z = (float)luaL_optnumber(L, 4, 0);
+    b3Body_SetAngularVelocity(body_at(L, 1)->id, w);
+    return 0;
+}
+static int l_body_apply_torque(lua_State *L) {
+    b3Vec3 t;
+    t.x = (float)luaL_optnumber(L, 2, 0);
+    t.y = (float)luaL_optnumber(L, 3, 0);
+    t.z = (float)luaL_optnumber(L, 4, 0);
+    b3Body_ApplyTorque(body_at(L, 1)->id, t, true);
+    return 0;
+}
+static int l_body_apply_angular_impulse(lua_State *L) {
+    b3Vec3 t;
+    t.x = (float)luaL_optnumber(L, 2, 0);
+    t.y = (float)luaL_optnumber(L, 3, 0);
+    t.z = (float)luaL_optnumber(L, 4, 0);
+    b3Body_ApplyAngularImpulse(body_at(L, 1)->id, t, true);
+    return 0;
+}
+static int l_body_is_awake(lua_State *L) {
+    lua_pushboolean(L, b3Body_IsAwake(body_at(L, 1)->id));
+    return 1;
+}
+static int l_body_set_awake(lua_State *L) {
+    b3Body_SetAwake(body_at(L, 1)->id, lua_toboolean(L, 2));
+    return 0;
+}
+static int l_body_enable_sleep(lua_State *L) {
+    b3Body_EnableSleep(body_at(L, 1)->id, lua_toboolean(L, 2));
+    return 0;
+}
+/* Below this speed the body is allowed to fall asleep. In px/s in, meters
+ * out, same as every other length in this binding. */
+static int l_body_set_sleep_threshold(lua_State *L) {
+    b3Body_SetSleepThreshold(body_at(L, 1)->id, px2m(luaL_checknumber(L, 2)));
+    return 0;
+}
+static int l_body_get_sleep_threshold(lua_State *L) {
+    lua_pushnumber(L, m2px(b3Body_GetSleepThreshold(body_at(L, 1)->id)));
+    return 1;
+}
+static int l_body_set_type(lua_State *L) {
+    int t = (int)luaL_checkinteger(L, 2);
+    b3Body_SetType(body_at(L, 1)->id, (b3BodyType)(t < 0 ? 0 : (t > 2 ? 2 : t)));
+    return 0;
+}
+static int l_body_get_type(lua_State *L) {
+    lua_pushinteger(L, (int)b3Body_GetType(body_at(L, 1)->id));
+    return 1;
+}
+static int l_body_set_bullet(lua_State *L) {
+    /* Continuous collision. A hard-struck ball can cross a cushion's
+     * thickness inside one step; this is what stops it tunnelling out. */
+    b3Body_SetBullet(body_at(L, 1)->id, lua_toboolean(L, 2));
+    return 0;
+}
+static int l_body_is_bullet(lua_State *L) {
+    lua_pushboolean(L, b3Body_IsBullet(body_at(L, 1)->id));
+    return 1;
+}
+static int l_body_set_gravity_scale(lua_State *L) {
+    b3Body_SetGravityScale(body_at(L, 1)->id, (float)luaL_checknumber(L, 2));
+    return 0;
+}
+static int l_body_get_gravity_scale(lua_State *L) {
+    lua_pushnumber(L, b3Body_GetGravityScale(body_at(L, 1)->id));
+    return 1;
+}
+static int l_body_enable_hit_events(lua_State *L) {
+    b3Body_EnableHitEvents(body_at(L, 1)->id, lua_toboolean(L, 2));
+    return 0;
+}
+static int l_body_apply_impulse_at(lua_State *L) {
+    /* Off-centre impulse: the difference between a centre-ball hit and one
+     * with english on it. */
+    b3Vec3 imp = vec3_arg(L, 2);
+    b3Pos  at  = pos_arg(L, 5);
+    b3Body_ApplyLinearImpulse(body_at(L, 1)->id, imp, at, true);
+    return 0;
+}
+
+/* ── contact events ─────────────────────────────────────────────────────
+ *
+ * b3.contact_events(world) -> { hits = { {shapeA, shapeB, x,y,z, nx,ny,nz,
+ * speed}, ... }, begins = {{shapeA, shapeB}, ...}, ends = {...} }
+ *
+ * Shape IDs are mapped back to cart-side handles; a shape the cart never
+ * created (or already destroyed) reports 0 rather than a dangling index. */
+static int shape_handle_of(b3ShapeId id) {
+    for (int i = 0; i < MAX_SHAPES; i++)
+        if (shapes[i].active && B3_ID_EQUALS(shapes[i].id, id)) return i + 1;
+    return 0;
+}
+
+static int l_contact_events(lua_State *L) {
+    int wh = (int)luaL_checkinteger(L, 1);
+    if (wh < 1 || wh > MAX_WORLDS || !world_alive[wh - 1])
+        return luaL_error(L, "b3: bad world handle %d", wh);
+    b3ContactEvents ev = b3World_GetContactEvents(worlds[wh - 1]);
+
+    lua_newtable(L);
+
+    lua_newtable(L);                                   /* hits */
+    for (int i = 0; i < ev.hitCount; i++) {
+        b3ContactHitEvent *h = &ev.hitEvents[i];
+        lua_newtable(L);
+        lua_pushinteger(L, shape_handle_of(h->shapeIdA)); lua_setfield(L, -2, "a");
+        lua_pushinteger(L, shape_handle_of(h->shapeIdB)); lua_setfield(L, -2, "b");
+        lua_pushnumber(L, m2px(h->point.x)); lua_setfield(L, -2, "x");
+        lua_pushnumber(L, m2px(h->point.y)); lua_setfield(L, -2, "y");
+        lua_pushnumber(L, m2px(h->point.z)); lua_setfield(L, -2, "z");
+        lua_pushnumber(L, h->normal.x); lua_setfield(L, -2, "nx");
+        lua_pushnumber(L, h->normal.y); lua_setfield(L, -2, "ny");
+        lua_pushnumber(L, h->normal.z); lua_setfield(L, -2, "nz");
+        /* approachSpeed is m/s from the solver; report px/s to match the
+         * cart's own units, so a volume curve written in pixels works. */
+        lua_pushnumber(L, m2px(h->approachSpeed)); lua_setfield(L, -2, "speed");
+        lua_rawseti(L, -2, i + 1);
+    }
+    lua_setfield(L, -2, "hits");
+
+    lua_newtable(L);                                   /* begins */
+    for (int i = 0; i < ev.beginCount; i++) {
+        lua_newtable(L);
+        lua_pushinteger(L, shape_handle_of(ev.beginEvents[i].shapeIdA)); lua_setfield(L, -2, "a");
+        lua_pushinteger(L, shape_handle_of(ev.beginEvents[i].shapeIdB)); lua_setfield(L, -2, "b");
+        lua_rawseti(L, -2, i + 1);
+    }
+    lua_setfield(L, -2, "begins");
+
+    lua_newtable(L);                                   /* ends */
+    for (int i = 0; i < ev.endCount; i++) {
+        lua_newtable(L);
+        lua_pushinteger(L, shape_handle_of(ev.endEvents[i].shapeIdA)); lua_setfield(L, -2, "a");
+        lua_pushinteger(L, shape_handle_of(ev.endEvents[i].shapeIdB)); lua_setfield(L, -2, "b");
+        lua_rawseti(L, -2, i + 1);
+    }
+    lua_setfield(L, -2, "ends");
+
+    return 1;
+}
+
+/* b3.world_set_hit_threshold(world, px_per_sec) — below this an impact
+ * raises no hit event, so a rack of balls jostling does not machine-gun
+ * the click sound. */
+static int l_world_set_hit_threshold(lua_State *L) {
+    int wh = (int)luaL_checkinteger(L, 1);
+    if (wh < 1 || wh > MAX_WORLDS || !world_alive[wh - 1])
+        return luaL_error(L, "b3: bad world handle %d", wh);
+    b3World_SetHitEventThreshold(worlds[wh - 1], px2m(luaL_checknumber(L, 2)));
+    return 0;
+}
+
+static int l_world_set_gravity(lua_State *L) {
+    int wh = (int)luaL_checkinteger(L, 1);
+    if (wh < 1 || wh > MAX_WORLDS || !world_alive[wh - 1])
+        return luaL_error(L, "b3: bad world handle %d", wh);
+    b3World_SetGravity(worlds[wh - 1], vec3_arg(L, 2));
+    return 0;
 }
 
 /* ── queries ────────────────────────────────────────────────────────── */
@@ -336,9 +615,48 @@ static const luaL_Reg b3_lib[] = {
     { "body_apply_impulse", l_body_apply_impulse },
     { "body_mass",          l_body_mass },
 
+    { "body_set_linear_damping",  l_body_set_linear_damping },
+    { "body_get_linear_damping",  l_body_get_linear_damping },
+    { "body_set_angular_damping", l_body_set_angular_damping },
+    { "body_get_angular_damping", l_body_get_angular_damping },
+    { "body_angular_velocity",     l_body_angular_velocity },
+    { "body_set_angular_velocity", l_body_set_angular_velocity },
+    { "body_apply_torque",          l_body_apply_torque },
+    { "body_apply_angular_impulse", l_body_apply_angular_impulse },
+    { "body_apply_impulse_at",      l_body_apply_impulse_at },
+    { "body_is_awake",            l_body_is_awake },
+    { "body_set_awake",           l_body_set_awake },
+    { "body_enable_sleep",        l_body_enable_sleep },
+    { "body_set_sleep_threshold", l_body_set_sleep_threshold },
+    { "body_get_sleep_threshold", l_body_get_sleep_threshold },
+    { "body_set_type",            l_body_set_type },
+    { "body_get_type",            l_body_get_type },
+    { "body_set_bullet",          l_body_set_bullet },
+    { "body_is_bullet",           l_body_is_bullet },
+    { "body_set_gravity_scale",   l_body_set_gravity_scale },
+    { "body_get_gravity_scale",   l_body_get_gravity_scale },
+    { "body_enable_hit_events",   l_body_enable_hit_events },
+
     { "shape_box",          l_shape_box },
     { "shape_sphere",       l_shape_sphere },
     { "shape_capsule",      l_shape_capsule },
+    { "shape_destroy",      l_shape_destroy },
+
+    { "shape_set_friction",     l_shape_set_friction },
+    { "shape_get_friction",     l_shape_get_friction },
+    { "shape_set_restitution",  l_shape_set_restitution },
+    { "shape_get_restitution",  l_shape_get_restitution },
+    { "shape_set_rolling_resistance", l_shape_set_rolling },
+    { "shape_get_rolling_resistance", l_shape_get_rolling },
+    { "shape_set_material",     l_shape_set_material },
+    { "shape_set_density",      l_shape_set_density },
+    { "shape_get_density",      l_shape_get_density },
+    { "shape_enable_hit_events",     l_shape_enable_hit_events },
+    { "shape_enable_contact_events", l_shape_enable_contact_events },
+
+    { "contact_events",          l_contact_events },
+    { "world_set_hit_threshold", l_world_set_hit_threshold },
+    { "world_set_gravity",       l_world_set_gravity },
 
     { "raycast",            l_raycast },
     { NULL, NULL }
