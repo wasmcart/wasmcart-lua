@@ -219,6 +219,9 @@ typedef struct {
 #ifdef __wasm__
 __attribute__((import_module("env"), import_name("wc_log")))
 extern void wc_log(const char* ptr, unsigned int len);
+#elif defined(WC_NATIVE_HOST)
+/* native host links these in (see wc_native.h) */
+extern void wc_log(const char* ptr, unsigned int len);
 #else
 static inline void wc_log(const char* ptr, unsigned int len) { (void)ptr; (void)len; }
 #endif
@@ -234,6 +237,9 @@ static inline void wc_log(const char* ptr, unsigned int len) { (void)ptr; (void)
 #ifdef __wasm__
 __attribute__((import_module("env"), import_name("wc_debug_mark")))
 extern void wc_debug_mark(unsigned int id);
+#elif defined(WC_NATIVE_HOST)
+/* native host links these in (see wc_native.h) */
+extern void wc_debug_mark(unsigned int id);
 #else
 static inline void wc_debug_mark(unsigned int id) { (void)id; }
 #endif
@@ -243,6 +249,9 @@ static inline void wc_debug_mark(unsigned int id) { (void)id; }
 // The host provides the SDL controller name, Gamepad API id, or "Keyboard".
 #ifdef __wasm__
 __attribute__((import_module("env"), import_name("wc_pad_name")))
+extern int wc_pad_name(unsigned int pad_id, char* buf, unsigned int buf_len);
+#elif defined(WC_NATIVE_HOST)
+/* native host links these in (see wc_native.h) */
 extern int wc_pad_name(unsigned int pad_id, char* buf, unsigned int buf_len);
 #else
 static inline int wc_pad_name(unsigned int pad_id, char* buf, unsigned int buf_len) {
@@ -287,6 +296,11 @@ extern void wc_text_input_begin(void);
 __attribute__((import_module("env"), import_name("wc_text_input_end")))
 extern void wc_text_input_end(void);
 __attribute__((import_module("env"), import_name("wc_text_input_active")))
+extern unsigned int wc_text_input_active(void);
+#elif defined(WC_NATIVE_HOST)
+/* native host links these in (see wc_native.h) */
+extern void wc_text_input_begin(void);
+extern void wc_text_input_end(void);
 extern unsigned int wc_text_input_active(void);
 #else
 static inline void wc_text_input_begin(void) {}
@@ -355,6 +369,9 @@ static inline unsigned int wc_text_input_active(void) { return 0; }
 #ifdef __wasm__
 __attribute__((import_module("env"), import_name("wc_frame_yield")))
 extern void wc_frame_yield(void);
+#elif defined(WC_NATIVE_HOST)
+/* native host links these in (see wc_native.h) */
+extern void wc_frame_yield(void);
 #else
 static inline void wc_frame_yield(void) {}
 #endif
@@ -386,6 +403,12 @@ extern void wc_pad_rumble(unsigned int pad_id, float low, float high,
 
 __attribute__((import_module("env"), import_name("wc_pad_rumble_stop")))
 extern void wc_pad_rumble_stop(unsigned int pad_id);
+#elif defined(WC_NATIVE_HOST)
+/* native host links these in (see wc_native.h) */
+extern unsigned int wc_pad_has_rumble(unsigned int pad_id);
+extern void wc_pad_rumble(unsigned int pad_id, float low, float high,
+                          unsigned int duration_ms);
+extern void wc_pad_rumble_stop(unsigned int pad_id);
 #else
 static inline unsigned int wc_pad_has_rumble(unsigned int pad_id) {
     (void)pad_id; return 0;
@@ -408,6 +431,11 @@ extern int wc_asset_size(const char* path, unsigned int path_len);
 
 // Load an asset into cart memory at dest. Returns bytes loaded, or -1 on error.
 __attribute__((import_module("env"), import_name("wc_load_asset")))
+extern int wc_load_asset(const char* path, unsigned int path_len,
+                         void* dest, unsigned int max_size);
+#elif defined(WC_NATIVE_HOST)
+/* native host links these in (see wc_native.h) */
+extern int wc_asset_size(const char* path, unsigned int path_len);
 extern int wc_load_asset(const char* path, unsigned int path_len,
                          void* dest, unsigned int max_size);
 #else
@@ -481,6 +509,17 @@ __attribute__((import_module("env"), import_name("wc_peer_name")))
 extern int wc_peer_name(int peer_id, char* dest, unsigned int max_len);
 
 __attribute__((import_module("env"), import_name("wc_peer_transport")))
+extern int wc_peer_transport(int peer_id);
+#elif defined(WC_NATIVE_HOST)
+/* native host links these in (see wc_native.h) */
+extern int wc_peer_open(const char* addr, unsigned int addr_len);
+extern void wc_peer_close(int peer_id);
+extern int wc_peer_send(int peer_id, const void* data, unsigned int len);
+extern int wc_peer_broadcast(const void* data, unsigned int len);
+extern int wc_peer_state(int peer_id);
+extern int wc_peer_count(void);
+extern int wc_peer_id(unsigned int index);
+extern int wc_peer_name(int peer_id, char* dest, unsigned int max_len);
 extern int wc_peer_transport(int peer_id);
 #else
 static inline int wc_peer_open(const char* addr, unsigned int addr_len) {

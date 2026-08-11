@@ -67,6 +67,7 @@ void wcl_open_physics(lua_State *L);
 
 WC_CART_BUFFERS;
 
+
 /* The cart's ACTUAL resolution, chosen once at boot. Defaults hold unless the
  * cart ships a conf.lua whose love.conf(t) sets t.window.width/height (the
  * LOVE idiom), clamped to MAX_*. The buffers above are MAX-sized, so this is
@@ -145,6 +146,36 @@ static uint32_t tick_n;
 /* cart "SRAM": hosts persist this (.sav next to the cart) */
 #define SAVE_BYTES 4096
 static uint8_t wc_save[SAVE_BYTES];
+
+/* ── native-host region access ────────────────────────────────────────
+ *
+ * wc_info_t hands every shared region to the host as a uint32_t OFFSET into
+ * wasm linear memory. That is exact under wasm (pointers are 32-bit) and
+ * lossy everywhere else, so a 64-bit native host cannot use those fields.
+ *
+ * The regions themselves are `static` (WC_CART_BUFFERS), i.e. not linkable
+ * by name. A native host is linked into this same address space, so the
+ * honest fix is to hand it the real addresses once. The wasm ABI struct is
+ * untouched — wasm hosts see exactly what they always saw.
+ */
+#ifdef WC_NATIVE_HOST
+#include "wc_native.h"
+static const wc_native_regions_t wcl_native_regions = {
+    .framebuffer        = wc_framebuffer,
+    .audio_ring         = wc_audio_ring,
+    .audio_write_cursor = &wc_audio_write_cursor,
+    .audio_cap          = AUDIO_CAP,
+    .pads               = wc_pads,
+    .pointers           = wc_pointers,
+    .keys               = wc_keys,
+    .time               = &wc_time,
+    .host_info          = &wc_host_info,
+    .info               = &wc_info,
+    .save               = wc_save,
+    .save_size          = SAVE_BYTES,
+};
+const wc_native_regions_t *wc_native_regions(void) { return &wcl_native_regions; }
+#endif
 
 /* ── raster state ──────────────────────────────────────────────────── */
 
