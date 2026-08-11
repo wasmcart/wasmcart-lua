@@ -661,8 +661,14 @@ async function main() {
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       const lines = out.split('\n');
       const refusals = lines.filter(l => /newShader/.test(l)).length;
-      // a real GLSL compiler message, not our own wrapper text
-      const compilerMsg = lines.some(l => /^LOG: \d+:\d+\(\d+\): error/.test(l));
+      // A real GLSL compiler message, not our own wrapper text. Drivers do
+      // not agree on the dialect, and the point of this gate is "the
+      // compiler actually spoke", not "Mesa spoke":
+      //   Mesa/Linux   LOG: 0:12(1): error: ...
+      //   ANGLE/Apple  LOG: ERROR: 0:12: '...' : ...
+      const compilerMsg = lines.some(l =>
+        /^LOG: \d+:\d+\(\d+\): error/.test(l) ||      // Mesa
+        /^LOG: ERROR: \d+:\d+:/.test(l));                // ANGLE / Apple GL
       const noGl = lines.some(l => /no GL context on this host/.test(l));
       if (noGl) {
         console.log('\nFAIL  shaderfail   ran without a GL context, so the refusals prove nothing');
