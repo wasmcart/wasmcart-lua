@@ -340,7 +340,7 @@ two artifacts:
 | artifact | what it is |
 |---|---|
 | `build/engine.wasm` | **the engine** (~629 KB). GL2D plus the software rasterizer. This is what `template/main.wasm` ships. |
-| `build/engine-cpu.wasm` | software only, imports nothing from `gl`. The comparator the GL build is diffed against, and the fallback for a host with no GL. |
+| `build/engine-cpu.wasm` | software only, imports nothing from `gl`. **A test artifact, not a shipped runtime**: it is the oracle the GL build is diffed against. Carts ship `engine.wasm`. |
 
 ## Performance
 
@@ -441,10 +441,11 @@ renders as ANSI exactly like a software one; that is precisely what the romdev
 harness does for every screenshot in this repo.
 
 Today `npx wasmcart --term` still refuses GL carts, because it loads without
-a `glBackend` at all rather than because a terminal cannot show one. Until
-that host grows an offscreen context, `engine-cpu.wasm` is the artifact for
-it. The engine also detects a stubbed `gl` module at startup and falls back
-to the software rasterizer rather than rendering a black screen.
+a `glBackend` at all rather than because a terminal cannot show one. That is
+a gap in that host to close by giving it an offscreen context, not a reason
+to ship a CPU-rendered cart: **wasmcart targets a GPU, and software rendering
+is the reference implementation the GL path is checked against, never a
+fallback shipped to a player.**
 
 ## The wasmcart org
 

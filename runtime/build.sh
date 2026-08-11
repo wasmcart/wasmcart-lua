@@ -191,7 +191,9 @@ build_engine ../build/engine.wasm -DWCL_USE_GL -DWCL_ENABLE_GL2D
 # ── the CPU-only comparator ─────────────────────────────────────────
 # Imports nothing from the `gl` module, so it is what the GL build is
 # measured and diffed against (tools/gl2d-compare.mjs, test/render-hash.js).
-# Also the artifact to reach for on a host with no GL at all.
+# A TEST ARTIFACT ONLY. Carts ship engine.wasm: wasmcart targets a GPU, and
+# this build exists to give the differ an oracle, never to ship to a player
+# as a no-GL fallback.
 build_engine ../build/engine-cpu.wasm
 
 # the template ships the engine so `run.sh` works with no build step

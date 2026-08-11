@@ -284,7 +284,7 @@ Two things it caught, both worth keeping in mind when reading GL back:
 | artifact | what it is |
 |---|---|
 | `build/engine.wasm` | **the engine.** GL2D + the software rasterizer, which still renders every frame GL2D cannot. This is what `template/main.wasm` ships. |
-| `build/engine-cpu.wasm` | software only, imports nothing from `gl`. The comparator the GL build is diffed against, and the artifact for a host with no GL. |
+| `build/engine-cpu.wasm` | software only, imports nothing from `gl`. **A test artifact, not a shipped runtime**: it is the oracle the GL build is diffed against. Carts ship `engine.wasm`. |
 
 The goldens (`test/blit`, `test/prims`, `test/render-hash.js`) run against the
 **CPU** build on purpose: they assert bit-equality, which is a property of the
