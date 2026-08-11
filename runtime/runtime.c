@@ -406,7 +406,7 @@ static void raster_circle(int cx, int cy, int r, uint32_t c, int a, int filled) 
      * minimum radius, no fallback. */
     if (filled) {
         if (wcl_r2d_circle(cx, cy, r, c, a)) return;
-        wcl_r2d_disable();
+        wcl_r2d_disable_why("raster_circle: filled circle rejected by wcl_r2d_circle");
     }
     /* The OUTLINE writes single pixels. blend_span goes straight to the
      * framebuffer and would be INVISIBLE on a GL frame, so on the GL path
@@ -454,7 +454,7 @@ static void raster_polygon(const double *xs, const double *ys, int n,
      * fan, so it keeps the scanline fill and drops the frame to software. */
     if (filled) {
         if (wcl_r2d_poly(xs, ys, n, c, a)) return;
-        wcl_r2d_disable();
+        wcl_r2d_disable_why("raster_polygon: filled polygon rejected by wcl_r2d_poly (concave/self-intersecting or >cap)");
     }
     if (!filled) {
         for (int i = 0; i < n; i++) {
@@ -910,7 +910,7 @@ static void draw_ttf(font_t *f, int x, int y_top, const char *s, uint32_t c, int
                                b->x0, b->y0, gw, gh, c, a)) {
                 /* out of glyph textures: give up on GL for the run rather
                  * than draw half the string on each backend */
-                wcl_r2d_disable();
+                wcl_r2d_disable_why("draw_text: out of glyph textures");
                 return;
             }
         } else {
@@ -1213,7 +1213,7 @@ static int l_set_canvas(lua_State *S) {
      * later samples the texture that was just rendered into. If the backend
      * cannot provide one, drop to software for the rest of the run rather
      * than let GL and CPU each hold half the canvas. */
-    if (!wcl_r2d_target(im->rgba, im->w, im->h)) wcl_r2d_disable();
+    if (!wcl_r2d_target(im->rgba, im->w, im->h)) wcl_r2d_disable_why("setCanvas: wcl_r2d_target could not provide an FBO");
     return 0;
 }
 

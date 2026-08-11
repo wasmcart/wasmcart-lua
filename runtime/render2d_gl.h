@@ -24,6 +24,7 @@ int  wcl_r2d_begin(uint32_t clear_color);
 /* fb: the cart framebuffer - blitted to GL when the frame was CPU-rendered */
 void wcl_r2d_end(const uint32_t *fb);
 void wcl_r2d_disable(void);
+void wcl_r2d_disable_why(const char *why);
 int  wcl_r2d_active(void);
 int  wcl_r2d_solid(int x, int y, int w, int h, uint32_t color, int alpha);
 int  wcl_r2d_line(int x0, int y0, int x1, int y1, uint32_t color, int alpha);
@@ -157,6 +158,7 @@ static inline int wcl_r2d_init(int width, int height) {
 static inline int wcl_r2d_begin(uint32_t clear_color) { (void)clear_color; return 0; }
 static inline void wcl_r2d_end(const uint32_t *fb) { (void)fb; }
 static inline void wcl_r2d_disable(void) {}
+static inline void wcl_r2d_disable_why(const char *why) { (void)why; }
 static inline int wcl_r2d_active(void) { return 0; }
 static inline int wcl_r2d_solid(int x, int y, int w, int h, uint32_t color, int alpha) {
     (void)x; (void)y; (void)w; (void)h; (void)color; (void)alpha; return 0;

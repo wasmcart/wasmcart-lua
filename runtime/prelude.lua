@@ -159,15 +159,34 @@ function graphics.points(...)
   end
 end
 
+-- Scratch buffer reused across every polygon() call.
+--
+-- This used to allocate a fresh `out` table per call and grow it one element
+-- at a time with out[#out+1], which reallocates the array part as it doubles.
+-- A cart drawing 48 filled polygons a frame (16 objects x 3 rings) threw away
+-- ~50 KB PER FRAME on this line alone -- 3 MB/s of garbage for a shape whose
+-- vertex count never changes. The transformed coordinates are handed straight
+-- to wc.polygon and are dead the moment it returns, so a single buffer is
+-- safe: nothing can hold a reference across calls, and the C side copies out
+-- of it before returning. Not reentrant, which polygon() never is.
+local poly_scratch = {}
+local arc_scratch = {}
+
 function graphics.polygon(mode, ...)
   local pts = ...
   if rawtype(pts) ~= "table" then pts = { ... } end
-  local out = {}
+  local out = poly_scratch
+  local n = 0
   for i = 1, #pts - 1, 2 do
     local x, y = apply(pts[i], pts[i + 1])
-    out[#out + 1] = x
-    out[#out + 1] = y
+    out[n + 1] = x
+    out[n + 2] = y
+    n = n + 2
   end
+  -- The C side reads rawlen, so a buffer left longer by a previous call would
+  -- feed stale trailing vertices into this polygon. Truncate to this call's
+  -- point count.
+  for i = #out, n + 1, -1 do out[i] = nil end
   wc.polygon(mode == "fill" and 1 or 0, out)
 end
 
@@ -1883,14 +1902,21 @@ function graphics.arc(mode, a, b, c, d, e, f, g)
           "angle1, angle2)", 2)
   end
   segs = math.max(3, math.floor(segs or math.max(8, r / 2)))
-  local pts = {}
+  -- Reused across calls for the same reason polygon()'s buffer is: these
+  -- points are consumed by polygon() before this returns and can never be
+  -- referenced afterwards. This is a SEPARATE buffer from poly_scratch --
+  -- polygon() is about to read this one while writing that one.
+  local pts = arc_scratch
+  local n = 0
   -- "pie" closes through the centre; "open"/"closed" trace only the rim.
-  if arctype == "pie" then pts[#pts + 1] = x; pts[#pts + 1] = y end
+  if arctype == "pie" then pts[1] = x; pts[2] = y; n = 2 end
   for i = 0, segs do
     local t = a1 + (a2 - a1) * (i / segs)
-    pts[#pts + 1] = x + math.cos(t) * r
-    pts[#pts + 1] = y + math.sin(t) * r
+    pts[n + 1] = x + math.cos(t) * r
+    pts[n + 2] = y + math.sin(t) * r
+    n = n + 2
   end
+  for i = #pts, n + 1, -1 do pts[i] = nil end
   graphics.polygon(mode, pts)
 end
 

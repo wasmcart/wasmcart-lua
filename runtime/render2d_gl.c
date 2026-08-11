@@ -1945,6 +1945,18 @@ GLuint wcl_r2d__upload_standalone(const void *pixels, int w, int h) {
     return t;
 }
 
+void wcl_r2d_disable_why(const char *why) {
+    /* The GPU 2D path is not a preference, it is the contract. Anything that
+     * silently drops the whole frame to the software rasterizer is a DEFECT,
+     * and a silent one is the worst kind: the picture still looks right while
+     * the frame time quietly triples. Say which primitive did it. */
+    if (wcl_r2d_active()) {
+        WC_LOG("GPU 2D path DISABLED for the rest of the run -- this is a BUG, not a fallback:");
+        WC_LOG(why);
+    }
+    wcl_r2d_disable();
+}
+
 void wcl_r2d_disable(void) {
     if (wcl_r2d_active()) flush_batches();
     /* Depth testing and culling are global GL state. Leaving them enabled
