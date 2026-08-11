@@ -465,6 +465,53 @@ player on the title screen.
 
 All six examples were already gamepad-only and needed no change.
 
+## Running off-wasm (WC_NATIVE_HOST)
+
+The engine is plain C99. Compiled with a normal toolchain instead of
+emcc, it runs as native code with a host linked into the same address
+space -- no wasm, no JS engine. That is how the Android player ships a
+game as a ~6 MB APK instead of ~64 MB (libnode is nearly all of the
+difference), at 60 fps for about 40% less CPU. The wasm build stays
+canonical everywhere else; this is a second target, not a fork.
+
+Almost nothing was needed, because two things were already true:
+
+- `_GL_IMPORT` in `wasmcart.h` is `#ifdef __wasm__`, so off-wasm the GL
+  declarations are ordinary externs that bind to real GLES3. There is no
+  marshaling shim to go wrong.
+- `-sSUPPORT_LONGJMP=wasm` -- needing wasm exception handling for Lua's
+  setjmp/longjmp -- was the reason a wasm host had to be V8-class at all.
+  Native longjmp just works.
+
+What DID need a seam is the ABI's use of 32-bit offsets:
+
+- `wc_info_t` hands the host every shared region (framebuffer, audio ring,
+  pads, pointers, time, save) as a `uint32_t` offset into wasm linear
+  memory. Exact under wasm, lossy on a 64-bit target. `wc_native.h`'s
+  `wc_native_regions()` returns the real addresses instead.
+- Each host-import block in `wasmcart.h` gained an
+  `#elif defined(WC_NATIVE_HOST)` branch declaring the import `extern`.
+  The plain non-wasm branch is a no-op stub -- right for a cart built
+  without a host, silently wrong for a host that must supply them.
+- `wc_cart.h`'s debug descriptor gained a native form holding real
+  pointers; `(uint32_t)(uintptr_t)&x` is neither lossless nor a
+  compile-time constant on a 64-bit target.
+
+Rules for anyone writing such a host:
+
+- **Leave GL state exactly as you found it.** The renderer caches its
+  bindings and skips redundant `glBindTexture`; a host that creates its
+  own texture without restoring the previous binding will have the
+  engine's next upload land in the host's texture, with no GL error and
+  no sprites on screen. This cost real debugging time twice, in two
+  different hosts.
+- Do not delete or re-gen GL names in the cart's context. A driver will
+  recycle a freed name into one the engine still holds.
+
+The wasm output is unaffected: the engine builds byte-identical (verified
+by md5) with and without the seam, and all four of the reference card
+games render bit-exact on both targets over a 300-frame scripted run.
+
 ## Adding to the API
 
 1. Add the primitive to `wc_lib[]` in `runtime.c` if C work is needed.
