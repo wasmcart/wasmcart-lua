@@ -1,6 +1,6 @@
 {
   "name": "wasmcart-lua",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Write games in Lua, ship them as wasmcart carts. Real Lua 5.4 with a LOVE-style API.",
   "license": "MIT",
   "scripts": {
