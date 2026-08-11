@@ -454,7 +454,11 @@ static int l_query_circle(lua_State *L) {
     b2Circle circle = { { 0, 0 }, r };
     b2ShapeProxy proxy = b2MakeProxy(&(b2Vec2){ x, y }, 1, r);
     (void)circle;
-    b2World_OverlapShape(world, &proxy, b2DefaultQueryFilter(), overlap_cb, &ctx);
+    /* Box2D gained a double-precision world ORIGIN for queries (same split
+     * Box3D uses: double translation, float rotation). These carts work in
+     * absolute coordinates, so the origin is zero. */
+    b2World_OverlapShape(world, (b2Pos){ 0, 0 }, &proxy, b2DefaultQueryFilter(),
+                         overlap_cb, &ctx);
     return 1;
 }
 
@@ -469,7 +473,8 @@ static int l_query_box(lua_State *L) {
     lua_newtable(L);
     query_ctx_t ctx = { L, 0 };
     b2AABB aabb = { { x, y }, { x + w, y + h } };
-    b2World_OverlapAABB(world, aabb, b2DefaultQueryFilter(), overlap_cb, &ctx);
+    b2World_OverlapAABB(world, (b2Pos){ 0, 0 }, aabb, b2DefaultQueryFilter(),
+                        overlap_cb, &ctx);
     return 1;
 }
 

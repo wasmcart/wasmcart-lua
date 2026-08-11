@@ -1,0 +1,11 @@
+{
+  "name": "physics",
+  "version": "1.0.0",
+  "abi": 3,
+  "entry": "main.wasm",
+  "width": 1280,
+  "height": 720,
+  "assets": "app/",
+  "players": 1,
+  "debug": true
+}

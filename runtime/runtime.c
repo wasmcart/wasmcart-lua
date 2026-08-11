@@ -49,6 +49,8 @@ extern int stb_vorbis_decode_memory(const unsigned char *mem, int len, int *chan
 
 /* physics.c: Box2D v3 bound as the global `b2` */
 void wcl_open_physics(lua_State *L);
+/* physics3d.c: Box3D bound as the global `b3` */
+void wcl_open_physics3d(lua_State *L);
 
 #include <stdlib.h>
 #include <string.h>
@@ -2137,6 +2139,7 @@ WC_EXPORT_INIT void wc_init(void) {
     /* Box2D v3 as the global `b2`; prelude.lua builds love.physics and the
      * windfield-shaped collider API on top of it */
     wcl_open_physics(L);
+    wcl_open_physics3d(L);
 
     /* the cart's resolution choice, before anything captures the dims */
     apply_conf();

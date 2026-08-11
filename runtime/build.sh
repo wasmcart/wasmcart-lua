@@ -10,7 +10,14 @@ if [ -z "${WASMCART_REPO:-}" ]; then
 fi
 WASMCART_REPO="${WASMCART_REPO:-../../wasmcart}"
 LUA_VERSION=5.4.7
-BOX2D_TAG=v3.2.0
+# Pinned by SHA, not tag. physics.c calls b2Body_SetMotionLocks, which exists
+# in NO released Box2D tag (v3.1.1 is the newest); the old v3.2.0 pin here
+# resolved to nothing at all upstream, so a fresh clone could not build
+# physics -- it only worked where a stale vendor/libbox2d.a happened to sit.
+BOX2D_SHA=56edae79f2949d86142b03450d5d60f63bcf5a6f
+# Box3D (Erin Catto's 3D engine, portable C17). Same SHA box3d-wasm pins, so
+# the wasm and native builds of both projects agree on one revision.
+BOX3D_SHA=29bf523ce7bc4590aba9f17c9db791cdc5c4397e
 RUNTIME_DIR="$(pwd)"
 
 # ── fetch + build the Lua VM (pinned, fetched not vendored) ──────────
@@ -45,6 +52,42 @@ if [ ! -f vendor/liblua54.a ]; then
 fi
 
 
+# ── stub the physics timers for wasm ────────────────────────────────
+# Box2D and Box3D time their own solver stages with clock_gettime, which
+# emscripten lowers to the WASI import clock_time_get. A wasmcart cart must
+# import ONLY the `env` module -- a host that provides just that (and the
+# engine's own test harness, which fails a cart that touches WASI) breaks
+# otherwise. The numbers are profiling telemetry no cart reads, so under
+# wasm the clock becomes a counter: the profile fields still exist, they
+# just always read zero. Idempotent via the marker.
+patch_physics_timer() {   # $1 = path to a box2d/box3d timer.c
+  python3 - "$1" <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1])
+src = p.read_text()
+MARK = "/* wasmcart: no-WASI clock */"
+if MARK in src:
+    sys.exit(0)
+old = """	struct timespec ts;
+	clock_gettime( CLOCK_MONOTONIC, &ts );
+	return ts.tv_sec * 1000000000LL + ts.tv_nsec;"""
+new = MARK + """
+#if defined( __EMSCRIPTEN__ )
+	/* No host clock: a wasmcart cart imports only `env`. Profiling reads 0. */
+	return 0;
+#else
+	struct timespec ts;
+	clock_gettime( CLOCK_MONOTONIC, &ts );
+	return ts.tv_sec * 1000000000LL + ts.tv_nsec;
+#endif"""
+if old not in src:
+    sys.stderr.write("patch_physics_timer: pattern not found in %s\n" % p)
+    sys.exit(1)
+p.write_text(src.replace(old, new, 1))
+print("patched timer:", p)
+PY
+}
+
 # ── fetch + build Box2D v3 (SIMD) ────────────────────────────────────
 # Box2D 3.x is pure C with an opaque-handle API and first-class wasm SIMD
 # (B2_CPU_WASM selects its SSE2 path; -msse2 lets clang lower those
@@ -52,12 +95,29 @@ fi
 # the C++ v2 that LOVE wraps.
 if [ ! -f vendor/libbox2d.a ]; then
   if [ ! -d vendor/box2d ]; then
-    git clone --depth 1 --branch "$BOX2D_TAG" https://github.com/erincatto/box2d.git vendor/box2d
+    git clone --filter=blob:none https://github.com/erincatto/box2d.git vendor/box2d
+    ( cd vendor/box2d && git checkout -q "$BOX2D_SHA" )
     rm -rf vendor/box2d/.git
   fi
+  patch_physics_timer vendor/box2d/src/timer.c
   ( cd vendor/box2d/src && \
     emcc -O2 -msimd128 -msse2 -c *.c -I../include -I. && \
     emar rcs ../../libbox2d.a *.o && rm -f *.o )
+fi
+
+# ── fetch + build Box3D (SIMD) ───────────────────────────────────────
+# Portable C17, needs only libc + libm. Bound as the Lua global `b3` by
+# physics3d.c. -msimd128 gives it wasm SIMD the same way Box2D gets it.
+if [ ! -f vendor/libbox3d.a ]; then
+  if [ ! -d vendor/box3d ]; then
+    git clone --filter=blob:none https://github.com/erincatto/box3d.git vendor/box3d
+    ( cd vendor/box3d && git checkout -q "$BOX3D_SHA" )
+    rm -rf vendor/box3d/.git
+  fi
+  patch_physics_timer vendor/box3d/src/timer.c
+  ( cd vendor/box3d/src && \
+    emcc -O2 -msimd128 -msse2 -c *.c -I../include -I. && \
+    emar rcs ../../libbox3d.a *.o && rm -f *.o )
 fi
 
 # ── embed the Lua API surface (games ship ONLY their own Lua) ────────
@@ -83,10 +143,12 @@ mkdir -p ../build
 # fallback -- it is the reference implementation, not a legacy path.
 build_engine() {   # $1 = output, $2... = extra flags
   local out="$1"; shift
-  emcc runtime.c vorbis.c cartconf.c physics.c render2d_gl.c \
-    vendor/liblua54.a vendor/libbox2d.a \
-    -O2 -msimd128 -msse2 -DWC_USE_NET_PEER "$@" \
-    -I vendor/lua/src -I vendor/box2d/include -I "$WASMCART_REPO/include" -I . \
+  emcc runtime.c vorbis.c cartconf.c physics.c physics3d.c wc_taskpool.c \
+    render2d_gl.c \
+    vendor/liblua54.a vendor/libbox2d.a vendor/libbox3d.a \
+    -O2 -msimd128 -msse2 -DWC_USE_NET_PEER -DWC_PHYSICS_SIMD='"wasm-simd128"' "$@" \
+    -I vendor/lua/src -I vendor/box2d/include -I vendor/box3d/include \
+    -I "$WASMCART_REPO/include" -I . \
     -s STANDALONE_WASM=1 --no-entry -sSUPPORT_LONGJMP=wasm \
     -s EXPORTED_FUNCTIONS='["_wc_init","_wc_render","_wc_get_info","_wc_debug_state","_wc_set_seed","_wc_peer_on_connect","_wc_peer_on_message","_wc_peer_on_disconnect","_wc_peer_on_error"]' \
     -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
