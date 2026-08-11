@@ -40,12 +40,19 @@ local function must_accept(what, fn)
 end
 
 function love.load()
-  -- 1: a custom vertex format
-  must_refuse("custom vertex format", function()
+  -- 1: too MANY attributes. Custom attribute names are supported now (a
+  --    declared format drives the buffer layout and the shader bindings),
+  --    so the refusal that remains is the hard limit: 8 attribute slots,
+  --    shared across the cart. Past that a format cannot be bound at all,
+  --    and accepting it would mean silently dropping attributes.
+  must_refuse("vertex format with more than 8 attributes", function()
     return love.graphics.newMesh({
-      { "VertexPosition", "float", 2 },
-      { "VertexWeight",   "float", 1 },
-    }, 8, "fan")
+      { "VertexPosition", "float", 3 }, { "VertexTexCoord", "float", 2 },
+      { "VertexNormal", "float", 3 },   { "VertexColor", "byte", 4 },
+      { "AttrE", "float", 1 }, { "AttrF", "float", 1 },
+      { "AttrG", "float", 1 }, { "AttrH", "float", 1 },
+      { "AttrI", "float", 1 },
+    }, { { 0,0,0, 0,0, 0,0,1, 255,255,255,255, 0,0,0,0,0 } }, "triangles")
   end)
 
   -- 2: the "points" draw mode
@@ -75,6 +82,38 @@ function love.load()
     m:setTexture("tex.png")
   end)
 
+  -- 7: a normal without a 3D position. VertexNormal only exists in the 3D
+  --    layout, so pairing it with a 2-component position describes a vertex
+  --    this engine has nowhere to put.
+  must_refuse("VertexNormal with a 2D position", function()
+    return love.graphics.newMesh({
+      { "VertexPosition", "float", 2 },
+      { "VertexNormal",   "float", 3 },
+    }, { { 0, 0, 0, 0, 0 } }, "triangles")
+  end)
+
+  -- 8: a 3D mesh from a vertex COUNT. Its buffer is uploaded once at
+  --    creation and there is no per-vertex write path to fill in later, so
+  --    a count-only 3D mesh could only ever draw nothing.
+  must_refuse("3D mesh from a vertex count", function()
+    return love.graphics.newMesh({
+      { "VertexPosition", "float", 3 },
+      { "VertexTexCoord", "float", 2 },
+      { "VertexNormal",   "float", 3 },
+      { "VertexColor",    "byte",  4 },
+    }, 8, "triangles")
+  end)
+
+  -- 9: a 3D mesh in a non-triangles mode. Fans and strips are 2D
+  --    conveniences; reinterpreting the cart's topology would silently
+  --    render different geometry than it built.
+  must_refuse("3D mesh with a fan draw mode", function()
+    return love.graphics.newMesh({
+      { "VertexPosition", "float", 3 },
+      { "VertexNormal",   "float", 3 },
+    }, { { 0,0,0, 0,0,1 }, { 1,0,0, 0,0,1 }, { 0,1,0, 0,0,1 } }, "fan")
+  end)
+
   -- and the control: a GOOD mesh must still be accepted. Without this the
   -- gate would pass just as well if newMesh refused everything.
   must_accept("a valid default-format mesh", function()
@@ -86,6 +125,57 @@ function love.load()
     if m:getVertexCount() ~= 3 then error("vertex count wrong") end
     if m:getDrawMode() ~= "fan" then error("draw mode not reported") end
     return m
+  end)
+
+  -- the SAME control for 3D. Without it, every refusal above would still
+  -- pass if declared formats were rejected outright, which is exactly the
+  -- state this engine used to be in.
+  must_accept("a valid 3D-format mesh", function()
+    local m = love.graphics.newMesh({
+      { "VertexPosition", "float", 3 },
+      { "VertexTexCoord", "float", 2 },
+      { "VertexNormal",   "float", 3 },
+      { "VertexColor",    "byte",  4 },
+    }, {
+      { -1, -1, 0,  0, 0,  0, 0, 1,  1, 1, 1, 1 },
+      {  1, -1, 0,  1, 0,  0, 0, 1,  1, 1, 1, 1 },
+      {  0,  1, 0,  0.5, 1, 0, 0, 1, 1, 1, 1, 1 },
+    }, "triangles")
+    if m:getVertexCount() ~= 3 then error("vertex count wrong") end
+    if m:type() ~= "Mesh" then error("a 3D mesh must still report type Mesh") end
+    return m
+  end)
+
+  -- A CUSTOM attribute must be accepted. This is what a real renderer needs
+  -- (a tangent for normal mapping, material terms for PBR), and refusing it
+  -- was the wall that stopped 3DreamEngine from building a single mesh.
+  must_accept("a vertex format with custom attributes", function()
+    local m = love.graphics.newMesh({
+      { "VertexPosition", "float", 4 },
+      { "VertexTexCoord", "float", 2 },
+      { "VertexNormal",   "byte",  4 },
+      { "VertexTangent",  "byte",  4 },
+    }, {
+      { 0,0,0,1,  0,0,  128,128,255,0,  255,128,128,0 },
+      { 1,0,0,1,  1,0,  128,128,255,0,  255,128,128,0 },
+      { 0,1,0,1,  0,1,  128,128,255,0,  255,128,128,0 },
+    }, "triangles")
+    if m:getVertexCount() ~= 3 then error("vertex count wrong") end
+    return m
+  end)
+
+  -- A 2D-shaped declared format must route to the 2D path, not be refused:
+  -- it describes exactly the engine's built-in layout, spelled out.
+  must_accept("a declared 2D-format mesh", function()
+    return love.graphics.newMesh({
+      { "VertexPosition", "float", 2 },
+      { "VertexTexCoord", "float", 2 },
+      { "VertexColor",    "byte",  4 },
+    }, {
+      {  0,  0, 0, 0, 1, 1, 1, 1 },
+      { 40,  0, 1, 0, 1, 1, 1, 1 },
+      { 40, 40, 1, 1, 1, 1, 1, 1 },
+    }, "fan")
   end)
 
   -- ── semantics a pixel probe cannot see ───────────────────────────

@@ -131,24 +131,33 @@ A vertex shader defines
 
 **What is different from LÖVE, and why:**
 
-- **The surface is WebGL2 / GLES 3.0 only.** A shader that writes its own
-  `#version`, or uses GLSL ES 1.00 spellings (`gl_FragColor`, `texture2D`,
-  `varying`, `attribute`), or anything from GLES 3.1+ (compute, image
-  load/store) is refused **by name** with an explanation. That is
-  deliberate: handing it to the driver instead produces errors pointing at
-  line numbers in generated code you never wrote.
+- **The surface is WebGL2 / GLES 3.0.** A shader that writes its own
+  `#version`, uses `gl_FragColor`, or reaches for GLES 3.1+ (compute, image
+  load/store) is refused **by name** with an explanation, rather than handed
+  to the driver to produce errors pointing at line numbers in generated code
+  you never wrote. (`gl_FragColor` is refused rather than rewritten because
+  `effect()` *returns* its colour; rewriting it would compile and draw
+  nothing.)
+- **GLSL ES 1.00 spellings are rewritten, not refused.** `attribute`,
+  `varying` and `texture2D` become `in`/`out`/`texture`, which is what LÖVE
+  itself does — nearly every LÖVE shader in the wild is written that way.
+  The rewrite only touches whole identifiers outside comments, strings and
+  preprocessor lines, so a `varyingScale` uniform or a comment that mentions
+  the word is left alone.
 - **`transform_projection` is the identity.** This engine has no
-  model/view/projection matrix; vertices reach the vertex shader already in
-  clip space. Multiplying by it is correct; deriving your own projection
-  from it is not.
+  model/view/projection matrix; 2D vertices reach the vertex shader already
+  in clip space. Multiplying by it is correct; deriving your own projection
+  from it is not. (In a [3D](#3d) shader you supply your own matrices as
+  uniforms, which is the same thing every LÖVE 3D library does.)
 - **`Texel` on the draw's own texture honours the draw type.** An
   untextured draw (a rectangle, a circle) sees an all-white texel, so
   `Texel(tex, uv) * color` reduces to the vertex colour. Sample your own
   `Image` uniforms with plain `texture()`.
-- **An `Image` sent as a uniform is a sub-rect of a shared atlas**, so its
-  uv range is not 0..1. The engine logs the actual range. Use a `Canvas` if
-  you need a 0..1 sampler.
-- **Limits:** 8 shaders, 4 image uniforms per shader, 16 KB of source.
+- **An `Image` sent as a uniform gets its own 0..1 texture.** Sprites live
+  in a shared atlas, but a sampler uniform needs the whole image, so the
+  engine uploads it separately (with `GL_REPEAT` and mipmaps) the first time
+  it is sent.
+- **Limits:** 64 shaders, 15 sampler uniforms per shader, 16 KB of source.
 - **Shaders need GL.** `newShader` fails on a host with no GL context, and
   `setShader` fails if the renderer has fallen back to the software
   rasterizer, rather than drawing unshaded and looking almost right. If a
@@ -196,11 +205,12 @@ Draw modes: `"fan"` (the default), `"strip"`, `"triangles"`.
 
 **What is different from LÖVE, and why:**
 
-- **The vertex format is fixed** at `{x, y, u, v, r, g, b, a}`, and
-  `newMesh(vertexformat, ...)` is **refused**. The renderer has one vertex
-  layout, shared by every program including your own shaders through a single
-  VAO, so extra attributes have nowhere to go. Accepting the call and
-  dropping them would render something that looks nearly right.
+- **The 2D vertex format is fixed** at `{x, y, u, v, r, g, b, a}`. A declared
+  `newMesh(vertexformat, ...)` is matched against the engine's two built-in
+  layouts by attribute name and size: a 2-component `VertexPosition` gets
+  this 2D path, a 3-component one gets [the 3D path](#3d). A format that
+  matches neither is refused by name rather than accepted with its extra
+  attributes silently dropped.
 - **`"points"` is refused.** There is no point primitive on this path.
   Use `love.graphics.points`, or a `"triangles"` mesh of small quads.
 - **`usage` is accepted and ignored.** `"static"`/`"dynamic"`/`"stream"` is a
@@ -218,6 +228,231 @@ Draw modes: `"fan"` (the default), `"strip"`, `"triangles"`.
   triangle, and inventing an approximate one that disagreed with GL would be
   worse than saying so.
 - **Limits:** 32 meshes, 4096 vertices each.
+
+### 3D
+
+The engine has a real 3D pipeline: a depth buffer, face culling, and meshes
+with position, texture coordinates, normals and colour, transformed on the
+GPU by your own shader.
+
+There is no camera, no matrix stack, no model loader and no scene graph, and
+that is deliberate — LÖVE has none of those either. 3D in LÖVE is four
+primitives that a *library* builds a renderer on top of, and matching that
+surface is what lets existing LÖVE 3D libraries run here unmodified.
+[groverburger's g3d](https://github.com/groverburger/g3d) runs with its
+sources copied verbatim; `test/g3d/` is that, as a conformance gate.
+
+```lua
+local mesh = love.graphics.newMesh({
+  {"VertexPosition", "float", 3},
+  {"VertexTexCoord", "float", 2},
+  {"VertexNormal",   "float", 3},
+  {"VertexColor",    "byte",  4},
+}, {
+  --  x  y  z    u  v    nx ny nz   r g b a
+  {  -1, -1, 0,  0, 0,   0, 0, 1,   1,1,1,1 },
+  {   1, -1, 0,  1, 0,   0, 0, 1,   1,1,1,1 },
+  {   0,  1, 0,  0.5,1,  0, 0, 1,   1,1,1,1 },
+}, "triangles")
+mesh:setTexture(myImage)
+
+local shader = love.graphics.newShader([[
+  vec4 effect(vec4 color, Image tex, vec2 uv, vec2 sc) {
+    return Texel(tex, uv) * color;
+  }
+]], [[
+  uniform mat4 projectionMatrix;
+  uniform mat4 viewMatrix;
+  uniform mat4 modelMatrix;
+  varying vec3 normal;                 // ES 1.00 spellings are rewritten
+  vec4 position(mat4 transform_projection, vec4 vertex_position) {
+    normal = VertexNormal;
+    return projectionMatrix * viewMatrix * modelMatrix * vertex_position;
+  }
+]])
+
+love.graphics.setDepthMode("lequal", true)
+love.graphics.setMeshCullMode("back")
+
+function love.draw()
+  love.graphics.setShader(shader)
+  shader:send("projectionMatrix", myProjection)   -- flat 16 or 4x4 nested
+  shader:send("viewMatrix", myView)
+  shader:send("modelMatrix", myModel)
+  love.graphics.draw(mesh)                        -- NO x/y/rotation args
+  love.graphics.setShader()
+end
+```
+
+| Function | Notes |
+|---|---|
+| `newMesh(vertexformat, vertices, "triangles")` | 3-component `VertexPosition` selects 3D |
+| `Mesh:setVertices(verts)` | replaces the buffer; cannot grow past the original count |
+| `Mesh:setTexture(img)` / `getTexture()` | its own GL texture with `GL_REPEAT` + mipmaps |
+| `Mesh:setVertexMap(indices)` | 1-based, like LÖVE |
+| `setDepthMode(compare, write)` / `getDepthMode()` | `never/less/equal/lequal/greater/notequal/gequal/always` |
+| `setMeshCullMode(mode)` / `getMeshCullMode()` | `none` (default), `back`, `front` |
+| `setFrontFaceWinding(w)` / `getFrontFaceWinding()` | `ccw` (default), `cw` |
+
+The vertex layout is `{x, y, z, u, v, nx, ny, nz, r, g, b, a}`; everything
+past `z` is optional and defaults to uv 0, normal 0, opaque white.
+
+**What to know before you build on this:**
+
+- **A 3D draw takes no placement arguments.** `draw(mesh)` only — the
+  transform is your shader's matrices, and the 2D transform stack has no
+  meaning in a perspective projection. Passing x/y would silently shift the
+  model by whatever the stack held.
+- **A 3D draw REQUIRES a bound shader** with a vertex stage. There is no
+  default 3D program, because there is no default projection; without one,
+  `draw` fails loudly rather than drawing model-space coordinates as clip
+  space.
+- **Matrices are row-major**, as in LÖVE. `shader:send` accepts a flat
+  16-number table or a nested 4x4 and transposes on upload. This is the
+  single most expensive thing to get wrong: a transposed matrix draws
+  perfectly and rasterizes nothing, with no GL error to point at it.
+- **Textures bypass the 2D atlas.** A 3D mesh's texture gets its own GL
+  texture so `uv` outside 0..1 can wrap, and it is mipmapped and trilinear —
+  a receding surface aliases badly under the 2D path's `NEAREST`.
+- **Depth is cleared for you** at the start of each frame, and depth/cull
+  state is turned off around every 2D draw, so 2D and 3D compose in one
+  frame without either disturbing the other.
+- **`"triangles"` only.** Fans and strips are 2D conveniences; 3D geometry
+  arrives triangulated.
+- **3D needs GL**, on the same terms as shaders and 2D meshes: `newMesh`
+  refuses on a host with no GL context rather than pretending.
+- **Limits:** 64 meshes, 200000 vertices each.
+
+### Deferred rendering
+
+The GPU surface a real 3D renderer needs: render targets in float formats,
+several of them written in one pass, cube/array/volume textures, and
+instancing.
+
+```lua
+-- A g-buffer: colour + normals + depth, all written by ONE geometry pass.
+local albedo = love.graphics.newCanvas(w, h, { format = "rgba16f" })
+local normal = love.graphics.newCanvas(w, h, { format = "rgba16f" })
+local depth  = love.graphics.newCanvas(w, h, { format = "depth24" })
+
+local geometry = love.graphics.newShader([[
+  #pragma wasmcart mrt 2
+  void effect2(out vec4 c0, out vec4 c1) {
+    c0 = vec4(albedoColor, 1.0);
+    c1 = vec4(normalize(VertexNormal) * 0.5 + 0.5, 1.0);
+  }
+]], myVertexShader)
+
+love.graphics.setCanvas({ albedo, normal, depthstencil = depth })
+love.graphics.clear()
+love.graphics.setShader(geometry)
+love.graphics.draw(mesh)
+love.graphics.setCanvas()
+
+-- The lighting pass reads them back as samplers.
+lighting:send("albedoMap", albedo)
+lighting:send("normalMap", normal)
+```
+
+| Function | Notes |
+|---|---|
+| `newCanvas(w, h, {format=, type=, layers=, mipmaps=, msaa=})` | a GPU target |
+| `setCanvas({t1, t2, ..., depthstencil=d})` | multiple render targets |
+| `setCanvas({{cube, face=n}})` / `{{arr, layer=n}}` | draw into one face/layer |
+| `getCanvasFormats()` / `getSystemLimits()` | **probed at runtime**, not hardcoded |
+| `newCubeImage{6 faces}` / `newArrayImage{...}` / `newVolumeImage{...}` | from paths or Images |
+| `drawInstanced(mesh, count)` | `gl_InstanceID` in the vertex shader |
+| `setColorMask(r,g,b,a)` / `getColorMask()` | |
+| `Canvas:generateMipmaps()` / `setFilter` / `setWrap` | |
+
+**Formats:** `normal`/`rgba8`, `r8`, `rg8`, `r16f`, `rg16f`, `rgba16f`,
+`r32f`, `rgba32f`, `depth16`, `depth24`, `depth32f`, `depth24stencil8`.
+**Types:** `2d`, `cube`, `array`, `volume`.
+
+**Shader sampler types:** `Image` (2D), `CubeImage`, `ArrayImage`,
+`VolumeImage` — declare with the type that matches the texture, or the
+shader will not compile.
+
+### Custom vertex formats
+
+`newMesh` accepts a fully declared format with arbitrary named attributes,
+which is what a real renderer needs — a tangent for normal mapping, material
+terms for PBR, per-instance data:
+
+```lua
+local mesh = love.graphics.newMesh({
+  { "VertexPosition", "float", 4 },   -- 2, 3 or 4 components
+  { "VertexTexCoord", "float", 2 },
+  { "VertexNormal",   "byte",  4 },   -- byte attributes are always 4,
+  { "VertexTangent",  "byte",  4 },   -- normalized to 0..1 in the shader
+}, verts, "triangles")
+```
+
+Vertices may be flat component arrays, tables of named fields
+(`VertexPositionX = ...`), or a **ByteData** of already-interleaved bytes —
+the last is the zero-marshalling path for a renderer that packs its own
+buffer. `Mesh:setVertexMap` likewise takes a table or a packed ByteData.
+
+A shader declares the extra attributes itself; the engine binds each name to
+a stable index across every program, so a shader linked against one mesh
+draws correctly with another. **Limit: 8 attribute slots across the cart.**
+
+### Running LÖVE 3D libraries
+
+Both major LÖVE 3D libraries run with their sources copied verbatim, and
+each is a regression gate in this repo:
+
+| Library | Test | What it proves |
+|---|---|---|
+| [g3d](https://github.com/groverburger/g3d) | `test/g3d` | perspective + depth occlusion |
+| [3DreamEngine](https://github.com/3dreamengine/3DreamEngine) | `test/dream3d` | ffi-packed buffers, custom vertex formats, its own `.obj` loader |
+
+Two compatibility layers make that possible and are worth knowing about:
+
+- **`require("ffi")` works.** Not a real FFI — there is no C to call — but
+  the typed-memory subset these libraries actually use: `cdef` of flat
+  structs, `new`/`cast`/`copy`/`sizeof`, 0-based indexing, and struct
+  elements that write through to the backing bytes. Implemented in pure Lua.
+- **`love.thread` gives you real Channels and inert Threads.** A cart is one
+  wasm instance, so a Thread never runs — but Channels are genuine queues,
+  so producer/consumer code works unchanged. Work that must actually happen
+  has to run on the main thread.
+
+**What to know:**
+
+- **Two kinds of canvas.** `newCanvas(w, h)` with no settings is the
+  original CPU-backed canvas the software rasterizer can draw into.
+  Anything with a `format` or a non-2D `type` is a **GPU-only** target: no
+  readback, no software path, and creating one on a host with no GL is an
+  error rather than a silent 8-bit downgrade. That downgrade is exactly the
+  bug this refuses to hide — a renderer that thinks it has 16 bits and gets
+  8 produces banding no one can explain later.
+- **`getCanvasFormats()` is probed, not declared.** On WebGL2 float targets
+  need `EXT_color_buffer_float`, so the honest answer is a runtime one. Pick
+  your g-buffer format from this table.
+- **MRT needs `#pragma wasmcart mrt N`** and `void effect2(out vec4 c0,
+  ...)` with one `out` per target. `effect()` returns a single colour and
+  cannot express a g-buffer. Outputs are pinned to explicit locations, so
+  attachment order is exactly the order in `setCanvas`.
+- **`depthstencil = true` is refused.** There is no implicit depth buffer to
+  hand out; create one with `{format="depth24"}` and pass it.
+- **Texture units are shared.** Image samplers and render-target samplers
+  draw from one pool of 15 per shader, so they can never collide.
+- **Instancing carries no per-instance attributes.** Pass per-instance data
+  as a uniform array indexed by `gl_InstanceID`, which is what LÖVE's own
+  `drawInstanced` gives you.
+- **Limits:** 32 GPU targets, 64 shaders, 8 render targets per pass (query
+  `getSystemLimits().multicanvas`).
+
+### Directory listing
+
+`love.filesystem.getDirectoryItems` works if the cart ships an
+`assets.index` file — one asset path per line, written by
+`tools/gen-asset-index.sh app/` before packing. The wasmcart ABI can look an
+asset up by path but cannot enumerate one, so without that index there is
+nothing to list and the call errors rather than returning `{}` (which would
+tell a library its resources are missing). Many Lua libraries discover their
+own modules by listing a directory, so this is worth generating.
 
 ### Transforms
 

@@ -9,6 +9,23 @@ if [ -z "${WASMCART_REPO:-}" ]; then
   WASMCART_REPO="$(node -e "console.log(require('path').dirname(require.resolve('wasmcart')))" 2>/dev/null || true)"
 fi
 WASMCART_REPO="${WASMCART_REPO:-../../wasmcart}"
+
+# WARN when the resolved headers differ from a sibling checkout.
+#
+# The npm package is the right default -- building this engine should not
+# require a second repo -- but when someone IS developing the two together,
+# an npm copy that predates a header change fails in the least helpful way
+# available: the engine compiles against the old declarations and a GL enum
+# the new code needs is simply absent, so the error names a symbol rather
+# than the stale file that lacks it. Say which header is in use instead.
+if [ -f ../../wasmcart/include/wasmcart.h ] && \
+   [ -f "$WASMCART_REPO/include/wasmcart.h" ] && \
+   ! cmp -s ../../wasmcart/include/wasmcart.h "$WASMCART_REPO/include/wasmcart.h"; then
+  echo "WARNING: building against $WASMCART_REPO/include/wasmcart.h, which"
+  echo "         DIFFERS from the sibling checkout ../../wasmcart/include/."
+  echo "         If you are developing both, re-run with:"
+  echo "           WASMCART_REPO=\$(cd ../../wasmcart && pwd) ./build.sh"
+fi
 LUA_VERSION=5.4.7
 # Pinned by SHA, not tag. physics.c calls b2Body_SetMotionLocks, which exists
 # in NO released Box2D tag (v3.1.1 is the newest); the old v3.2.0 pin here
@@ -122,7 +139,19 @@ fi
 
 # ── embed the Lua API surface (games ship ONLY their own Lua) ────────
 python3 - <<'PY'
-data = open('prelude.lua', 'rb').read()
+# The ffi shim is appended to the prelude as a PRELOADED MODULE rather than
+# embedded separately: it must be reachable through require("ffi") (which is
+# how every caller asks for it) and it needs nothing the prelude does not
+# already have. One embedded blob, one load, one place to look.
+prelude = open('prelude.lua', 'rb').read()
+ffi_src = open('ffi.lua', 'rb').read()
+
+shim = (b"\n-- ---- embedded module: ffi (see runtime/ffi.lua) ----\n"
+        b"package.loaded['ffi'] = (function()\n"
+        + ffi_src +
+        b"\nend)()\n")
+data = prelude + shim
+
 with open('prelude.inc', 'w') as f:
     f.write('static const unsigned char WCL_PRELUDE[] = {')
     f.write(','.join(str(b) for b in data))
@@ -144,7 +173,7 @@ mkdir -p ../build
 build_engine() {   # $1 = output, $2... = extra flags
   local out="$1"; shift
   emcc runtime.c vorbis.c cartconf.c physics.c physics3d.c wc_taskpool.c \
-    render2d_gl.c \
+    render2d_gl.c render3d_gl.c \
     vendor/liblua54.a vendor/libbox2d.a vendor/libbox3d.a \
     -O2 -msimd128 -msse2 -DWC_USE_NET_PEER -DWC_PHYSICS_SIMD='"wasm-simd128"' "$@" \
     -I vendor/lua/src -I vendor/box2d/include -I vendor/box3d/include \

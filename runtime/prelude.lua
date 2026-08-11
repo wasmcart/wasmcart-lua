@@ -13,6 +13,15 @@
   Colors are 0..1 floats, like LOVE 11+.
 ]]
 
+-- The REAL Lua type(), for engine-internal checks. The prelude installs a
+-- type() at the very end that reports LOVE objects as "userdata" (see
+-- there for why); engine code must not see that, since it works with those
+-- objects AS tables.
+local rawtype = type
+-- Exposed so the embedded ffi shim (appended after this file) can see the
+-- real type() too. Not part of the cart-facing API.
+rawset(_G, "rawtype", rawtype)
+
 local W, H = __WC_WIDTH, __WC_HEIGHT
 __WC_WIDTH, __WC_HEIGHT = nil, nil
 
@@ -54,7 +63,7 @@ local bg = { 0, 0, 0 }
 local cur_font = nil
 
 function graphics.setColor(r, g, b, a)
-  if type(r) == "table" then r, g, b, a = r[1], r[2], r[3], r[4] end
+  if rawtype(r) == "table" then r, g, b, a = r[1], r[2], r[3], r[4] end
   cr = math.floor((r or 0) * 255 + 0.5)
   cg = math.floor((g or 0) * 255 + 0.5)
   cb = math.floor((b or 0) * 255 + 0.5)
@@ -67,15 +76,32 @@ function graphics.getColor()
 end
 
 function graphics.setBackgroundColor(r, g, b)
-  if type(r) == "table" then r, g, b = r[1], r[2], r[3] end
+  if rawtype(r) == "table" then r, g, b = r[1], r[2], r[3] end
   bg[1], bg[2], bg[3] = r or 0, g or 0, b or 0
 end
 
 function graphics.getBackgroundColor() return bg[1], bg[2], bg[3] end
 
-function graphics.clear(r, g, b)
+-- clear() | clear(r,g,b,a) | clear({r,g,b,a}, {r,g,b,a}, ...) |
+-- clear(true, true, ...)
+--
+-- With multiple render targets bound, LOVE takes ONE argument per target:
+-- a table to clear that attachment to a colour, or a boolean to clear it to
+-- the background. A renderer clearing a g-buffer calls it that way, and
+-- treating the first boolean as a red channel is an arithmetic error on a
+-- line the cart author never wrote.
+function graphics.clear(r, g, b, a)
+  if rawtype(r) == "boolean" then
+    -- Clear every bound target to the background. This engine clears the
+    -- whole framebuffer at once rather than per attachment, which is the
+    -- same result whenever the targets are cleared together -- and they are,
+    -- since that is what a single clear() call means.
+    wc.clear(math.floor(bg[1] * 255 + 0.5), math.floor(bg[2] * 255 + 0.5),
+             math.floor(bg[3] * 255 + 0.5))
+    return
+  end
   if r then
-    if type(r) == "table" then r, g, b = r[1], r[2], r[3] end
+    if rawtype(r) == "table" then r, g, b = r[1], r[2], r[3] end
     wc.clear(math.floor(r * 255 + 0.5), math.floor((g or 0) * 255 + 0.5),
              math.floor((b or 0) * 255 + 0.5))
   else
@@ -116,7 +142,7 @@ end
 
 function graphics.line(...)
   local pts = ...
-  if type(pts) ~= "table" then pts = { ... } end
+  if rawtype(pts) ~= "table" then pts = { ... } end
   for i = 1, #pts - 3, 2 do
     local x1, y1 = apply(pts[i], pts[i + 1])
     local x2, y2 = apply(pts[i + 2], pts[i + 3])
@@ -126,7 +152,7 @@ end
 
 function graphics.points(...)
   local pts = ...
-  if type(pts) ~= "table" then pts = { ... } end
+  if rawtype(pts) ~= "table" then pts = { ... } end
   for i = 1, #pts - 1, 2 do
     local x, y = apply(pts[i], pts[i + 1])
     wc.point(x, y)
@@ -135,7 +161,7 @@ end
 
 function graphics.polygon(mode, ...)
   local pts = ...
-  if type(pts) ~= "table" then pts = { ... } end
+  if rawtype(pts) ~= "table" then pts = { ... } end
   local out = {}
   for i = 1, #pts - 1, 2 do
     local x, y = apply(pts[i], pts[i + 1])
@@ -145,11 +171,22 @@ function graphics.polygon(mode, ...)
   wc.polygon(mode == "fill" and 1 or 0, out)
 end
 
--- Forward declaration: graphics.draw() dispatches on SpriteBatch and Mesh,
--- both defined further down. Without this the reference inside draw would
--- bind to a global (nil) instead of the local table.
+-- Forward declaration: graphics.draw() dispatches on SpriteBatch, Mesh and
+-- Mesh3D, all defined further down. Without this the reference inside draw
+-- would bind to a global (nil) instead of the local table -- and since the
+-- dispatch is `getmetatable(img) == Mesh3D`, a nil binding does not error,
+-- it just never matches, and every 3D draw silently falls through to the
+-- image path.
+
 local SpriteBatch
 local Mesh
+local Mesh3D
+local new_mesh_3d
+local new_mesh_generic
+-- Canvas3D is a GPU render target, distinct from the CPU-backed Image-shaped
+-- canvas. setCanvas dispatches on it, so it must be a local visible from
+-- there rather than a global that a cart could shadow.
+local Canvas3D
 
 -- Image / Quad / Canvas objects
 local Image = {}
@@ -157,7 +194,19 @@ Image.__index = Image
 function Image:getWidth()  return self.w end
 function Image:getHeight() return self.h end
 function Image:getDimensions() return self.w, self.h end
-function Image:type() return "Image" end
+function Image:type() return self.canvas and "Canvas" or "Image" end
+-- Canvas introspection. A renderer clones a canvas by reading its settings
+-- back and passing them to newCanvas, so these have to return values that
+-- round-trip -- and the ordinary CPU-backed canvas is always plain 8-bit
+-- RGBA with no mipmaps.
+function Image:getFormat() return "normal" end
+function Image:isReadable() return true end
+function Image:getMSAA() return 0 end
+function Image:getTextureType() return "2d" end
+function Image:getMipmapMode() return "none" end
+function Image:getMipmapCount() return 1 end
+function Image:getDepth() return 1 end
+function Image:getLayerCount() return 1 end
 -- Texture sampling knobs are GPU concepts. The software renderer samples
 -- nearest-neighbour always (correct for pixel art, which is what carts
 -- ship), so these are accepted and ignored rather than erroring: map and
@@ -177,7 +226,7 @@ function Quad:type() return "Quad" end
 -- newImage(path) | newImage(imageData) - LOVE accepts either, and map
 -- loaders routinely pass an ImageData they made earlier.
 function graphics.newImage(src)
-  if type(src) == "table" then
+  if rawtype(src) == "table" then
     if src._img then return src._img end          -- our ImageData wrapper
     error("love.graphics.newImage: unsupported table argument", 2)
   end
@@ -190,19 +239,457 @@ function graphics.newQuad(x, y, w, h, sw, sh)
   return setmetatable({ x = x, y = y, w = w, h = h, sw = sw, sh = sh }, Quad)
 end
 
-function graphics.newCanvas(w, h)
-  local id = wc.canvas_new(w or W, h or H)
-  if not id then error("could not create canvas", 2) end
-  return setmetatable({ id = id, w = w or W, h = h or H, canvas = true }, Image)
+-- ── canvases ────────────────────────────────────────────────────────
+--
+-- There are TWO kinds, and which one you get depends on the settings:
+--
+--   newCanvas(w, h)                     -> the ordinary RGBA8 canvas
+--   newCanvas(w, h, {format = "rgba16f", type = "cube", ...})
+--                                       -> a GPU render target
+--
+-- The plain canvas is backed by an RGBA8 buffer in the cart's own memory,
+-- which is what lets the software rasterizer draw into it and keeps the CPU
+-- fallback exact. That design cannot represent a float target (no 8-bit
+-- form), a depth target (no colour), or a cubemap (six faces, not one
+-- buffer), so those live on the GPU only -- no readback, no software path.
+--
+-- Asking for a GPU-only canvas on a host with no GL is an error rather than
+-- a silent downgrade to RGBA8: a renderer that thinks it has 16 bits of
+-- headroom and gets 8 produces banding it will never explain.
+local GPU_ONLY_FORMATS = {
+  r16f = true, rg16f = true, rgba16f = true, r32f = true, rgba32f = true,
+  depth16 = true, depth24 = true, depth32f = true, depth24stencil8 = true,
+  r8 = true, rg8 = true,
+}
+
+Canvas3D = {}
+Canvas3D.__index = Canvas3D
+function Canvas3D:type() return "Canvas" end
+function Canvas3D:typeOf(t) return t == "Canvas" or t == "Texture" or t == "Object" end
+function Canvas3D:getWidth() return self.w end
+function Canvas3D:getHeight() return self.h end
+function Canvas3D:getDimensions() return self.w, self.h end
+function Canvas3D:getFormat() return self.format end
+function Canvas3D:getTextureType() return self.textype end
+function Canvas3D:getLayerCount() return self.layers end
+function Canvas3D:getMipmapCount() return self.mipmaps and 2 or 1 end
+-- LOVE's newCanvas takes mipmaps as a MODE string, and getMipmapMode returns
+-- it -- a renderer round-trips this to clone a canvas's settings, so the
+-- value has to be one newCanvas accepts back.
+function Canvas3D:getMipmapMode() return self.mipmaps and "manual" or "none" end
+function Canvas3D:getDepth() return 1 end
+function Canvas3D:getDepthSampleMode() return nil end
+function Canvas3D:setDepthSampleMode() end
+function Canvas3D:isReadable() return true end
+function Canvas3D:getMSAA() return 0 end
+function Canvas3D:generateMipmaps() wc.target_mipmaps(self.id) end
+function Canvas3D:release()
+  wc.target_free(self.id)
+  self.id = -1
+  return true
+end
+-- LOVE lets a Canvas be drawn like an Image. A GPU-only target has no CPU
+-- pixels for the 2D path to sample, so say so rather than draw nothing.
+function Canvas3D:getFilter() return self._filter or "linear", self._filter or "linear" end
+function Canvas3D:setFilter(min)
+  self._filter = (min == "nearest") and "nearest" or "linear"
+  wc.image3d_filter(self.id, self._filter == "linear")
+end
+-- setWrap("repeat") applies to every axis, which is the common call; the
+-- per-axis form is honoured when given.
+function Canvas3D:setWrap(s, t, r)
+  self._wrap = s or "clamp"
+  wc.image3d_wrap(self.id, s == "repeat", (t or s) == "repeat",
+                  (r or s) == "repeat")
+end
+function Canvas3D:getWrap()
+  local w = self._wrap or "clamp"
+  return w, w, w
 end
 
-function graphics.setCanvas(c)
-  if c then wc.set_canvas(c.id) else wc.set_canvas(nil) end
+function graphics.newCanvas(w, h, settings)
+  w = w or W; h = h or H
+  if rawtype(settings) == "table" then
+    local fmt = settings.format or "normal"
+    local textype = settings.type or "2d"
+    if GPU_ONLY_FORMATS[fmt] or textype ~= "2d" then
+      local id, why = wc.target_new(w, h, fmt, textype,
+                                    settings.layers or 1,
+                                    settings.mipmaps and settings.mipmaps ~= "none",
+                                    settings.msaa or 0)
+      if not id then
+        if why == "nogl" then
+          error("love.graphics.newCanvas: a '" .. tostring(fmt) .. "' " ..
+                tostring(textype) .. " canvas is a GPU render target, and this " ..
+                "run is on the software rasterizer. There is no CPU " ..
+                "representation of it to fall back to.", 2)
+        elseif why == "format" then
+          error("love.graphics.newCanvas: unknown pixel format '" ..
+                tostring(fmt) .. "'. Supported: normal/rgba8, r8, rg8, r16f, " ..
+                "rg16f, rgba16f, r32f, rgba32f, depth16, depth24, depth32f, " ..
+                "depth24stencil8.", 2)
+        elseif why == "type" then
+          error("love.graphics.newCanvas: unknown texture type '" ..
+                tostring(textype) .. "'. Supported: 2d, cube, array, volume.", 2)
+        end
+        error("love.graphics.newCanvas: this driver cannot render to format '" ..
+              tostring(fmt) .. "' at " .. w .. "x" .. h ..
+              " (see the cart log)", 2)
+      end
+      local layers = (textype == "cube") and 6 or (settings.layers or 1)
+      return setmetatable({ id = id, w = w, h = h, format = fmt,
+                            textype = textype, layers = layers,
+                            mipmaps = settings.mipmaps and settings.mipmaps ~= "none",
+                            gpu = true }, Canvas3D)
+    end
+  end
+  local id = wc.canvas_new(w, h)
+  if not id then error("could not create canvas", 2) end
+  return setmetatable({ id = id, w = w, h = h, canvas = true }, Image)
 end
+
+-- ── cube / array / volume images ────────────────────────────────────
+--
+-- The read-only twin of a GPU canvas: the same texture shapes, filled from
+-- the cart's own images instead of rendered into. A skybox is a cube image,
+-- a texture atlas that must not bleed between entries is an array image, and
+-- a 3D lookup table is a volume image.
+--
+-- Sources may be paths, Images, or ImageData -- LOVE accepts all three and
+-- ported code uses each. They are all resolved to a decoded 2D image first,
+-- which means cube faces get the same PNG decoder and the same missing-asset
+-- error as every other texture in the cart.
+local function resolve_layer_source(src, what, index)
+  if rawtype(src) == "string" then
+    local img = graphics.newImage(src)
+    return img
+  end
+  if rawtype(src) == "table" then
+    -- an ImageData wrapper from love.image.newImageData
+    if src._img then return src._img end
+    if src.id then return src end
+  end
+  error(what .. ": source " .. index .. " must be a filename, an Image or " ..
+        "an ImageData, got " .. rawtype(src), 3)
+end
+
+local function new_layered_image(what, textype, sources, settings)
+  if rawtype(sources) ~= "table" or #sources < 1 then
+    error(what .. ": expected a table of " ..
+          (textype == "cube" and "6 faces" or "layers"), 3)
+  end
+  -- LOVE also accepts a single filename for a cube image laid out as a
+  -- cross or a strip. That needs an image-slicing step this engine has no
+  -- reason to guess at, so it is refused with the shape that does work.
+  if textype == "cube" and #sources ~= 6 then
+    error(what .. ": expected exactly 6 faces (+X, -X, +Y, -Y, +Z, -Z), got " ..
+          #sources .. ". A single-image cube layout (cross/strip) is not " ..
+          "supported; pass the six faces.", 3)
+  end
+
+  local imgs = {}
+  for i = 1, #sources do
+    imgs[i] = resolve_layer_source(sources[i], what, i)
+  end
+  local w, h = imgs[1].w, imgs[1].h
+
+  settings = settings or {}
+  local id, why = wc.image3d_new(w, h, textype, #imgs,
+                                 settings.mipmaps and settings.mipmaps ~= "none")
+  if not id then
+    if why == "nogl" then
+      error(what .. ": this run is on the software rasterizer, and a " ..
+            textype .. " texture is GPU-only.", 3)
+    end
+    error(what .. ": the texture could not be created (" .. tostring(why) ..
+          ")", 3)
+  end
+  for i = 1, #imgs do
+    if not wc.image3d_upload_from(id, i - 1, imgs[i].id) then
+      error(what .. ": face/layer " .. i .. " could not be uploaded. Every " ..
+            "face must be the same size (" .. w .. "x" .. h .. ").", 3)
+    end
+  end
+  wc.image3d_finish(id)
+
+  return setmetatable({ id = id, w = w, h = h, format = "rgba8",
+                        textype = textype, layers = #imgs,
+                        mipmaps = settings.mipmaps and settings.mipmaps ~= "none",
+                        gpu = true, image = true }, Canvas3D)
+end
+
+function graphics.newCubeImage(faces, settings)
+  return new_layered_image("love.graphics.newCubeImage", "cube", faces, settings)
+end
+
+function graphics.newArrayImage(layers, settings)
+  return new_layered_image("love.graphics.newArrayImage", "array", layers, settings)
+end
+
+function graphics.newVolumeImage(slices, settings)
+  return new_layered_image("love.graphics.newVolumeImage", "volume", slices, settings)
+end
+
+-- love.graphics.getCanvasFormats() - which formats this driver can render
+-- to. PROBED, not hardcoded: on WebGL2 the float formats are renderable only
+-- with EXT_color_buffer_float, so the honest answer is a runtime one. A
+-- renderer picks its g-buffer format from this table (3DreamEngine does
+-- exactly that), and a wrong answer here means an incomplete framebuffer
+-- much later, with nothing pointing back to the cause.
+function graphics.getCanvasFormats()
+  local out = {}
+  for _, f in ipairs({ "normal", "rgba8", "r8", "rg8", "r16f", "rg16f",
+                       "rgba16f", "r32f", "rgba32f", "depth16", "depth24",
+                       "depth32f", "depth24stencil8" }) do
+    out[f] = wc.target_supported(f) and true or false
+  end
+  -- The plain RGBA8 canvas exists even with no GL at all.
+  out.normal = true
+  out.rgba8 = true
+  return out
+end
+
+function graphics.getSystemLimits()
+  return {
+    -- LOVE calls the MRT limit "multicanvas".
+    multicanvas = wc.gl_limit(0),
+    texturesize = wc.gl_limit(1),
+    cubetexturesize = wc.gl_limit(2),
+    volumetexturesize = wc.gl_limit(3),
+    texturelayers = wc.gl_limit(4),
+    multisample = wc.gl_limit(5),
+    anisotropy = 1,
+    pointsize = 1,
+  }
+end
+
+-- The canvas is TRACKED, not just forwarded, because getCanvas is a real
+-- part of the API rather than a convenience: a renderer has to know whether
+-- it is drawing to the screen or to an off-screen target, since an FBO's
+-- origin is bottom-left against the screen's top-left and the projection
+-- has to flip to match. g3d asks on every model draw
+-- (`shader:send("isCanvasEnabled", love.graphics.getCanvas() ~= nil)`), and
+-- without it the whole scene renders vertically mirrored.
+local cur_canvas = nil
+-- Forward declaration: graphics.push saves the bound shader, and push is
+-- defined above the Shader section. Without this it would bind to a global.
+local cur_shader = nil
+
+-- setCanvas() | setCanvas(canvas) | setCanvas({t1, t2, ..., depthstencil = d})
+-- and LOVE's per-target form  setCanvas({{canvas, face = n}, ...})
+--
+-- The multi-target call is what a deferred renderer's geometry pass is: one
+-- draw writing colour, normals and depth to separate attachments at once,
+-- which is the difference between one geometry pass and three.
+function graphics.setCanvas(a, ...)
+  -- setCanvas() with no arguments: back to the screen.
+  if a == nil then
+    wc.set_canvas(nil)
+    wc.target_bind(nil, nil, nil)
+    cur_canvas = nil
+    return
+  end
+
+  -- A single ordinary canvas keeps the original CPU-backed path.
+  if getmetatable(a) == Image then
+    wc.target_bind(nil, nil, nil)      -- drop any GPU target first
+    wc.set_canvas(a.id)
+    cur_canvas = a
+    return
+  end
+
+  -- A single GPU target.
+  if getmetatable(a) == Canvas3D then
+    wc.set_canvas(nil)
+    if not wc.target_bind({ a.id }, { 0 }, nil) then
+      error("love.graphics.setCanvas: the framebuffer could not be completed " ..
+            "(see the cart log)", 2)
+    end
+    cur_canvas = a
+    return
+  end
+
+  if rawtype(a) ~= "table" then
+    error("love.graphics.setCanvas: expected a Canvas, a table of Canvases, " ..
+          "or no arguments, got " .. rawtype(a), 2)
+  end
+
+  -- The table form. Entries are either a Canvas or {Canvas, face = n,
+  -- layer = n, mipmap = n}; `depthstencil` names the depth target.
+  local handles, layers = {}, {}
+  local list = a
+  for i = 1, #list do
+    local e = list[i]
+    local canvas, layer = e, 0
+    if getmetatable(e) ~= Canvas3D and getmetatable(e) ~= Image and rawtype(e) == "table" then
+      canvas = e[1]
+      -- LOVE spells the cube face "face" and the array slice "layer"; both
+      -- are 1-based in its API and 0-based in GL.
+      layer = (e.face and e.face - 1) or (e.layer and e.layer - 1) or 0
+    end
+    if getmetatable(canvas) == Image then
+      error("love.graphics.setCanvas: an ordinary canvas cannot be one of " ..
+            "several render targets -- it is a CPU buffer, not a GPU " ..
+            "attachment. Create it with a format (e.g. {format=\"rgba16f\"}) " ..
+            "to get a target that can.", 2)
+    end
+    if getmetatable(canvas) ~= Canvas3D then
+      error("love.graphics.setCanvas: entry " .. i .. " is not a Canvas", 2)
+    end
+    handles[#handles + 1] = canvas.id
+    layers[#layers + 1] = layer
+  end
+
+  local depth, dlayer = nil, 0
+  local ds = list.depthstencil
+  if ds ~= nil and ds ~= false then
+    -- `depthstencil = true` asks for a depth buffer without naming one.
+    -- This engine has no implicit depth attachment to hand out, so say so
+    -- rather than silently render without depth testing.
+    if ds == true then
+      error("love.graphics.setCanvas: depthstencil=true asks this engine for " ..
+            "an implicit depth buffer, which it does not have. Create one " ..
+            "explicitly -- newCanvas(w, h, {format=\"depth24\"}) -- and pass " ..
+            "it as depthstencil.", 2)
+    end
+    local dc = ds
+    if getmetatable(dc) ~= Canvas3D and rawtype(dc) == "table" then
+      dc = ds[1]
+      dlayer = (ds.face and ds.face - 1) or (ds.layer and ds.layer - 1) or 0
+    end
+    if getmetatable(dc) ~= Canvas3D then
+      error("love.graphics.setCanvas: depthstencil is not a Canvas", 2)
+    end
+    depth = dc.id
+  end
+
+  if #handles == 0 and not depth then
+    wc.set_canvas(nil)
+    wc.target_bind(nil, nil, nil)
+    cur_canvas = nil
+    return
+  end
+
+  wc.set_canvas(nil)
+  if not wc.target_bind(handles, layers, depth, dlayer) then
+    error("love.graphics.setCanvas: the framebuffer could not be completed. " ..
+          "Every target must be the same size, the driver must support " ..
+          "rendering to each format, and there must be no more targets than " ..
+          "getSystemLimits().multicanvas (" .. tostring(wc.gl_limit(0)) ..
+          "). See the cart log.", 2)
+  end
+  cur_canvas = list[1]
+  return
+end
+
+function graphics.getCanvas() return cur_canvas end
 
 -- draw(image, [quad], x, y, r, sx, sy, ox, oy)
+-- Drawing a GPU render target as an IMAGE.
+--
+-- A deferred renderer composites by drawing its canvases: the AO pass draws
+-- the depth canvas, the blur passes draw each other, and the final pass
+-- draws the colour canvas to the screen. Every one of those is
+-- love.graphics.draw(canvas, ...) on a target this engine keeps on the GPU.
+--
+-- Without this, all of that silently does nothing -- every pass runs, no
+-- error is raised, and the screen stays black. That is exactly the failure
+-- this hit: shaders compiled, meshes drew, and the composite never landed.
+--
+-- Implemented as a textured quad through the 3D pipeline, because that is
+-- the path that can sample a GPU texture at all. The quad is built once and
+-- its vertices rewritten per draw.
+local blit_quad, blit_shader
+
+local function draw_gpu_target(target, x, y, r, sx, sy, ox, oy)
+  x = x or 0; y = y or 0; r = r or 0
+  sx = sx or 1; sy = sy or (sx or 1); ox = ox or 0; oy = oy or 0
+
+  if not blit_shader then
+    blit_shader = graphics.newShader([[
+      extern Image wc_blit_tex;
+      vec4 effect(vec4 c, Image t, vec2 uv, vec2 sc) {
+        return texture(wc_blit_tex, uv) * c;
+      }
+    ]], [[
+      vec4 position(mat4 tp, vec4 vp) {
+        vec3 n = VertexNormal;    // selects the 3D prologue
+        return vec4(vp.xy, 0.0, 1.0);
+      }
+    ]])
+    blit_quad = new_mesh_generic({
+      { "VertexPosition", "float", 3 },
+      { "VertexTexCoord", "float", 2 },
+      { "VertexNormal",   "float", 3 },
+      { "VertexColor",    "byte",  4 },
+    }, {
+      {0,0,0, 0,0, 0,0,1, 255,255,255,255},
+      {0,0,0, 1,0, 0,0,1, 255,255,255,255},
+      {0,0,0, 1,1, 0,0,1, 255,255,255,255},
+      {0,0,0, 0,0, 0,0,1, 255,255,255,255},
+      {0,0,0, 1,1, 0,0,1, 255,255,255,255},
+      {0,0,0, 0,1, 0,0,1, 255,255,255,255},
+    }, "triangles")
+  end
+
+  -- Destination rect in the CURRENT target's pixel space, composed with the
+  -- transform stack exactly as an image draw is.
+  local w, h = target.w * sx, target.h * sy
+  local px, py = apply(x - ox * sx, y - oy * sy)
+  local dw, dh = w * tsx, h * tsy
+
+  -- Pixels -> clip space. The destination may be the screen or another GPU
+  -- target; W/H here is whichever is bound, which graphics.getWidth tracks.
+  local vw, vh = graphics.getWidth(), graphics.getHeight()
+  local cur = graphics.getCanvas()
+  if cur and cur.w then vw, vh = cur.w, cur.h end
+  local function clip(qx, qy)
+    return (qx / vw) * 2 - 1, 1 - (qy / vh) * 2
+  end
+  local x0, y0 = clip(px, py)
+  local x1, y1 = clip(px + dw, py + dh)
+
+  local vs = {
+    {x0,y0,0, 0,0, 0,0,1, 255,255,255,255},
+    {x1,y0,0, 1,0, 0,0,1, 255,255,255,255},
+    {x1,y1,0, 1,1, 0,0,1, 255,255,255,255},
+    {x0,y0,0, 0,0, 0,0,1, 255,255,255,255},
+    {x1,y1,0, 1,1, 0,0,1, 255,255,255,255},
+    {x0,y1,0, 0,1, 0,0,1, 255,255,255,255},
+  }
+  blit_quad:setVertices(vs)
+
+  -- A composite blit is a 2D operation wearing 3D clothes: it must not be
+  -- depth-tested (its quad has no meaningful z against the scene's depths)
+  -- and must not be culled (its winding is whatever the quad happens to
+  -- be). A renderer leaves both enabled from its geometry pass, so the
+  -- final draw would be discarded entirely -- which is a black screen after
+  -- a pipeline that ran perfectly.
+  local prevDepth, prevWrite = graphics.getDepthMode()
+  local prevCull = graphics.getMeshCullMode()
+  graphics.setDepthMode()
+  graphics.setMeshCullMode("none")
+
+  local prev = graphics.getShader()
+  blit_shader:send("wc_blit_tex", target)
+  graphics.setShader(blit_shader)
+  wc.mesh3d_draw(blit_quad.id)
+  graphics.setShader(prev)
+
+  graphics.setDepthMode(prevDepth, prevWrite)
+  graphics.setMeshCullMode(prevCull)
+end
+
 function graphics.draw(img, a, b, c, d, e, f, g, h)
   if not img then return end
+
+  -- A GPU render target drawn as an image. Must come BEFORE the Image case:
+  -- a Canvas3D has an `id` too, and the 2D path would look it up in the
+  -- image table and find someone else's texture.
+  if getmetatable(img) == Canvas3D then
+    draw_gpu_target(img, a, b, c, d, e, f, g)
+    return
+  end
 
   -- a SpriteBatch replays its entries, offset by the batch's own transform
   if getmetatable(img) == SpriteBatch then
@@ -216,6 +703,22 @@ function graphics.draw(img, a, b, c, d, e, f, g, h)
       if it.quad then qx, qy, qw, qh = it.quad.x, it.quad.y, it.quad.w, it.quad.h end
       wc.image_draw(batchImg.id, px, py, it.r + trot,
                     it.sx * tsx, it.sy * tsy, it.ox, it.oy, qx, qy, qw, qh)
+    end
+    return
+  end
+
+  -- A 3D mesh takes NO placement arguments: its transform is the cart's own
+  -- matrices inside its vertex shader, and the 2D transform stack has no
+  -- meaning in a perspective projection. Silently applying tx/ty here would
+  -- shift a model by the stack's leftover translation, which reads as a
+  -- camera bug in the cart rather than an engine one.
+  if getmetatable(img) == Mesh3D then
+    if not wc.mesh3d_draw(img.id) then
+      error("love.graphics.draw(mesh): the 3D mesh could not be drawn. Either " ..
+            "this run is on the software rasterizer (3D is GL-only), or no " ..
+            "shader is bound -- a 3D draw REQUIRES love.graphics.setShader " ..
+            "with a vertex stage, because that is where the model/view/" ..
+            "projection transform lives. See the cart log.", 2)
     end
     return
   end
@@ -237,7 +740,7 @@ function graphics.draw(img, a, b, c, d, e, f, g, h)
 
   if not img.id then return end
   local quad, x, y, r, sx, sy, ox, oy
-  if type(a) == "table" and a.getViewport then
+  if rawtype(a) == "table" and a.getViewport then
     quad = a; x, y, r, sx, sy, ox, oy = b, c, d, e, f, g, h
   else
     x, y, r, sx, sy, ox, oy = a, b, c, d, e, f, g
@@ -262,7 +765,7 @@ SpriteBatch.__index = SpriteBatch
 
 function SpriteBatch:add(a, b, c, d, e, f, g, h, i)
   local quad, x, y, r, sx, sy, ox, oy
-  if type(a) == "table" and a.getViewport then
+  if rawtype(a) == "table" and a.getViewport then
     quad = a; x, y, r, sx, sy, ox, oy = b, c, d, e, f, g, h
   else
     x, y, r, sx, sy, ox, oy = a, b, c, d, e, f, g
@@ -277,7 +780,7 @@ function SpriteBatch:set(idx, a, b, c, d, e, f, g, h)
   local it = self.items[idx]
   if not it then return end
   local quad, x, y, r, sx, sy, ox, oy
-  if type(a) == "table" and a.getViewport then
+  if rawtype(a) == "table" and a.getViewport then
     quad = a; x, y, r, sx, sy, ox, oy = b, c, d, e, f, g, h
   else
     x, y, r, sx, sy, ox, oy = a, b, c, d, e, f, g
@@ -311,7 +814,7 @@ function graphics.newFont(a, b)
   -- newFont(path, size) | newFont(size) -> scaled bitfont.
   -- Sizes are rounded: games compute them from screen scale, so a
   -- fractional size is normal and must not be an error.
-  if type(a) == "string" then
+  if rawtype(a) == "string" then
     local px = math.max(1, math.floor((tonumber(b) or 12) + 0.5))
     local id, real = wc.font_load(a, px)
     if not id then error("could not load font: " .. tostring(a), 2) end
@@ -383,13 +886,45 @@ function graphics.printf(text, x, y, limit, align)
 end
 
 -- transform stack
-function graphics.push()
-  tstack[#tstack + 1] = { tx, ty, tsx, tsy, trot }
+-- push([stacktype]) / pop()
+--
+-- LOVE's stack saves the TRANSFORM, and with push("all") the whole render
+-- state -- canvas, shader, colour, blend mode, scissor. A renderer leans on
+-- that hard: 3DreamEngine's final pass is `love.graphics.pop()` followed by
+-- a draw, and the pop is what puts rendering back on the SCREEN after its
+-- passes have each bound their own canvas.
+--
+-- Saving only the transform (what this used to do) made that pop a no-op,
+-- so the final composite drew into whichever 640x360 bloom canvas was still
+-- bound. The screen stayed black and every pass had "worked". Restoring the
+-- canvas is what makes the picture arrive.
+--
+-- The state is captured on EVERY push, not only push("all"): a renderer
+-- that pushes plain and pops expecting its canvas back is relying on
+-- LOVE's actual behaviour, and the cost is one small table.
+function graphics.push(stacktype)
+  tstack[#tstack + 1] = {
+    tx, ty, tsx, tsy, trot,
+    canvas = cur_canvas,
+    shader = cur_shader,
+    r = cr, g = cg, b = cb, a = ca,
+    all = stacktype == "all",
+  }
 end
 
 function graphics.pop()
   local t = table.remove(tstack)
-  if t then tx, ty, tsx, tsy, trot = t[1], t[2], t[3], t[4], t[5] end
+  if not t then return end
+  tx, ty, tsx, tsy, trot = t[1], t[2], t[3], t[4], t[5]
+  -- Restore the render target only when it actually changed, so a pop does
+  -- not re-bind (and re-clear the clip scale for) the target already bound.
+  if t.canvas ~= cur_canvas then
+    graphics.setCanvas(t.canvas)
+  end
+  if t.all then
+    if t.shader ~= cur_shader then graphics.setShader(t.shader) end
+    graphics.setColor(t.r / 255, t.g / 255, t.b / 255, t.a / 255)
+  end
 end
 
 -- translate composes THROUGH the current rotation+scale, so a translate
@@ -480,23 +1015,42 @@ function Shader:getHandle() return self.id end
 -- throwing there would be worse than useless. A name that was never written
 -- at all is the same case and is reported the same way.
 function Shader:send(name, a, ...)
-  if type(name) ~= "string" then
+  if rawtype(name) ~= "string" then
     error("Shader:send: the uniform name must be a string", 2)
   end
-  if type(a) == "table" then
+  if rawtype(a) == "table" then
+    -- A GPU render target binds as a sampler of its own texture TYPE
+    -- (samplerCube / sampler2DArray / sampler3D / sampler2D), which the 2D
+    -- image path has no uniform for. Each gets its own texture unit,
+    -- assigned per shader in order of first use, because unit 0 belongs to
+    -- the 2D batcher and would be clobbered by the next sprite.
+    if getmetatable(a) == Canvas3D then
+      self._units = self._units or {}
+      local unit = self._units[name]
+      if not unit then
+        self._next_unit = (self._next_unit or 0) + 1
+        unit = self._next_unit
+        if unit > 15 then
+          error("Shader:send('" .. name .. "'): out of texture units (15 max " ..
+                "per shader)", 2)
+        end
+        self._units[name] = unit
+      end
+      return wc.target_send(self.id, name, a.id, unit)
+    end
     if a.id and (a.w or a.canvas) then          -- an Image or a Canvas
       return wc.shader_send_image(self.id, name, a.id)
     end
     return wc.shader_send(self.id, name, a)
   end
-  if type(a) == "boolean" then
+  if rawtype(a) == "boolean" then
     return wc.shader_send_bool(self.id, name, a, ...)
   end
-  if type(a) == "number" then
+  if rawtype(a) == "number" then
     return wc.shader_send(self.id, name, a, ...)
   end
   error("Shader:send('" .. name .. "'): unsupported value type '" ..
-        type(a) .. "'. Supported: number(s), a table of 1-4 numbers, a 4x4 " ..
+        rawtype(a) .. "'. Supported: number(s), a table of 1-4 numbers, a 4x4 " ..
         "table-of-tables, boolean(s), an Image or a Canvas.", 2)
 end
 
@@ -517,7 +1071,7 @@ function Shader:release() return true end
 -- string that names an existing asset is read from it; anything else is
 -- treated as source, which is how the inline [[...]] idiom works.
 local function shader_source(s)
-  if type(s) ~= "string" then return nil end
+  if rawtype(s) ~= "string" then return nil end
   if not s:find("[\n{;]") and wc.asset_exists(s) then
     local src = wc.asset_read(s)
     if not src then error("could not read shader asset: " .. s, 3) end
@@ -534,12 +1088,25 @@ end
 -- ipairs({nil, v}) stops at index 1, so the vertex source was dropped and
 -- the call failed with "no shader source given". Index explicitly.
 local function shader_split(a, b)
+  -- ONE source containing BOTH stages is the standard LOVE shader file:
+  -- the whole thing is compiled twice, guarded by `#ifdef VERTEX` and
+  -- `#ifdef PIXEL`, and the engine's prologues define exactly one of those
+  -- per stage. Assigning such a source to a single stage (which this used to
+  -- do, since it matched `position()` first) drops the other half entirely
+  -- and reports "a 3D shader must supply a vertex stage" about a file that
+  -- plainly contains one.
+  if a and not b then
+    local has_pos = a:find("vec4%s+position%s*%(")
+    local has_eff = a:find("effect%s*%(")
+    if has_pos and has_eff then return a, a end
+  end
+
   local pixel, vertex
   for i = 1, 2 do
     local s = (i == 1) and a or b
     if s then
       if s:find("vec4%s+position%s*%(") then vertex = s
-      elseif s:find("vec4%s+effect%s*%(") then pixel = s
+      elseif s:find("effect%s*%(") then pixel = s
       elseif not pixel then pixel = s
       else vertex = s end
     end
@@ -547,12 +1114,80 @@ local function shader_split(a, b)
   return pixel, vertex
 end
 
+-- Is this a 3D shader?
+--
+-- LOVE has no flag for it: the same newShader builds both, and which vertex
+-- ATTRIBUTES exist is decided by the mesh the shader is later drawn with.
+-- This engine has to choose a prologue at compile time, so it infers from
+-- the source, and the signal is VertexNormal -- the one attribute that
+-- exists only in the 3D layout. Every LOVE 3D shader declares or reads it
+-- (g3d's `attribute vec3 VertexNormal;` is the canonical line), and no 2D
+-- shader mentions it, since there is nothing to mention.
+--
+-- A cart can force the choice with a `#pragma wasmcart 3d` line, which is
+-- the escape hatch for a 3D shader that genuinely ignores normals. The
+-- pragma is stripped before the source reaches GL.
+local function shader_is_3d(pixel, vertex)
+  for _, s in ipairs({ vertex or "", pixel or "" }) do
+    if s:find("#pragma%s+wasmcart%s+3d") then return true end
+    if s:find("#pragma%s+wasmcart%s+mrt") then return true end
+    if s:find("VertexNormal") then return true end
+  end
+  return false
+end
+
 function graphics.newShader(a, b)
   local pixel, vertex = shader_split(shader_source(a), shader_source(b))
   if not pixel and not vertex then
     error("love.graphics.newShader: no shader source given", 2)
   end
-  local id = wc.shader_new(pixel, vertex)
+  local is3d = shader_is_3d(pixel, vertex)
+
+  -- `#pragma wasmcart mrt N` selects the multi-output fragment scaffold: the
+  -- shader then defines `void effect2(out vec4 c0, ..., out vec4 cN-1)` and
+  -- writes one colour per bound render target. This is how a deferred
+  -- renderer's geometry pass fills a g-buffer in a single pass.
+  local mrt = 0
+  for _, s in ipairs({ pixel or "", vertex or "" }) do
+    local n = s:match("#pragma%s+wasmcart%s+mrt%s+(%d+)")
+    if n then mrt = math.floor(tonumber(n)) break end
+  end
+
+  -- LOVE's OWN multi-target form: `void effect()` writing love_Canvases[i].
+  -- Real LOVE renderers are written this way (3DreamEngine's sky and
+  -- g-buffer shaders both are), so it is detected rather than requiring the
+  -- pragma. The target count is the highest index the source touches, plus
+  -- one -- there is nothing else in the shader that states it.
+  if mrt == 0 and pixel and pixel:find("love_Canvases") then
+    local highest = -1
+    for idx in pixel:gmatch("love_Canvases%s*%[%s*(%d+)%s*%]") do
+      local i = tonumber(idx)
+      if i > highest then highest = i end
+    end
+    if highest >= 0 then
+      -- Negative marks the love_Canvases form for the C side.
+      mrt = -(highest + 1)
+    end
+  end
+  if mrt ~= 0 then
+    is3d = true                       -- MRT implies the 3D vertex layout
+    if math.abs(mrt) > 8 then
+      error("love.graphics.newShader: at most 8 render targets (asked for " ..
+            math.abs(mrt) .. ")", 2)
+    end
+  end
+
+  -- GLSL has no #pragma of ours; strip them rather than let the driver warn
+  -- about an unknown one on every compile.
+  local function strip(s)
+    if not s then return nil end
+    s = s:gsub("#pragma%s+wasmcart%s+3d", "")
+    s = s:gsub("#pragma%s+wasmcart%s+mrt%s+%d+", "")
+    return s
+  end
+  if is3d or mrt ~= 0 then pixel, vertex = strip(pixel), strip(vertex) end
+
+  local id = wc.shader_new(pixel, vertex, is3d, mrt)
   if not id then
     -- the GL info log has already gone to wc_log with the real compiler
     -- message; this is the Lua-visible failure so a cart cannot carry on
@@ -563,7 +1198,6 @@ function graphics.newShader(a, b)
   return setmetatable({ id = id }, Shader)
 end
 
-local cur_shader = nil
 
 -- setShader(shader) | setShader() to revert to the engine's default program
 function graphics.setShader(s)
@@ -624,7 +1258,7 @@ local MESH_MODES = { fan = 0, strip = 1, triangles = 2 }
 
 -- setVertex(i, x, y, u, v, r, g, b, a) | setVertex(i, {x, y, u, v, r, g, b, a})
 function Mesh:setVertex(i, a, b, c, d, e, f, g, h)
-  if type(a) == "table" then
+  if rawtype(a) == "table" then
     a, b, c, d, e, f, g, h = a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]
   end
   wc.mesh_set_vertex(self.id, i - 1, a or 0, b or 0, c or 0, d or 0,
@@ -655,8 +1289,8 @@ function Mesh:setTexture(img)
     wc.mesh_set_texture(self.id, nil)
     return
   end
-  if type(img) ~= "table" or not img.id then
-    error("Mesh:setTexture: expected an Image or a Canvas, got " .. type(img), 2)
+  if rawtype(img) ~= "table" or not img.id then
+    error("Mesh:setTexture: expected an Image or a Canvas, got " .. rawtype(img), 2)
   end
   self.tex = img
   wc.mesh_set_texture(self.id, img.id)
@@ -671,7 +1305,7 @@ function Mesh:setVertexMap(a, ...)
     wc.mesh_set_map(self.id, nil)
     return
   end
-  local src = (type(a) == "table") and a or { a, ... }
+  local src = (rawtype(a) == "table") and a or { a, ... }
   local out = {}
   for i = 1, #src do out[i] = src[i] - 1 end
   wc.mesh_set_map(self.id, out)
@@ -716,21 +1350,366 @@ Mesh.getVertexFormat = function()
            {"VertexColor",    "byte",  4} }
 end
 
+-- ── 3D meshes ───────────────────────────────────────────────────────
+--
+-- A separate object from Mesh, not a mode of it. The two share a name in
+-- LOVE's API and nothing else: this one's vertices live in a GPU buffer that
+-- is written once, it has no transform arguments on draw (the cart's shader
+-- does that), and it is drawn against the depth buffer. Merging them would
+-- mean every 2D mesh method needed a "which kind am I" branch.
+--
+-- Vertex layout, matching what the C side reads (mesh3d_read_vertex):
+--     {x, y, z, u, v, nx, ny, nz, r, g, b, a}
+-- Everything past z is optional. This is exactly g3d's vertexFormat order,
+-- which is not a coincidence -- that order is the de-facto LOVE 3D layout.
+Mesh3D = {}
+Mesh3D.__index = Mesh3D
+function Mesh3D:type() return "Mesh" end
+function Mesh3D:typeOf(t) return t == "Mesh" or t == "Object" end
+function Mesh3D:getVertexCount() return self.n end
+function Mesh3D:getDrawMode() return "triangles" end
+
+function Mesh3D:setVertices(verts)
+  -- A ByteData of already-interleaved vertex bytes. This is the fast path a
+  -- renderer uses when it packed the buffer itself (through ffi), and it
+  -- goes straight to the GPU with no per-vertex marshalling at all.
+  if rawtype(verts) == "table" and verts._bytes then
+    if not wc.mesh3d_set_bytes(self.id, verts:getString()) then
+      error("Mesh:setVertices: the byte upload failed. The data must not be " ..
+            "larger than the buffer allocated at newMesh (" .. self.n ..
+            " vertices).", 2)
+    end
+    return
+  end
+  if rawtype(verts) ~= "table" then
+    error("Mesh:setVertices: expected a table of vertices, or a ByteData of " ..
+          "packed vertex bytes", 2)
+  end
+  -- A DECLARED-format mesh has its own stride and attribute set, so its
+  -- vertices cannot go through the fixed-layout updater -- that one writes
+  -- 12 floats per vertex regardless, which overruns a smaller stride and
+  -- fails with GL_INVALID_VALUE (or, worse, silently scrambles geometry).
+  if self.generic then
+    if not wc.mesh3d_set_vertices_format(self.id, self.fmt, verts) then
+      error("Mesh:setVertices: the update failed. A declared-format mesh's " ..
+            "buffer is allocated at newMesh and cannot grow past " ..
+            self.n .. " vertices.", 2)
+    end
+    self.n = #verts
+    return
+  end
+  if not wc.mesh3d_set_vertices(self.id, verts) then
+    error("Mesh:setVertices: the update failed. A 3D mesh's vertex buffer is " ..
+          "allocated at newMesh and cannot grow, so the new list must not be " ..
+          "longer than the original (" .. self.n .. ").", 2)
+  end
+  self.n = #verts
+end
+
+function Mesh3D:setTexture(img)
+  if img == nil then
+    wc.mesh3d_set_texture(self.id, nil)
+    self.tex = nil
+    return
+  end
+  if rawtype(img) ~= "table" or not img.id then
+    error("Mesh:setTexture: expected an Image or a Canvas, got " ..
+          rawtype(img), 2)
+  end
+  if not wc.mesh3d_set_texture(self.id, img.id) then
+    error("Mesh:setTexture: the texture could not be uploaded", 2)
+  end
+  self.tex = img
+end
+function Mesh3D:getTexture() return self.tex end
+
+-- setVertexMap(indices) | setVertexMap(a, b, c, ...)
+-- setVertexMap(indices) | setVertexMap(a, b, c, ...) |
+-- setVertexMap(byteData, "uint16"|"uint32")
+--
+-- The ByteData form is how a renderer that built its index buffer through
+-- ffi hands it over -- already packed, no per-index marshalling. LOVE's
+-- datatype argument names the element width.
+function Mesh3D:setVertexMap(a, b, ...)
+  if rawtype(a) == "table" and a._bytes then
+    local width = (b == "uint16") and 2 or 4
+    if not wc.mesh3d_set_map_bytes(self.id, a:getString(), width) then
+      error("Mesh:setVertexMap: the packed index upload failed", 2)
+    end
+    self.map_n = #a._bytes // width
+    return
+  end
+  local map = a
+  if rawtype(a) == "number" then map = { a, b, ... } end
+  if map ~= nil and rawtype(map) ~= "table" then
+    error("Mesh:setVertexMap: expected a table of indices, or a ByteData of " ..
+          "packed indices", 2)
+  end
+  wc.mesh3d_set_map(self.id, map)
+  self.map_n = map and #map or 0
+end
+
+function Mesh3D:release()
+  wc.mesh3d_release(self.id)
+  self.id = -1
+  return true
+end
+
+-- The methods a 3D mesh genuinely cannot answer, refused by name rather than
+-- returning a plausible wrong value. Vertices live only in the GPU buffer
+-- here (that is the point), so there is nothing on this side to read back.
+local function mesh3d_err(name, why)
+  return function()
+    error("Mesh:" .. name .. ": " .. why, 2)
+  end
+end
+Mesh3D.getVertex = mesh3d_err("getVertex",
+  "a 3D mesh keeps its vertices only in the GPU buffer, so they cannot be " ..
+  "read back. Keep the source table if the cart needs to inspect them.")
+Mesh3D.setVertex = mesh3d_err("setVertex",
+  "a 3D mesh has no per-vertex write path. Rebuild the vertex list and call " ..
+  "Mesh:setVertices, which replaces the buffer in one upload.")
+Mesh3D.setVertexAttribute = mesh3d_err("setVertexAttribute",
+  "not supported; use Mesh:setVertices.")
+Mesh3D.attachAttribute = mesh3d_err("attachAttribute",
+  "this engine has one fixed 3D vertex layout, so there is no second buffer " ..
+  "to attach.")
+Mesh3D.setDrawRange = mesh3d_err("setDrawRange",
+  "not supported on a 3D mesh; use a vertex map to select geometry.")
+
+-- A mesh with a fully DECLARED vertex format: arbitrary named attributes,
+-- in the cart's own order. This is what a real renderer needs -- normal
+-- mapping wants a tangent, PBR wants material terms, and neither fits the
+-- fixed layout.
+--
+-- The vertices arrive as flat arrays of components in FORMAT ORDER (LOVE's
+-- convention), and the C side packs them to the format's stride. A
+-- table-of-named-fields form is also accepted, since 3DreamEngine builds
+-- its vertices that way.
+new_mesh_generic = function(fmt, verts, mode, usage)
+  -- newMesh(format, COUNT, ...) allocates an empty buffer to be filled by
+  -- Mesh:setVertices later, which is how a renderer that packs its own
+  -- interleaved bytes builds geometry: it wants the buffer first and writes
+  -- the ByteData into it. 3DreamEngine does exactly this.
+  -- ByteData of ALREADY-PACKED interleaved vertices. This is the path a
+  -- renderer that owns its own memory takes: it built the buffer through
+  -- ffi to the exact format stride, so there is nothing to marshal -- the
+  -- bytes go straight to the GPU. 3DreamEngine's meshFormat:create returns
+  -- precisely this.
+  if rawtype(verts) == "table" and verts._bytes then
+    local stride = 0
+    for _, attr in ipairs(fmt) do
+      stride = stride + ((attr[2] == "byte") and 4 or (attr[3] * 4))
+    end
+    local count = math.floor(#verts._bytes / stride)
+    if count < 1 then
+      error("love.graphics.newMesh: the packed vertex data is smaller than " ..
+            "one vertex (" .. #verts._bytes .. " bytes, stride " .. stride ..
+            ")", 3)
+    end
+    local id, why = wc.mesh3d_new_format_empty(fmt, count)
+    if not id then
+      if why == "nogl" then
+        error("love.graphics.newMesh: this run is on the software rasterizer " ..
+              "(no GL context), and meshes with a declared vertex format are " ..
+              "GL-only.", 3)
+      end
+      error("love.graphics.newMesh: the mesh could not be created (" ..
+            tostring(why) .. ")", 3)
+    end
+    wc.mesh3d_set_bytes(id, verts:getString())
+    return setmetatable({ id = id, n = count, fmt = fmt, generic = true },
+                        Mesh3D)
+  end
+
+  -- A count may also arrive as an OBJECT that knows its own size.
+  if rawtype(verts) == "table" and #verts == 0 and rawtype(verts.getSize) == "function" then
+    verts = verts:getSize()
+  end
+  if rawtype(verts) == "number" then
+    local count = math.floor(verts)
+    if count < 1 then
+      error("love.graphics.newMesh: vertex count must be >= 1", 3)
+    end
+    local id, why = wc.mesh3d_new_format_empty(fmt, count)
+    if not id then
+      if why == "nogl" then
+        error("love.graphics.newMesh: this run is on the software rasterizer " ..
+              "(no GL context), and meshes with a declared vertex format are " ..
+              "GL-only.", 3)
+      end
+      error("love.graphics.newMesh: the mesh could not be created (" ..
+            tostring(why) .. ")", 3)
+    end
+    return setmetatable({ id = id, n = count, fmt = fmt, generic = true },
+                        Mesh3D)
+  end
+  if rawtype(verts) ~= "table" or #verts < 1 then
+    error("love.graphics.newMesh: the vertex list is empty", 3)
+  end
+  if mode ~= nil and mode ~= "triangles" then
+    error("love.graphics.newMesh: a mesh with a declared vertex format must " ..
+          "use the \"triangles\" draw mode (got \"" .. tostring(mode) ..
+          "\").", 3)
+  end
+
+  -- Named-field vertices ({VertexPositionX = ..., ...}) are flattened into
+  -- component order here, so the C packer sees one shape.
+  local flat = verts
+  if rawtype(verts[1]) == "table" and verts[1][1] == nil then
+    flat = {}
+    local SUF = { "X", "Y", "Z", "W" }
+    for i = 1, #verts do
+      local v, row = verts[i], {}
+      for _, attr in ipairs(fmt) do
+        local nm, _, comps = attr[1], attr[2], attr[3]
+        if attr[2] == "byte" then comps = 4 end
+        for c = 1, comps do
+          -- LOVE names a 1-component attribute plainly and a multi-component
+          -- one with an X/Y/Z/W suffix.
+          local key = (comps == 1) and nm or (nm .. SUF[c])
+          row[#row + 1] = v[key] or 0
+        end
+      end
+      flat[i] = row
+    end
+  end
+
+  local id, why = wc.mesh3d_new_format(fmt, flat)
+  if not id then
+    if why == "nogl" then
+      error("love.graphics.newMesh: this run is on the software rasterizer " ..
+            "(no GL context), and meshes with a declared vertex format are " ..
+            "GL-only.", 3)
+    elseif why == "attribs" then
+      error("love.graphics.newMesh: a vertex format may declare at most 8 " ..
+            "attributes", 3)
+    end
+    error("love.graphics.newMesh: the mesh could not be created (" ..
+          tostring(why) .. ")", 3)
+  end
+  return setmetatable({ id = id, n = #flat, fmt = fmt, generic = true }, Mesh3D)
+end
+
+function new_mesh_3d(fmt, verts, mode, usage)
+  if rawtype(verts) == "number" then
+    error("love.graphics.newMesh: a 3D mesh must be created from a vertex " ..
+          "list, not a vertex count -- its buffer is uploaded once at " ..
+          "creation and there is no per-vertex write path to fill it in " ..
+          "afterwards.", 3)
+  end
+  if rawtype(verts) ~= "table" or #verts < 1 then
+    error("love.graphics.newMesh: the vertex list is empty", 3)
+  end
+  -- LOVE defaults to "fan"; a 3D mesh is always a triangle list. Refuse the
+  -- others rather than silently reinterpreting the cart's geometry.
+  if mode ~= nil and mode ~= "triangles" then
+    error("love.graphics.newMesh: a 3D mesh must use the \"triangles\" draw " ..
+          "mode (got \"" .. tostring(mode) .. "\"). Fans and strips are 2D " ..
+          "conveniences; 3D geometry arrives already triangulated.", 3)
+  end
+  if usage ~= nil and usage ~= "static" and usage ~= "dynamic" and usage ~= "stream" then
+    error("love.graphics.newMesh: unknown usage '" .. tostring(usage) .. "'", 3)
+  end
+  local id, why = wc.mesh3d_new(verts)
+  if not id then
+    if why == "nogl" then
+      error("love.graphics.newMesh: this run is on the software rasterizer " ..
+            "(no GL context, or a draw used a feature the GL backend does " ..
+            "not implement), and 3D meshes are GL-only. See the cart log.", 3)
+    elseif why == "toobig" then
+      error("love.graphics.newMesh: too many vertices (200000 max per mesh)", 3)
+    elseif why == "slots" then
+      error("love.graphics.newMesh: out of 3D mesh slots (64 max)", 3)
+    end
+    error("love.graphics.newMesh: the mesh could not be created (" ..
+          tostring(why) .. ")", 3)
+  end
+  return setmetatable({ id = id, n = #verts, fmt = fmt }, Mesh3D)
+end
+
+-- ── custom vertex formats, and the 3D path ──────────────────────────
+--
+-- newMesh(vertexformat, vertices, mode) is LOVE's 3D door, and the only one:
+-- there is no love.graphics.setProjection, no camera, no model type. A 3D
+-- library declares a format with a 3-component VertexPosition and a
+-- VertexNormal, writes a vertex shader that multiplies by its own matrices,
+-- and turns the depth test on. g3d, 3DreamEngine and every other LOVE 3D
+-- engine are that shape. Supporting this signature IS supporting 3D.
+--
+-- WHICH FORMATS ARE ACCEPTED. Not arbitrary ones. The engine has exactly two
+-- vertex layouts compiled into it, each with its own VAO and shader
+-- prologue: the 2D one (x,y,u,v,r,g,b,a) and the 3D one
+-- (x,y,z, u,v, nx,ny,nz, r,g,b,a). A declared format is matched against
+-- those two by its ATTRIBUTE NAMES AND SIZES, and anything else is refused
+-- by name. The alternative -- accepting a format and silently dropping the
+-- attributes that do not fit -- produces a model that renders, wrongly, in a
+-- way no error message ever explains.
+--
+-- The 3D format is recognised by VertexPosition having 3 components. That is
+-- the one signal that actually distinguishes 2D from 3D in LOVE's API.
+local function classify_vertex_format(fmt)
+  local pos_n, has_normal, names = nil, false, {}
+  for i = 1, #fmt do
+    local attr = fmt[i]
+    if rawtype(attr) ~= "table" or rawtype(attr[1]) ~= "string" then
+      return nil, "attribute " .. i .. " is not a {name, datatype, components} table"
+    end
+    local name, _, comps = attr[1], attr[2], attr[3]
+    names[#names + 1] = name
+    if name == "VertexPosition" then pos_n = comps
+    elseif name == "VertexNormal" then has_normal = true
+    elseif name ~= "VertexTexCoord" and name ~= "VertexColor" then
+      -- A custom attribute (VertexTangent, VertexMaterial, InstancePosition
+      -- ...). Not an error: it selects the GENERIC path, where the declared
+      -- format drives the buffer layout and the shader's attribute bindings.
+      return "generic"
+    end
+  end
+  if not pos_n then
+    return nil, "the vertex format declares no VertexPosition"
+  end
+  if pos_n == 3 then return "3d" end
+  if pos_n == 2 then
+    if has_normal then
+      return nil, "a VertexNormal needs a 3-component VertexPosition " ..
+                  "(this engine's 3D layout); with a 2-component position " ..
+                  "the normal has nowhere to go."
+    end
+    return "2d"
+  end
+  -- A 4-component position is what a renderer uses when it packs something
+  -- extra into w. The generic path carries it verbatim.
+  if pos_n == 4 then return "generic" end
+  return nil, "VertexPosition must have 2 components (2D), 3 (3D) or 4, got " ..
+              tostring(pos_n)
+end
+
 -- newMesh(vertices) | newMesh(vertexcount) | newMesh(..., mode[, usage])
-function graphics.newMesh(a, b, c)
-  if type(a) == "table" and type(a[1]) == "table" and type(a[1][1]) == "string" then
-    error("love.graphics.newMesh: a custom vertex format is not supported by " ..
-          "this engine. The renderer has one fixed vertex layout " ..
-          "(x, y, u, v, r, g, b, a), shared by every program including cart " ..
-          "shaders, so extra attributes have nowhere to go. Use the default " ..
-          "format: newMesh({{x,y,u,v,r,g,b,a}, ...}, mode).", 2)
+-- newMesh(vertexformat, vertices | vertexcount, mode[, usage])
+function graphics.newMesh(a, b, c, d)
+  if rawtype(a) == "table" and rawtype(a[1]) == "table" and rawtype(a[1][1]) == "string" then
+    local kind, why = classify_vertex_format(a)
+    if not kind then
+      error("love.graphics.newMesh: " .. why, 2)
+    end
+    if kind == "3d" then
+      return new_mesh_3d(a, b, c, d)
+    end
+    if kind == "generic" then
+      return new_mesh_generic(a, b, c, d)
+    end
+    -- A 2D custom format that matches the built-in layout: shift the
+    -- arguments down and fall through to the default path, which already
+    -- IS that layout.
+    a, b, c = b, c, d
   end
 
   local verts, count
-  if type(a) == "number" then
+  if rawtype(a) == "number" then
     count = math.floor(a)
     if count < 1 then error("love.graphics.newMesh: vertex count must be >= 1", 2) end
-  elseif type(a) == "table" then
+  elseif rawtype(a) == "table" then
     verts = a
     count = #verts
     if count < 1 then
@@ -738,7 +1717,7 @@ function graphics.newMesh(a, b, c)
     end
   else
     error("love.graphics.newMesh: expected a vertex table or a vertex count, " ..
-          "got " .. type(a), 2)
+          "got " .. rawtype(a), 2)
   end
 
   local modename = b or "fan"
@@ -778,6 +1757,193 @@ function graphics.newMesh(a, b, c)
   if verts then m:setVertices(verts) end
   return m
 end
+
+-- ── depth and face culling ──────────────────────────────────────────
+--
+-- The other half of 3D. A cart that builds a perspective projection but
+-- never turns the depth test on gets painter's-order rendering: far geometry
+-- drawn after near geometry covers it, so a model looks inside-out and the
+-- bug reads as a broken projection matrix.
+--
+-- These are LOVE's exact signatures. g3d's whole depth setup is the single
+-- line `love.graphics.setDepthMode("lequal", true)`.
+
+-- GL compare-function enums. Kept here rather than in C so the name->enum
+-- mapping is visible next to the error that lists the valid names.
+local DEPTH_COMPARE = {
+  never = 0x0200, less = 0x0201, equal = 0x0202, lequal = 0x0203,
+  greater = 0x0204, notequal = 0x0205, gequal = 0x0206, always = 0x0207,
+}
+-- LOVE spells two of these with an extra word; accept both spellings.
+DEPTH_COMPARE.lessequal = DEPTH_COMPARE.lequal
+DEPTH_COMPARE.greaterequal = DEPTH_COMPARE.gequal
+
+local depth_mode_name, depth_write_flag = "always", false
+
+-- setDepthMode() with no arguments is LOVE's reset to "no depth testing",
+-- which is this engine's 2D resting state.
+function graphics.setDepthMode(comparemode, write)
+  if comparemode == nil then
+    depth_mode_name, depth_write_flag = "always", false
+    wc.depth_mode(0, false)
+    return
+  end
+  local e = DEPTH_COMPARE[comparemode]
+  if not e then
+    error("love.graphics.setDepthMode: unknown compare mode '" ..
+          tostring(comparemode) .. "'. Valid: never, less, equal, lequal, " ..
+          "greater, notequal, gequal, always.", 2)
+  end
+  -- "always" with no write is exactly "depth off", and passing it as a live
+  -- compare would cost a depth test per fragment for nothing.
+  if comparemode == "always" and not write then
+    depth_mode_name, depth_write_flag = "always", false
+    wc.depth_mode(0, false)
+    return
+  end
+  depth_mode_name, depth_write_flag = comparemode, not not write
+  wc.depth_mode(e, write and true or false)
+end
+
+function graphics.getDepthMode()
+  return depth_mode_name, depth_write_flag
+end
+
+-- drawInstanced(mesh, count) - the same geometry `count` times in ONE draw
+-- call, with gl_InstanceID varying so the vertex shader can place each copy.
+-- This is the difference between 1000 draw calls and 1. Per-instance data
+-- goes in a uniform array indexed by gl_InstanceID; there is no per-instance
+-- attribute buffer, matching what LOVE's own drawInstanced offers.
+function graphics.drawInstanced(mesh, count, ...)
+  if getmetatable(mesh) ~= Mesh3D then
+    error("love.graphics.drawInstanced: expected a 3D Mesh (one created with " ..
+          "a 3-component VertexPosition vertex format)", 2)
+  end
+  count = math.floor(count or 1)
+  if count < 1 then return end
+  if not wc.mesh3d_draw_instanced(mesh.id, count) then
+    error("love.graphics.drawInstanced: the mesh could not be drawn. Either " ..
+          "this run is on the software rasterizer (3D is GL-only), or no " ..
+          "shader is bound -- an instanced 3D draw REQUIRES a vertex stage, " ..
+          "which is where gl_InstanceID is read.", 2)
+  end
+end
+
+-- love.graphics.reset() - back to the default state, all of it. Renderers
+-- call this between passes to guarantee they are not inheriting whatever the
+-- previous pass left set, which is exactly the bug it prevents: a leftover
+-- colour mask or depth mode makes the NEXT pass render wrongly, far from the
+-- code that set it.
+function graphics.reset()
+  graphics.setColor(1, 1, 1, 1)
+  graphics.setBackgroundColor(0, 0, 0, 1)
+  graphics.setShader()
+  graphics.setCanvas()
+  graphics.setBlendMode("alpha")
+  graphics.setColorMask()
+  graphics.setDepthMode()
+  graphics.setMeshCullMode("none")
+  graphics.setFrontFaceWinding("ccw")
+  graphics.setScissor()
+  graphics.setLineWidth(1)
+  graphics.origin()
+end
+
+-- validateShader(gles, pixel, vertex) -> ok, err
+-- LOVE's dry run: compile without keeping the program. 3DreamEngine uses it
+-- to pick a shader variant the driver will actually accept.
+function graphics.validateShader(gles, pixel, vertex)
+  local ok, err = pcall(graphics.newShader, pixel, vertex)
+  if ok then
+    if err and err.release then err:release() end
+    return true, nil
+  end
+  return false, tostring(err)
+end
+
+-- isActive: is there a graphics device to draw on at all.
+function graphics.isActive() return true end
+-- present(): the host owns the swap; a cart's frame ends when wc_render
+-- returns. Accepted as a no-op so a renderer's main loop runs unchanged.
+function graphics.present() end
+
+-- arc(drawmode, [arctype], x, y, radius, angle1, angle2, [segments])
+-- Built from the polygon path rather than a new primitive: an arc IS a fan
+-- of points on a circle, and reusing polygon() keeps it consistent with the
+-- engine's existing fill/line rules.
+function graphics.arc(mode, a, b, c, d, e, f, g)
+  local arctype, x, y, r, a1, a2, segs
+  if rawtype(a) == "string" then
+    arctype, x, y, r, a1, a2, segs = a, b, c, d, e, f, g
+  else
+    arctype, x, y, r, a1, a2, segs = "pie", a, b, c, d, e, f
+  end
+  if not (x and y and r and a1 and a2) then
+    error("love.graphics.arc: expected (mode, [arctype], x, y, radius, " ..
+          "angle1, angle2)", 2)
+  end
+  segs = math.max(3, math.floor(segs or math.max(8, r / 2)))
+  local pts = {}
+  -- "pie" closes through the centre; "open"/"closed" trace only the rim.
+  if arctype == "pie" then pts[#pts + 1] = x; pts[#pts + 1] = y end
+  for i = 0, segs do
+    local t = a1 + (a2 - a1) * (i / segs)
+    pts[#pts + 1] = x + math.cos(t) * r
+    pts[#pts + 1] = y + math.sin(t) * r
+  end
+  graphics.polygon(mode, pts)
+end
+
+-- captureScreenshot: LOVE hands the image to a callback or a thread channel.
+-- A cart cannot write files and has no threads, so this is refused by name
+-- rather than silently doing nothing -- a screenshot that never arrives and
+-- never errors is the worst of both.
+graphics.captureScreenshot = err("love.graphics.captureScreenshot",
+  "a cart cannot write files. The HOST owns screenshots (romdev's frame " ..
+  "capture, or the player's own key binding)")
+
+function graphics.getStats()
+  return {
+    drawcalls = 0, canvasswitches = 0, texturememory = 0, images = 0,
+    canvases = 0, fonts = 0, shaderswitches = 0, drawcallsbatched = 0,
+  }
+end
+
+-- setColorMask() with no arguments enables every channel, which is LOVE's
+-- reset. A renderer uses this to write depth without touching colour.
+function graphics.setColorMask(r, g, b, a)
+  if r == nil then r, g, b, a = true, true, true, true end
+  wc.color_mask(r and true or false, g and true or false,
+                b and true or false, a and true or false)
+end
+function graphics.getColorMask() return wc.get_color_mask() end
+
+local CULL_MODES = { none = 0, back = 1, front = 2 }
+local cull_mode_name = "none"
+
+function graphics.setMeshCullMode(mode)
+  local m = CULL_MODES[mode or "none"]
+  if not m then
+    error("love.graphics.setMeshCullMode: unknown cull mode '" ..
+          tostring(mode) .. "'. Valid: none, back, front.", 2)
+  end
+  cull_mode_name = mode or "none"
+  wc.cull_mode(m)
+end
+function graphics.getMeshCullMode() return cull_mode_name end
+
+-- LOVE's default is counter-clockwise, matching GL's.
+local front_face_name = "ccw"
+function graphics.setFrontFaceWinding(winding)
+  local w = winding or "ccw"
+  if w ~= "ccw" and w ~= "cw" then
+    error("love.graphics.setFrontFaceWinding: expected \"ccw\" or \"cw\", " ..
+          "got '" .. tostring(winding) .. "'", 2)
+  end
+  front_face_name = w
+  wc.front_face(w == "cw")
+end
+function graphics.getFrontFaceWinding() return front_face_name end
 
 graphics.newVideo    = err("love.graphics.newVideo", "video playback is out of scope for this engine")
 
@@ -901,21 +2067,21 @@ function joystick.getJoystickCount() return 4 end
 local pad = {}
 love.pad = pad
 function pad.isDown(n, b)
-  if type(n) == "string" then n, b = 1, n end
+  if rawtype(n) == "string" then n, b = 1, n end
   return has(pads[n].buttons, b)
 end
 function pad.wasPressed(n, b)
-  if type(n) == "string" then n, b = 1, n end
+  if rawtype(n) == "string" then n, b = 1, n end
   local p = pads[n]
   return has(p.buttons, b) and not has(p.prev, b)
 end
 function pad.wasReleased(n, b)
-  if type(n) == "string" then n, b = 1, n end
+  if rawtype(n) == "string" then n, b = 1, n end
   local p = pads[n]
   return not has(p.buttons, b) and has(p.prev, b)
 end
 function pad.axis(n, which)
-  if type(n) == "string" then n, which = 1, n end
+  if rawtype(n) == "string" then n, which = 1, n end
   local p = pads[n]
   local v = (which == "leftx" and p.lx) or (which == "lefty" and p.ly)
          or (which == "rightx" and p.rx) or (which == "righty" and p.ry) or 0
@@ -959,7 +2125,7 @@ function pad.setVibration(...)
     left, right, dur = ...
   end
   left, right, dur = left or 0, right or 0, dur or 0
-  if type(pn) ~= "number" or pn < 1 or pn > 4 then return false end
+  if rawtype(pn) ~= "number" or pn < 1 or pn > 4 then return false end
   left = math.max(0, math.min(1, left))
   right = math.max(0, math.min(1, right))
   if left <= 0 and right <= 0 then
@@ -1031,12 +2197,12 @@ local TRANSPORT = { reliable = 0x01, ordered = 0x02, lowlatency = 0x04 }
 -- nil as normal and recoverable, never as an error worth crashing on: an
 -- offline device is a supported configuration.
 function net.open(address)
-  if type(address) ~= "string" then return nil end
+  if rawtype(address) ~= "string" then return nil end
   return wc.peer_open(address)
 end
 
 function net.close(peer)
-  if type(peer) ~= "number" then return end
+  if rawtype(peer) ~= "number" then return end
   wc.peer_close(peer)
 end
 
@@ -1044,7 +2210,7 @@ end
 -- Returning nil rather than 0 keeps "refused" distinguishable from "sent an
 -- empty message", which is a legal thing for a cart to do.
 function net.send(peer, data)
-  if type(peer) ~= "number" or type(data) ~= "string" then return nil end
+  if rawtype(peer) ~= "number" or rawtype(data) ~= "string" then return nil end
   local n = wc.peer_send(peer, data)
   if n < 0 then return nil end
   return n
@@ -1052,7 +2218,7 @@ end
 
 -- broadcast(data) -> number of peers it reached.
 function net.broadcast(data)
-  if type(data) ~= "string" then return 0 end
+  if rawtype(data) ~= "string" then return 0 end
   local n = wc.peer_broadcast(data)
   if n < 0 then return 0 end
   return n
@@ -1062,7 +2228,7 @@ end
 -- An unknown peer reads as "closed", which is the truth from the cart's
 -- point of view and saves every caller a nil check.
 function net.state(peer)
-  if type(peer) ~= "number" then return "closed" end
+  if rawtype(peer) ~= "number" then return "closed" end
   return STATE_NAMES[wc.peer_state(peer)] or "closed"
 end
 
@@ -1093,7 +2259,7 @@ end
 -- on that. The engine already bounds the length the host may write; what it
 -- cannot do is stop a cart from trusting the contents.
 function net.name(peer)
-  if type(peer) ~= "number" then return nil end
+  if rawtype(peer) ~= "number" then return nil end
   return wc.peer_name(peer)
 end
 
@@ -1101,7 +2267,7 @@ end
 -- from a host that does not characterize its transport, so a cart must not
 -- read "not reliable" as "unreliable" - it means "unknown, assume nothing".
 function net.transport(peer)
-  if type(peer) ~= "number" then return { reliable = false, ordered = false, lowLatency = false } end
+  if rawtype(peer) ~= "number" then return { reliable = false, ordered = false, lowLatency = false } end
   local bits = wc.peer_transport(peer)
   return {
     reliable   = (bits & TRANSPORT.reliable) ~= 0,
@@ -1143,6 +2309,15 @@ love.mouse = mouse
 local vcursor_x, vcursor_y = W / 2, H / 2
 local prev_mouse = 0   -- last frame's pointer button mask, for edge detection
 local VCURSOR_SPEED = 12
+
+local relative_mode = false
+-- setRelativeMode: LOVE captures the cursor so an FPS camera gets unbounded
+-- deltas. A cart cannot capture anything -- the host owns the pointer -- so
+-- this records the flag and reports it back rather than lying either way.
+-- Camera code that checks isRelativeMode() before using deltas still works;
+-- code that assumes capture succeeded gets the pointer's real position.
+function mouse.setRelativeMode(on) relative_mode = not not on end
+function mouse.isRelativeMode() return relative_mode end
 
 function mouse.getPosition()
   local px, py, _, active = wc.pointer(0)
@@ -1266,8 +2441,62 @@ function fs.read(path)
   return s, #s
 end
 
-function fs.getInfo(path)
-  if wc.asset_exists(path) then return { type = "file" } end
+local asset_index = nil        -- { [dir] = { name, ... } }
+
+local function build_asset_index()
+  if asset_index then return asset_index end
+  asset_index = {}
+  local raw = wc.asset_read("assets.index")
+  if not raw then return asset_index end
+  for line in raw:gmatch("([^\n]+)") do
+    local path = line:gsub("%s+$", "")
+    if #path > 0 then
+      -- Every ancestor directory gets an entry, so listing an intermediate
+      -- directory finds its subdirectories as well as its files -- which is
+      -- what a recursive walk (utils.lua does one) expects.
+      local dir, name = path:match("^(.*)/([^/]+)$")
+      if not dir then dir, name = "", path end
+      local seen = {}
+      local t = asset_index[dir]
+      if not t then t = {}; asset_index[dir] = t end
+      for _, v in ipairs(t) do seen[v] = true end
+      if not seen[name] then t[#t + 1] = name end
+      -- register this directory inside its own parent
+      while dir ~= "" do
+        local parent, dname = dir:match("^(.*)/([^/]+)$")
+        if not parent then parent, dname = "", dir end
+        local pt = asset_index[parent]
+        if not pt then pt = {}; asset_index[parent] = pt end
+        local found = false
+        for _, v in ipairs(pt) do if v == dname then found = true break end end
+        if not found then pt[#pt + 1] = dname end
+        dir = parent
+      end
+    end
+  end
+  return asset_index
+end
+
+function fs.getInfo(path, arg)
+  -- LOVE's second argument is either a filtertype string or a table to fill.
+  local want = rawtype(arg) == "string" and arg or nil
+  local out = rawtype(arg) == "table" and arg or {}
+  if wc.asset_exists(path) then
+    if want and want ~= "file" then return nil end
+    out.type = "file"
+    out.size = #(wc.asset_read(path) or "")
+    return out
+  end
+  -- A DIRECTORY has no asset of its own, so it is only knowable from the
+  -- index. Libraries check getInfo(...).type before recursing into a path,
+  -- and answering nil for a real directory stops that walk dead.
+  local idx = build_asset_index()
+  local key = tostring(path or ""):gsub("^%./", ""):gsub("/+$", "")
+  if idx[key] then
+    if want and want ~= "directory" then return nil end
+    out.type = "directory"
+    return out
+  end
   return nil
 end
 
@@ -1282,6 +2511,98 @@ end
 -- save data: one blob, size-capped, persisted by the host
 function fs.write(_, data) return wc.save_write(tostring(data)) end
 function fs.load_save() return wc.save_read() end
+
+-- A cart has an asset BUNDLE, not a filesystem. The wasmcart ABI can look an
+-- asset up by path (wc_asset_size / wc_load_asset) but cannot enumerate one,
+-- so directory listing is not a thing this engine is hiding -- it does not
+-- exist at the layer below.
+--
+-- Returning {} would be worse than erroring: a library that lists a
+-- directory to discover its own resources would find nothing and conclude
+-- the resources are missing, which sends the author looking in the wrong
+-- place entirely.
+-- Directory listing, from an INDEX the cart carries.
+--
+-- The wasmcart ABI looks an asset up by path and cannot enumerate one, so
+-- there is nothing under this to walk. But a cart knows its own contents at
+-- pack time, and a great many real libraries discover their modules by
+-- listing a directory -- 3DreamEngine finds its classes, shaders, jobs and
+-- loaders that way, in ten places, and simply cannot load without it.
+--
+-- So: if the cart ships `assets.index` (one path per line, which
+-- tools/gen-asset-index.sh writes), this answers from it. Without the index
+-- the honest answer is still an error, because returning {} would tell a
+-- library its resources are missing and send the author hunting in the
+-- wrong place.
+function fs.getDirectoryItems(dir)
+  local idx = build_asset_index()
+  local key = tostring(dir or ""):gsub("^%./", ""):gsub("/+$", "")
+  local items = idx[key]
+  if items then
+    -- A copy: a caller that sorts or mutates the result must not corrupt
+    -- the index for the next call.
+    local out = {}
+    for i, v in ipairs(items) do out[i] = v end
+    table.sort(out)
+    return out
+  end
+  if next(idx) == nil then
+    error("love.filesystem.getDirectoryItems('" .. tostring(dir) .. "'): a " ..
+          "cart carries an asset bundle, not a filesystem, and the wasmcart " ..
+          "ABI can only look an asset up BY PATH. Ship an `assets.index` " ..
+          "file (one asset path per line -- see tools/gen-asset-index.sh) " ..
+          "and this returns its contents.", 2)
+  end
+  -- The index exists and this directory is not in it: genuinely empty.
+  return {}
+end
+
+-- Writing: a cart gets ONE save blob, not a directory tree. These exist so a
+-- library that calls them fails with the reason rather than a nil index.
+function fs.createDirectory()
+  error("love.filesystem.createDirectory: a cart has no writable filesystem. " ..
+        "love.filesystem.write(name, data) persists a single save blob " ..
+        "through the host.", 2)
+end
+function fs.remove()
+  error("love.filesystem.remove: a cart has no writable filesystem; there is " ..
+        "one save blob, which love.filesystem.write replaces.", 2)
+end
+function fs.getSaveDirectory() return "save:" end
+function fs.getRealDirectory() return "cart:" end
+function fs.getIdentity() return "wasmcart" end
+function fs.setIdentity() end
+function fs.newFile(path)
+  -- A read-only File object over a cart asset. Enough for the common
+  -- open/read/close idiom; writing goes through the save blob instead.
+  local content, pos = nil, 1
+  local file = {}
+  function file:open(mode)
+    if mode == "w" or mode == "a" then
+      return false, "a cart asset is read-only; use love.filesystem.write " ..
+                    "for save data"
+    end
+    content = wc.asset_read(path)
+    pos = 1
+    return content ~= nil, content and nil or ("could not open " .. tostring(path))
+  end
+  function file:read(n)
+    if not content then return nil, "file is not open" end
+    local chunk = n and content:sub(pos, pos + n - 1) or content:sub(pos)
+    pos = pos + #chunk
+    return chunk, #chunk
+  end
+  function file:lines()
+    if not content then return function() return nil end end
+    return content:gmatch("([^\n]*)\n?")
+  end
+  function file:close() content = nil return true end
+  function file:getSize() return content and #content or (wc.asset_read(path) or ""):len() end
+  function file:isOpen() return content ~= nil end
+  function file:eof() return not content or pos > #content end
+  function file:type() return "File" end
+  return file
+end
 
 -- love.filesystem.load: compile a cart asset into a chunk. Tiled map
 -- loaders (STI) use this to pull .lua map files, so it is load-bearing for
@@ -1307,17 +2628,58 @@ love.window = {
   getDesktopDimensions = function() return W, H end,
   setVSync = function() end,
   setFullscreen = function() return true end,
+  -- A cart is always "fullscreen" in the only sense it can observe: it fills
+  -- whatever surface the host gave it and cannot resize itself.
+  getFullscreen = function() return true, "desktop" end,
+  updateMode = function() return true end,
+  isOpen = function() return true end,
+  hasFocus = function() return true end,
+  hasMouseFocus = function() return true end,
+  isVisible = function() return true end,
+  getDPIScale = function() return 1 end,
+  toPixels = function(v) return v end,
+  fromPixels = function(v) return v end,
+  requestAttention = function() end,
+  maximize = function() end,
+  minimize = function() end,
+  restore = function() end,
+  focus = function() end,
 }
 
 love.event = {
   quit = function()
     wc.log("love.event.quit(): cartridge hosts do not exit; ignoring")
   end,
+  -- The HOST runs the event loop and calls wc_render once per frame; a cart
+  -- never pumps its own. These exist so a library that drives its own loop
+  -- (3DreamEngine's job system does) runs without special-casing.
+  pump = function() end,
+  poll = function() return function() return nil end end,
+  push = function() end,
+  clear = function() end,
+}
+
+-- love.font.newRasterizer: in LOVE this exposes glyph rasterization so a
+-- caller can build its own font atlas. This engine bakes TTF glyphs in C
+-- (stb_truetype) and hands back a Font, so the rasterizer is not a thing a
+-- cart can hold. Return the Font instead, which is what callers do with the
+-- rasterizer anyway (newFont(rasterizer)).
+love.font = {
+  newRasterizer = function(path, size)
+    return graphics.newFont(path, size)
+  end,
 }
 
 love.system = {
   getOS = function() return "wasmcart" end,
   getPowerInfo = function() return "unknown" end,
+  -- ONE. A cart is a single wasm instance with no threads, and libraries
+  -- size their worker pools from this -- answering the host's real core
+  -- count would have them spawn workers that can never exist.
+  getProcessorCount = function() return 1 end,
+  getClipboardText = function() return "" end,
+  setClipboardText = function() end,
+  vibrate = function() end,
   openURL = function(url)
     wc.log("love.system.openURL ignored (cartridge sandbox): " .. tostring(url))
     return false
@@ -1329,15 +2691,72 @@ love.system = {
 -- manipulation is not supported; getWidth/getHeight work because callers
 -- often query them.
 love.image = {
-  newImageData = function(path)
-    local ok, img = pcall(graphics.newImage, path)
-    if not ok then return nil end
+  -- A cart's textures are PNGs decoded by the engine's own stb_image, so
+  -- there is no compressed-texture container to inspect. Answering "no"
+  -- honestly is what sends a loader down its uncompressed path.
+  isCompressed = function() return false end,
+  newCompressedData = function()
+    error("love.image.newCompressedData: compressed texture containers (DDS/" ..
+          "KTX/PVR) are not supported; ship PNGs, which the engine decodes.", 2)
+  end,
+  -- newImageData(path) | newImageData(width, height) | (w, h, format, data)
+  --
+  -- Both forms are real: the path form decodes an asset, and the size form
+  -- allocates zeroed CPU pixels a cart can write with setPixel. The size
+  -- form is not a nicety -- it is how a library builds a placeholder texture
+  -- (3DreamEngine's sky fallback is six 2x2 ImageDatas), and returning nil
+  -- for it makes a cubemap arrive with zero faces.
+  newImageData = function(a, b, format, data)
+    local img
+    if rawtype(a) == "number" then
+      local w, h = math.max(1, math.floor(a)), math.max(1, math.floor(b or a))
+      local id = wc.image_blank(w, h)
+      if not id then return nil end
+      img = setmetatable({ id = id, w = w, h = h }, Image)
+      -- LOVE's 4th argument is initial pixel bytes; honour it when the
+      -- string is the right size, since a caller passing data expects it.
+      if rawtype(data) == "string" and #data >= w * h * 4 then
+        local i = 1
+        for y = 0, h - 1 do
+          for x = 0, w - 1 do
+            wc.image_pixel(id, x, y,
+                           data:byte(i) / 255, data:byte(i + 1) / 255,
+                           data:byte(i + 2) / 255, data:byte(i + 3) / 255)
+            i = i + 4
+          end
+        end
+      end
+    else
+      local ok, loaded_img = pcall(graphics.newImage, a)
+      if not ok then return nil end
+      img = loaded_img
+    end
     return {
       _img = img,
+      id = img.id,           -- so newCubeImage can consume it directly
+      w = img.w, h = img.h,
       getWidth = function(self) return self._img.w end,
       getHeight = function(self) return self._img.h end,
       getDimensions = function(self) return self._img.w, self._img.h end,
+      getPixel = function(self, x, y) return wc.image_pixel(self._img.id, x, y) end,
+      setPixel = function(self, x, y, r, g, b, a)
+        wc.image_pixel(self._img.id, x, y, r, g, b, a == nil and 1 or a)
+      end,
+      -- mapPixel(fn): LOVE's per-pixel transform. Real games use it to build
+      -- gradients and masks at load time.
+      mapPixel = function(self, fn)
+        for y = 0, self._img.h - 1 do
+          for x = 0, self._img.w - 1 do
+            local r, g, bb, aa = wc.image_pixel(self._img.id, x, y)
+            local nr, ng, nb, na = fn(x, y, r, g, bb, aa)
+            wc.image_pixel(self._img.id, x, y, nr or r, ng or g, nb or bb,
+                           na == nil and aa or na)
+          end
+        end
+      end,
+      release = function() return true end,
       type = function() return "ImageData" end,
+      typeOf = function(_, t) return t == "ImageData" or t == "Data" end,
     }
   end,
 }
@@ -1352,7 +2771,7 @@ love.image = {
 -- sample buffers we don't have.
 love.sound = {
   newSoundData = function(path)
-    if type(path) ~= "string" then
+    if rawtype(path) ~= "string" then
       error("love.sound.newSoundData: only file paths are supported " ..
             "(raw sample buffers are not available in this engine)", 2)
     end
@@ -1382,11 +2801,209 @@ love.data = {
   end,
   decompress = err("love.data.decompress",
     "compressed data is not supported; export maps/assets uncompressed"),
+  compress = err("love.data.compress",
+    "compressed data is not supported; export maps/assets uncompressed"),
 }
 
-love.thread = setmetatable({}, { __index = function(_, k)
-  return err("love.thread." .. k, "the engine is a single wasm instance; no threads in v1")
-end })
+-- love.data.newByteData / pack / unpack / hash.
+--
+-- LOVE's ByteData is a handle to raw bytes with an FFI pointer behind it.
+-- There is no FFI here (that is LuaJIT; this is PUC Lua 5.4), so a ByteData
+-- is backed by a Lua string, and getFFIPointer is refused BY NAME rather
+-- than returning something that would be dereferenced.
+--
+-- This matters for a real reason: g3d's model:compress() and 3DreamEngine's
+-- mesh packing both take an ffi path when it exists and a plain-table path
+-- when it does not. Refusing getFFIPointer is what keeps them on the path
+-- that works.
+-- Backed by a table of BYTES rather than a string, because a ByteData is
+-- written through: ffi.cast gives out a typed view over this same table, and
+-- a string would make every field write an allocation and a copy. getString
+-- materializes on demand for the callers that want bytes out.
+local ByteData = {}
+ByteData.__index = ByteData
+function ByteData:type() return "ByteData" end
+function ByteData:typeOf(t) return t == "ByteData" or t == "Data" or t == "Object" end
+function ByteData:getSize() return #self._bytes end
+function ByteData:getString()
+  local out = {}
+  for i = 1, #self._bytes do out[i] = string.char(self._bytes[i] or 0) end
+  return table.concat(out)
+end
+function ByteData:clone()
+  local b = {}
+  for i = 1, #self._bytes do b[i] = self._bytes[i] end
+  return setmetatable({ _bytes = b }, ByteData)
+end
+-- A "pointer" here is the byte table itself, which is exactly what this
+-- engine's ffi.cast consumes. Handing it out is what lets the ffi shim be a
+-- VIEW over the same storage rather than a copy.
+function ByteData:getPointer() return self end
+ByteData.getFFIPointer = ByteData.getPointer
+
+love.data.newByteData = function(src)
+  if rawtype(src) == "number" then
+    local n, b = math.floor(src), {}
+    for i = 1, n do b[i] = 0 end
+    return setmetatable({ _bytes = b }, ByteData)
+  end
+  if rawtype(src) == "table" and src._bytes then return src:clone() end
+  local s = tostring(src)
+  local b = {}
+  for i = 1, #s do b[i] = s:byte(i) end
+  return setmetatable({ _bytes = b }, ByteData)
+end
+
+-- string.pack/unpack are Lua 5.4 built-ins, so love.data.pack is a thin
+-- wrapper rather than a reimplementation.
+love.data.pack = function(container, fmt, ...)
+  local s = string.pack(fmt, ...)
+  if container == "data" then return love.data.newByteData(s) end
+  return s
+end
+love.data.unpack = function(fmt, data, pos)
+  local s = (rawtype(data) == "table" and data.getString and data:getString()) or tostring(data)
+  return string.unpack(fmt, s, pos)
+end
+love.data.getPackedSize = function(fmt) return string.packsize(fmt) end
+
+-- A non-cryptographic hash. LOVE offers md5/sha1/... for content addressing
+-- (3DreamEngine keys its shader cache on one); the VALUE only has to be
+-- stable within a run, and saying which algorithm it really is beats
+-- claiming md5 and returning something else.
+-- Returns RAW BYTES, as LOVE's does -- callers pipe the result straight into
+-- love.data.encode("string", "hex", ...) to get something printable, and a
+-- hex string here would come back double-encoded.
+--
+-- This is FNV-1a, not md5/sha1, whatever algorithm name is passed. The
+-- callers that matter use a hash to KEY a cache (3DreamEngine names its
+-- vertex structs this way), which needs determinism and good dispersion,
+-- not a specific digest. Claiming md5 and returning something else would be
+-- worse only if a cart compared the value against a real md5 computed
+-- elsewhere -- which a cart has no way to do.
+love.data.hash = function(a, b)
+  local s = b == nil and a or b
+  s = (rawtype(s) == "table" and s.getString and s:getString()) or tostring(s)
+  local h = 0xcbf29ce484222325
+  for i = 1, #s do
+    h = h ~ s:byte(i)
+    h = (h * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+  end
+  -- 8 raw bytes, big-endian, so the hex encoding of it reads left to right.
+  local out = {}
+  for i = 7, 0, -1 do out[#out + 1] = string.char((h >> (i * 8)) & 0xFF) end
+  return table.concat(out)
+end
+
+-- The inverse of love.data.decode above, same alphabet, same restriction.
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+love.data.encode = function(container, format, src)
+  local s = (rawtype(src) == "table" and src.getString and src:getString()) or tostring(src)
+  -- hex is the other format LOVE supports, and it is what callers use to
+  -- turn a hash into a printable identifier.
+  if format == "hex" then
+    local out = s:gsub(".", function(c) return string.format("%02x", c:byte()) end)
+    if container == "data" then return love.data.newByteData(out) end
+    return out
+  end
+  if format ~= "base64" then
+    error("love.data.encode: supported formats are 'base64' and 'hex', got '" ..
+          tostring(format) .. "'", 2)
+  end
+  local out = {}
+  for i = 1, #s, 3 do
+    local a, b, c = s:byte(i), s:byte(i + 1), s:byte(i + 2)
+    local n = a * 65536 + (b or 0) * 256 + (c or 0)
+    local c1 = (n >> 18) & 63
+    local c2 = (n >> 12) & 63
+    local c3 = (n >> 6) & 63
+    local c4 = n & 63
+    out[#out + 1] = B64:sub(c1 + 1, c1 + 1) .. B64:sub(c2 + 1, c2 + 1) ..
+                    (b and B64:sub(c3 + 1, c3 + 1) or "=") ..
+                    (c and B64:sub(c4 + 1, c4 + 1) or "=")
+  end
+  local str = table.concat(out)
+  if container == "data" then return love.data.newByteData(str) end
+  return str
+end
+
+-- ── love.thread ─────────────────────────────────────────────────────
+--
+-- A cart is ONE wasm instance. There is no second thread and there cannot
+-- be one. But refusing the whole module outright turned out to be the wrong
+-- call, because of what libraries actually use threads FOR: a background
+-- worker fed by a Channel, usually to load assets without stalling the
+-- frame. That pattern decomposes into two halves, and only one of them
+-- needs a thread.
+--
+--   * Channels are just queues. They work perfectly in one thread, and
+--     implementing them means a library's produce/consume code runs
+--     unchanged.
+--   * The worker is the part that cannot exist. A Thread here starts
+--     nothing.
+--
+-- So Channels are REAL and Threads are inert. A library that pushes jobs and
+-- polls for results gets an empty result queue -- which is the same thing it
+-- sees when its workers are merely busy, so it keeps running rather than
+-- breaking. Work that must actually happen has to happen on the main
+-- thread; a cart doing async asset streaming should load synchronously
+-- instead.
+--
+-- Thread:start() logs ONCE, so a cart author can see why their background
+-- work never completes, without 60 lines a second.
+local channels = {}
+local Channel = {}
+Channel.__index = Channel
+
+function Channel:push(v) self.q[#self.q + 1] = v end
+function Channel:supply(v) self.q[#self.q + 1] = v return true end
+function Channel:pop()
+  if #self.q == 0 then return nil end
+  return table.remove(self.q, 1)
+end
+function Channel:peek() return self.q[1] end
+-- demand() BLOCKS in LOVE. Blocking here would hang the frame forever, since
+-- nothing else can ever run to fill the queue -- so it returns nil instead.
+function Channel:demand(timeout)
+  return self:pop()
+end
+function Channel:getCount() return #self.q end
+function Channel:clear() self.q = {} end
+function Channel:performAtomic(fn, ...) return fn(self, ...) end
+function Channel:release() return true end
+function Channel:type() return "Channel" end
+
+local warned_thread = false
+local Thread = {}
+Thread.__index = Thread
+function Thread:start()
+  if not warned_thread then
+    warned_thread = true
+    wc.log("love.thread: this engine is a single wasm instance, so a Thread " ..
+           "never runs. Channels ARE real queues, so producer/consumer code " ..
+           "works -- but anything that must actually execute has to run on " ..
+           "the main thread. (Asset streaming: load synchronously instead.)")
+  end
+  return true
+end
+function Thread:wait() return true end
+function Thread:isRunning() return false end
+function Thread:getError() return nil end
+function Thread:release() return true end
+function Thread:type() return "Thread" end
+
+love.thread = {
+  newThread = function() return setmetatable({}, Thread) end,
+  getChannel = function(name)
+    local c = channels[name]
+    if not c then
+      c = setmetatable({ q = {}, name = name }, Channel)
+      channels[name] = c
+    end
+    return c
+  end,
+  newChannel = function() return setmetatable({ q = {} }, Channel) end,
+}
 
 -- ── physics: Box2D v3 (wasm SIMD) ──────────────────────────────────
 --
@@ -1775,6 +3392,61 @@ math.ldexp = math.ldexp or function(m, e) return m * 2 ^ e end
 -- math.atan2 was removed in 5.3 (math.atan takes two args now). Game code
 -- uses it constantly for aiming, so it must be present.
 math.atan2 = math.atan2 or function(y, x) return math.atan(y, x) end
+
+-- The LuaJIT `bit` library. Lua 5.3 added native bitwise OPERATORS and
+-- dropped the library, but the library is what LuaJIT-era code calls -- and
+-- since LOVE has always shipped LuaJIT, that is most of the ecosystem.
+-- Implemented on the native operators, so it is exact rather than a
+-- floating-point emulation.
+--
+-- Semantics follow LuaJIT's: 32-bit, results normalized to a SIGNED 32-bit
+-- integer. Returning the raw 64-bit value would differ the moment a high bit
+-- is set, which is exactly where bit twiddling lives.
+local function tobit32(x)
+  x = math.floor(x) & 0xFFFFFFFF
+  if x >= 0x80000000 then x = x - 0x100000000 end
+  return x
+end
+bit = bit or {
+  tobit = tobit32,
+  band = function(a, b, ...)
+    local r = math.floor(a) & math.floor(b)
+    for _, v in ipairs({ ... }) do r = r & math.floor(v) end
+    return tobit32(r)
+  end,
+  bor = function(a, b, ...)
+    local r = math.floor(a) | math.floor(b)
+    for _, v in ipairs({ ... }) do r = r | math.floor(v) end
+    return tobit32(r)
+  end,
+  bxor = function(a, b, ...)
+    local r = math.floor(a) ~ math.floor(b)
+    for _, v in ipairs({ ... }) do r = r ~ math.floor(v) end
+    return tobit32(r)
+  end,
+  bnot = function(a) return tobit32(~math.floor(a)) end,
+  lshift = function(a, n) return tobit32((math.floor(a) & 0xFFFFFFFF) << (n & 31)) end,
+  -- LOGICAL right shift: the operand is masked to 32 bits first, so a
+  -- negative input shifts in zeros rather than sign bits, which is what
+  -- LuaJIT's rshift does and what packing code depends on.
+  rshift = function(a, n) return tobit32((math.floor(a) & 0xFFFFFFFF) >> (n & 31)) end,
+  arshift = function(a, n)
+    local v = tobit32(a)
+    return tobit32(v >> (n & 31) | (v < 0 and ~(0xFFFFFFFF >> (n & 31)) or 0))
+  end,
+  rol = function(a, n)
+    local v = math.floor(a) & 0xFFFFFFFF
+    n = n & 31
+    return tobit32(((v << n) | (v >> (32 - n))) & 0xFFFFFFFF)
+  end,
+  ror = function(a, n)
+    local v = math.floor(a) & 0xFFFFFFFF
+    n = n & 31
+    return tobit32(((v >> n) | (v << (32 - n))) & 0xFFFFFFFF)
+  end,
+  tohex = function(a, n) return string.format("%0" .. math.abs(n or 8) .. "x",
+                                              math.floor(a) & 0xFFFFFFFF) end,
+}
 math.frexp = math.frexp or function(x)
   if x == 0 then return 0, 0 end
   local e = math.floor(math.log(math.abs(x), 2)) + 1
@@ -1785,7 +3457,7 @@ math.log10 = math.log10 or function(x) return math.log(x, 10) end
 -- setfenv/getfenv over 5.4's _ENV. Function environments are upvalue 1
 -- named "_ENV" when a function references any global.
 function setfenv(fn, env)
-  if type(fn) == "number" then
+  if rawtype(fn) == "number" then
     error("setfenv by stack level is not supported; pass the function", 2)
   end
   local i = 1
@@ -1802,7 +3474,7 @@ function setfenv(fn, env)
 end
 
 function getfenv(fn)
-  if type(fn) == "number" or fn == nil then return _G end
+  if rawtype(fn) == "number" or fn == nil then return _G end
   local i = 1
   while true do
     local name, val = debug.getupvalue(fn, i)
@@ -1839,9 +3511,47 @@ os = {
 }
 
 -- ── require: cart-asset module loader ──────────────────────────────
+--
+-- `package` is NOT opened by the C side (open_cart_libs skips it, along with
+-- io and os, because a cart has no filesystem and package.loadlib would drag
+-- in dynamic loading). But `package.loaded` is not part of that hazard: it
+-- is a plain table, and reading or writing it is one of the most common
+-- idioms in real Lua libraries -- the self-registration line
+--
+--     package.loaded[...] = M
+--
+-- which a library runs so its own submodules can require it back without
+-- re-executing it. g3d's init.lua does exactly this on its line 46, and
+-- without the table the cart dies with "attempt to index a nil value
+-- (global 'package')" before a single frame renders.
+--
+-- So: expose `package.loaded`, backed by the SAME table require uses, and
+-- nothing else. A library that writes to it is registering a module and that
+-- now works; a library that reaches for package.path or package.loadlib
+-- still finds nil, which is the honest answer -- there is no search path and
+-- no dynamic loading in a cart.
 local loaded = {}
+package = { loaded = loaded }
+
 function require(name)
   if loaded[name] then return loaded[name] end
+  -- In LOVE every module is also requirable by name -- require("love.system")
+  -- is how a library pulls in a submodule it uses conditionally, and real
+  -- code does it (3DreamEngine requires love.system and love.thread this
+  -- way). The tables already exist; resolve to them rather than looking for
+  -- a file that a cart could never contain.
+  local sub = name:match("^love%.([%w_]+)$")
+  if sub then
+    local mod = love[sub]
+    if mod ~= nil then
+      loaded[name] = mod
+      return mod
+    end
+  end
+  if name == "love" then
+    loaded[name] = love
+    return love
+  end
   local path = name:gsub("%.", "/")
   local candidates = { path .. ".lua", "lib/" .. path .. ".lua", path .. "/init.lua" }
   for _, p in ipairs(candidates) do
@@ -1953,4 +3663,59 @@ function __wasmcart_frame(b1, lx1, ly1, rx1, ry1,
   wc.set_color(cr, cg, cb, ca)
 
   if love.draw then love.draw() end
+end
+
+-- ── type(): LOVE objects report as "userdata" ───────────────────────
+--
+-- In LOVE, every engine object (Image, Mesh, Canvas, Shader, Source, ...)
+-- is a C userdata, and library code type-checks on that:
+--
+--     if type(mesh) == "userdata" then ... else --[[ raw data ]] ... end
+--
+-- This engine's objects are Lua TABLES with metatables, so that check takes
+-- the wrong branch -- and the wrong branch is usually "treat it as
+-- unloaded data", which sends a library down a path that reconstructs an
+-- object it already has. 3DreamEngine does this in five places; the first
+-- one turns a live Mesh back into a cache record with no vertices.
+--
+-- So `type` is replaced with one that reports "userdata" for an engine
+-- object and defers to the real type() for everything else. An engine
+-- object is recognised by having a `type()` method returning a LOVE class
+-- name, which is the same duck-typing LOVE's own `Object:typeOf` relies on.
+--
+-- This is deliberately narrow: it does NOT change what type() says about a
+-- cart's own tables, only about objects this engine handed out.
+--
+-- INSTALLED LAST, at the very end of the prelude, and the prelude's own
+-- code above is written against the REAL type(). Installing it earlier
+-- would change the meaning of the 25 `type(x) == "table"` checks in this
+-- file -- every one of which is asking about an engine object, and every
+-- one of which would start taking the else branch.
+local raw_type = type
+local LOVE_CLASSES = {
+  Image = true, Canvas = true, Mesh = true, Shader = true, Font = true,
+  Quad = true, SpriteBatch = true, Source = true, ImageData = true,
+  ByteData = true, Text = true, Video = true, Thread = true, Channel = true,
+  Texture = true, Data = true,
+}
+
+function type(v)
+  local t = raw_type(v)
+  if t == "table" then
+    local mt = getmetatable(v)
+    if mt then
+      -- __index may be a FUNCTION, not a table (the Element proxy in the ffi
+      -- shim is one). Indexing it raises, so only look inside when it is
+      -- really a table.
+      local idx = rawget(mt, "__index")
+      local f = rawget(v, "type")
+      if f == nil and raw_type(idx) == "table" then f = idx.type end
+      if f == nil then f = rawget(mt, "type") end
+      if raw_type(f) == "function" then
+        local ok, name = pcall(f, v)
+        if ok and LOVE_CLASSES[name] then return "userdata" end
+      end
+    end
+  end
+  return t
 end

@@ -23,6 +23,7 @@
 #endif
 #include "wasmcart.h"
 #include "render2d_gl.h"
+#include "render3d_gl.h"
 #include "wc_cart.h"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -1136,6 +1137,56 @@ static int l_canvas_new(lua_State *S) {
     return 1;
 }
 
+/* image_pixel(id, x, y[, r, g, b, a]) - read or write one pixel.
+ *
+ * ImageData in LOVE is CPU-side pixels a cart can inspect and edit before
+ * they become a texture. The engine already keeps every image's RGBA bytes
+ * in linear memory (image_t.rgba), so this is a direct accessor rather than
+ * a second representation.
+ *
+ * Writing marks the image so the GL backend re-uploads it: a texture cached
+ * from the old pixels would otherwise keep drawing them, which looks like
+ * setPixel doing nothing. */
+static int l_image_pixel(lua_State *S) {
+    image_t *im = image_by_id(ARGI(1));
+    int x = ARGI(2), y = ARGI(3);
+    if (!im || !im->rgba || x < 0 || y < 0 || x >= im->w || y >= im->h) {
+        if (lua_gettop(S) <= 3) { lua_pushnil(S); return 1; }
+        return 0;
+    }
+    uint8_t *p = &im->rgba[((size_t)y * im->w + x) * 4];
+    if (lua_gettop(S) <= 3) {              /* read */
+        lua_pushnumber(S, p[0] / 255.0);
+        lua_pushnumber(S, p[1] / 255.0);
+        lua_pushnumber(S, p[2] / 255.0);
+        lua_pushnumber(S, p[3] / 255.0);
+        return 4;
+    }
+    double r = ARGD(4), g = ARGD(5), b = ARGD(6);
+    double a = lua_isnoneornil(S, 7) ? 1.0 : ARGD(7);
+    #define CLAMP01(v) ((v) < 0 ? 0 : ((v) > 1 ? 1 : (v)))
+    p[0] = (uint8_t)(CLAMP01(r) * 255.0 + 0.5);
+    p[1] = (uint8_t)(CLAMP01(g) * 255.0 + 0.5);
+    p[2] = (uint8_t)(CLAMP01(b) * 255.0 + 0.5);
+    p[3] = (uint8_t)(CLAMP01(a) * 255.0 + 0.5);
+    #undef CLAMP01
+    /* The GL side caches by payload POINTER, so the contents changing under
+     * it is invisible. Drop the cached texture and let it re-upload. */
+    wcl_r2d_forget(im->rgba);
+    return 0;
+}
+
+/* image_blank(w, h) -> id - an all-zero RGBA image a cart can write into. */
+static int l_image_blank(lua_State *S) {
+    int id = canvas_new(ARGI(1), ARGI(2));
+    if (id < 0) { lua_pushnil(S); return 1; }
+    /* Not a render target -- just CPU pixels. Clearing is_canvas keeps
+     * set_canvas from accepting it as one. */
+    images[id].is_canvas = 0;
+    lua_pushinteger(S, id);
+    return 1;
+}
+
 static int l_image_draw(lua_State *S) {
     image_t *im = image_by_id(ARGI(1));
     if (!im) return 0;
@@ -1540,7 +1591,12 @@ static int l_peer_dropped(lua_State *S) {
 static int l_shader_new(lua_State *S) {
     const char *pixel = lua_isnoneornil(S, 1) ? NULL : luaL_checkstring(S, 1);
     const char *vertex = lua_isnoneornil(S, 2) ? NULL : luaL_checkstring(S, 2);
-    int h = wcl_r2d_shader_new(pixel, vertex);
+    /* The prelude passes is_3d when the cart declared a 3D vertex format, so
+     * the shader gets the vec3-position prologue rather than the 2D one. */
+    int is_3d = lua_toboolean(S, 3);
+    /* >0 selects the multi-output fragment scaffold (effect2). */
+    int mrt = OPTI(4, 0);
+    int h = wcl_r2d_shader_new(pixel, vertex, is_3d, mrt);
     if (h < 0) { lua_pushnil(S); return 1; }
     lua_pushinteger(S, h);
     return 1;
@@ -1593,6 +1649,22 @@ static int l_shader_send(lua_State *S) {
                     m[r * 4 + c] = (float)lua_tonumber(S, -1);
                     lua_pop(S, 1);
                 }
+                lua_pop(S, 1);
+            }
+            lua_pushboolean(S, wcl_r2d_shader_send_float(h, name, m, 16));
+            return 1;
+        }
+        /* A FLAT 16-number table is also a mat4, and it is the shape every
+         * LOVE 3D library actually sends: g3d's matrices are plain arrays of
+         * 16 (see its matrices.lua), never tables of rows. Rejecting this
+         * meant a cart's projection matrix silently failed to upload and the
+         * model rendered at the identity transform -- geometry on screen,
+         * flat and enormous, with no error anywhere. */
+        if (len == 16) {
+            float m[16];
+            for (int i = 0; i < 16; i++) {
+                lua_rawgeti(S, 3, i + 1);
+                m[i] = (float)lua_tonumber(S, -1);
                 lua_pop(S, 1);
             }
             lua_pushboolean(S, wcl_r2d_shader_send_float(h, name, m, 16));
@@ -1909,6 +1981,582 @@ static int l_mesh_draw(lua_State *S) {
     return 1;
 }
 
+/* ── 3D meshes ─────────────────────────────────────────────────────────
+ *
+ * The 2D bridge above marshals vertices into C once and then re-walks them
+ * every frame to apply the transform. The 3D path does neither: the vertices
+ * go straight into a GPU buffer at creation and the transform is the cart's
+ * own matrices in its own vertex shader. So a 3D draw is a handle and a
+ * colour, and no geometry crosses the Lua/C boundary after load.
+ *
+ * That is the difference that makes a real model viable. A 20k-triangle
+ * model through the 2D path would be 160k lua_rawgeti calls and a 2.5 MB
+ * upload EVERY FRAME; here it is one upload, ever.
+ */
+#define MESH3D_MAX_VERTS 200000
+static wcl_vertex3d_t *mesh3d_scratch;
+static int mesh3d_scratch_cap;
+
+/* Grow the marshalling scratch to hold `n` vertices. One buffer reused
+ * across every newMesh call: they are not reentrant and the buffer is dead
+ * the moment the data reaches the GPU. */
+static wcl_vertex3d_t *mesh3d_scratch_for(int n) {
+    if (n <= mesh3d_scratch_cap) return mesh3d_scratch;
+    wcl_vertex3d_t *p = (wcl_vertex3d_t *)realloc(
+        mesh3d_scratch, (size_t)n * sizeof(wcl_vertex3d_t));
+    if (!p) return NULL;
+    mesh3d_scratch = p;
+    mesh3d_scratch_cap = n;
+    return p;
+}
+
+/* Read one vertex from a Lua table at stack index `t`.
+ *
+ * The layout is LOVE's 3D convention, the one g3d's vertexFormat declares:
+ *     {x, y, z, u, v, nx, ny, nz, r, g, b, a}
+ * Everything past z is optional, defaulting the way LOVE does: uv 0, normal
+ * 0, colour opaque white. A model with positions alone must render as white
+ * geometry, not as nothing -- calloc's transparent black would make a
+ * correctly-loaded .obj look like a failed load. */
+static void mesh3d_read_vertex(lua_State *S, int t, wcl_vertex3d_t *v) {
+    double c[12] = {0,0,0, 0,0, 0,0,0, 1,1,1,1};
+    for (int i = 0; i < 12; i++) {
+        lua_rawgeti(S, t, i + 1);
+        if (!lua_isnil(S, -1)) c[i] = lua_tonumber(S, -1);
+        lua_pop(S, 1);
+    }
+    v->x = (float)c[0];  v->y = (float)c[1];  v->z = (float)c[2];
+    v->u = (float)c[3];  v->v = (float)c[4];
+    v->nx = (float)c[5]; v->ny = (float)c[6]; v->nz = (float)c[7];
+    v->r = (float)c[8];  v->g = (float)c[9];  v->b = (float)c[10];
+    v->a = (float)c[11];
+}
+
+/* mesh3d_new(verts) -> handle | nil, reason
+ * `verts` is an array of vertex tables. */
+static int l_mesh3d_new(lua_State *S) {
+    luaL_checktype(S, 1, LUA_TTABLE);
+    int n = (int)lua_rawlen(S, 1);
+    if (n < 1) { lua_pushnil(S); lua_pushstring(S, "empty"); return 2; }
+    if (n > MESH3D_MAX_VERTS) {
+        lua_pushnil(S); lua_pushstring(S, "toobig"); return 2;
+    }
+    if (!wcl_r2d_active()) {
+        lua_pushnil(S); lua_pushstring(S, "nogl"); return 2;
+    }
+    wcl_vertex3d_t *buf = mesh3d_scratch_for(n);
+    if (!buf) { lua_pushnil(S); lua_pushstring(S, "oom"); return 2; }
+    for (int i = 0; i < n; i++) {
+        lua_rawgeti(S, 1, i + 1);
+        if (lua_istable(S, -1)) mesh3d_read_vertex(S, lua_gettop(S), &buf[i]);
+        else memset(&buf[i], 0, sizeof buf[i]);
+        lua_pop(S, 1);
+    }
+    int h = wcl_r3d_mesh_new(buf, n);
+    if (h < 0) { lua_pushnil(S); lua_pushstring(S, "slots"); return 2; }
+    lua_pushinteger(S, h);
+    return 1;
+}
+
+/* mesh3d_new_format(format, verts) -> handle | nil, reason
+ *
+ * `format` is an array of {name, "float"|"byte", components} and `verts` an
+ * array of per-vertex tables holding the components IN FORMAT ORDER,
+ * flattened. The packing happens here rather than in Lua because the target
+ * is raw interleaved bytes: doing it Lua-side would mean building a string
+ * per vertex.
+ */
+static int l_mesh3d_new_format(lua_State *S) {
+    luaL_checktype(S, 1, LUA_TTABLE);
+    luaL_checktype(S, 2, LUA_TTABLE);
+
+    wcl_attrib_t attribs[WCL_MAX_ATTRIBS];
+    int n_attribs = (int)lua_rawlen(S, 1);
+    if (n_attribs < 1 || n_attribs > WCL_MAX_ATTRIBS) {
+        lua_pushnil(S); lua_pushstring(S, "attribs"); return 2;
+    }
+    for (int i = 0; i < n_attribs; i++) {
+        lua_rawgeti(S, 1, i + 1);
+        lua_rawgeti(S, -1, 1);
+        const char *nm = lua_tostring(S, -1);
+        snprintf(attribs[i].name, WCL_ATTRIB_NAME_MAX, "%s", nm ? nm : "");
+        lua_pop(S, 1);
+        lua_rawgeti(S, -1, 2);
+        const char *ty = lua_tostring(S, -1);
+        attribs[i].is_byte = (ty && !strcmp(ty, "byte"));
+        lua_pop(S, 1);
+        lua_rawgeti(S, -1, 3);
+        int comps = (int)lua_tointeger(S, -1);
+        lua_pop(S, 1);
+        if (comps < 1) comps = 1;
+        if (comps > 4) comps = 4;
+        /* A byte attribute is always 4 components in LOVE, which is what
+         * makes it exactly one 32-bit word per vertex. */
+        attribs[i].components = attribs[i].is_byte ? 4 : comps;
+        lua_pop(S, 1);
+    }
+
+    const int stride = wcl_r3d_format_stride(attribs, n_attribs);
+    const int count = (int)lua_rawlen(S, 2);
+    if (count < 1) { lua_pushnil(S); lua_pushstring(S, "empty"); return 2; }
+    if (!wcl_r2d_active()) { lua_pushnil(S); lua_pushstring(S, "nogl"); return 2; }
+
+    uint8_t *buf = (uint8_t *)calloc((size_t)count * stride, 1);
+    if (!buf) { lua_pushnil(S); lua_pushstring(S, "oom"); return 2; }
+
+    for (int v = 0; v < count; v++) {
+        lua_rawgeti(S, 2, v + 1);
+        if (!lua_istable(S, -1)) { lua_pop(S, 1); continue; }
+        uint8_t *dst = buf + (size_t)v * stride;
+        int src_i = 1;                     /* 1-based index into the vertex */
+        for (int a = 0; a < n_attribs; a++) {
+            const wcl_attrib_t *at = &attribs[a];
+            if (at->is_byte) {
+                for (int c = 0; c < 4; c++) {
+                    lua_rawgeti(S, -1, src_i++);
+                    double d = lua_tonumber(S, -1);
+                    lua_pop(S, 1);
+                    /* LOVE's byte attributes arrive already in 0..255 from
+                     * the packing code that produced them. */
+                    if (d < 0) d = 0;
+                    if (d > 255) d = 255;
+                    dst[c] = (uint8_t)(d + 0.5);
+                }
+                dst += 4;
+            } else {
+                for (int c = 0; c < at->components; c++) {
+                    lua_rawgeti(S, -1, src_i++);
+                    float f = (float)lua_tonumber(S, -1);
+                    lua_pop(S, 1);
+                    memcpy(dst, &f, 4);
+                    dst += 4;
+                }
+            }
+        }
+        lua_pop(S, 1);
+    }
+
+    int h = wcl_r3d_mesh_new_format(attribs, n_attribs, buf, count, stride);
+    free(buf);
+    if (h < 0) { lua_pushnil(S); lua_pushstring(S, "create"); return 2; }
+    lua_pushinteger(S, h);
+    return 1;
+}
+
+/* mesh3d_new_format_empty(format, count) - allocate the buffer, fill later
+ * through mesh3d_set_bytes. */
+static int l_mesh3d_new_format_empty(lua_State *S) {
+    luaL_checktype(S, 1, LUA_TTABLE);
+    wcl_attrib_t attribs[WCL_MAX_ATTRIBS];
+    int n_attribs = (int)lua_rawlen(S, 1);
+    if (n_attribs < 1 || n_attribs > WCL_MAX_ATTRIBS) {
+        lua_pushnil(S); lua_pushstring(S, "attribs"); return 2;
+    }
+    for (int i = 0; i < n_attribs; i++) {
+        lua_rawgeti(S, 1, i + 1);
+        lua_rawgeti(S, -1, 1);
+        const char *nm = lua_tostring(S, -1);
+        snprintf(attribs[i].name, WCL_ATTRIB_NAME_MAX, "%s", nm ? nm : "");
+        lua_pop(S, 1);
+        lua_rawgeti(S, -1, 2);
+        const char *ty = lua_tostring(S, -1);
+        attribs[i].is_byte = (ty && !strcmp(ty, "byte"));
+        lua_pop(S, 1);
+        lua_rawgeti(S, -1, 3);
+        int comps = (int)lua_tointeger(S, -1);
+        lua_pop(S, 1);
+        if (comps < 1) comps = 1;
+        if (comps > 4) comps = 4;
+        attribs[i].components = attribs[i].is_byte ? 4 : comps;
+        lua_pop(S, 1);
+    }
+    int count = ARGI(2);
+    if (count < 1) { lua_pushnil(S); lua_pushstring(S, "empty"); return 2; }
+    if (!wcl_r2d_active()) { lua_pushnil(S); lua_pushstring(S, "nogl"); return 2; }
+
+    const int stride = wcl_r3d_format_stride(attribs, n_attribs);
+    uint8_t *buf = (uint8_t *)calloc((size_t)count * stride, 1);
+    if (!buf) { lua_pushnil(S); lua_pushstring(S, "oom"); return 2; }
+    int h = wcl_r3d_mesh_new_format(attribs, n_attribs, buf, count, stride);
+    free(buf);
+    if (h < 0) { lua_pushnil(S); lua_pushstring(S, "create"); return 2; }
+    lua_pushinteger(S, h);
+    return 1;
+}
+
+/* mesh3d_set_bytes(handle, str) - upload already-interleaved vertex bytes.
+ * No marshalling: the cart packed the buffer, so it goes straight across. */
+static int l_mesh3d_set_bytes(lua_State *S) {
+    int handle = ARGI(1);
+    size_t len = 0;
+    const char *data = luaL_checklstring(S, 2, &len);
+    lua_pushboolean(S, wcl_r3d_mesh_set_bytes(handle, data, (int)len));
+    return 1;
+}
+
+/* mesh3d_set_vertices_format(handle, format, verts) - repack a
+ * declared-format mesh's vertices in place, to ITS stride. */
+static int l_mesh3d_set_vertices_format(lua_State *S) {
+    int handle = ARGI(1);
+    luaL_checktype(S, 2, LUA_TTABLE);
+    luaL_checktype(S, 3, LUA_TTABLE);
+
+    wcl_attrib_t attribs[WCL_MAX_ATTRIBS];
+    int n_attribs = (int)lua_rawlen(S, 2);
+    if (n_attribs < 1 || n_attribs > WCL_MAX_ATTRIBS) {
+        lua_pushboolean(S, 0); return 1;
+    }
+    for (int i = 0; i < n_attribs; i++) {
+        lua_rawgeti(S, 2, i + 1);
+        lua_rawgeti(S, -1, 1);
+        const char *nm = lua_tostring(S, -1);
+        snprintf(attribs[i].name, WCL_ATTRIB_NAME_MAX, "%s", nm ? nm : "");
+        lua_pop(S, 1);
+        lua_rawgeti(S, -1, 2);
+        const char *ty = lua_tostring(S, -1);
+        attribs[i].is_byte = (ty && !strcmp(ty, "byte"));
+        lua_pop(S, 1);
+        lua_rawgeti(S, -1, 3);
+        int comps = (int)lua_tointeger(S, -1);
+        lua_pop(S, 1);
+        if (comps < 1) comps = 1;
+        if (comps > 4) comps = 4;
+        attribs[i].components = attribs[i].is_byte ? 4 : comps;
+        lua_pop(S, 1);
+    }
+    const int stride = wcl_r3d_format_stride(attribs, n_attribs);
+    const int count = (int)lua_rawlen(S, 3);
+    if (count < 1) { lua_pushboolean(S, 0); return 1; }
+
+    uint8_t *buf = (uint8_t *)calloc((size_t)count * stride, 1);
+    if (!buf) { lua_pushboolean(S, 0); return 1; }
+    for (int v = 0; v < count; v++) {
+        lua_rawgeti(S, 3, v + 1);
+        if (!lua_istable(S, -1)) { lua_pop(S, 1); continue; }
+        uint8_t *dst = buf + (size_t)v * stride;
+        int src_i = 1;
+        for (int a = 0; a < n_attribs; a++) {
+            const wcl_attrib_t *at = &attribs[a];
+            if (at->is_byte) {
+                for (int c = 0; c < 4; c++) {
+                    lua_rawgeti(S, -1, src_i++);
+                    double d = lua_tonumber(S, -1);
+                    lua_pop(S, 1);
+                    if (d < 0) d = 0;
+                    if (d > 255) d = 255;
+                    dst[c] = (uint8_t)(d + 0.5);
+                }
+                dst += 4;
+            } else {
+                for (int c = 0; c < at->components; c++) {
+                    lua_rawgeti(S, -1, src_i++);
+                    float f = (float)lua_tonumber(S, -1);
+                    lua_pop(S, 1);
+                    memcpy(dst, &f, 4);
+                    dst += 4;
+                }
+            }
+        }
+        lua_pop(S, 1);
+    }
+    int ok = wcl_r3d_mesh_set_bytes(handle, buf, count * stride);
+    free(buf);
+    lua_pushboolean(S, ok);
+    return 1;
+}
+
+/* mesh3d_set_map_bytes(handle, str, width) - an index buffer that is
+ * already packed. `width` is 2 or 4 bytes per index; GL wants 32-bit here,
+ * so 16-bit input is widened rather than reinterpreted. */
+static int l_mesh3d_set_map_bytes(lua_State *S) {
+    int handle = ARGI(1);
+    size_t len = 0;
+    const char *data = luaL_checklstring(S, 2, &len);
+    int width = OPTI(3, 4);
+    if (width != 2 && width != 4) { lua_pushboolean(S, 0); return 1; }
+    int n = (int)(len / (size_t)width);
+    if (n < 1) { lua_pushboolean(S, 0); return 1; }
+    uint32_t *idx = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
+    if (!idx) { lua_pushboolean(S, 0); return 1; }
+    for (int i = 0; i < n; i++) {
+        if (width == 2) {
+            uint16_t v;
+            memcpy(&v, data + (size_t)i * 2, 2);
+            idx[i] = v;
+        } else {
+            uint32_t v;
+            memcpy(&v, data + (size_t)i * 4, 4);
+            idx[i] = v;
+        }
+    }
+    /* NOT 1-based: these indices were written by the cart against its own
+     * 0-based buffer (through ffi), unlike the Lua table form which follows
+     * LOVE's 1-based convention. Subtracting one here would drop the first
+     * vertex of every primitive. */
+    lua_pushboolean(S, wcl_r3d_mesh_set_indices(handle, idx, n));
+    free(idx);
+    return 1;
+}
+
+/* mesh3d_set_vertices(handle, verts) - replace geometry in place. */
+static int l_mesh3d_set_vertices(lua_State *S) {
+    int h = ARGI(1);
+    luaL_checktype(S, 2, LUA_TTABLE);
+    int n = (int)lua_rawlen(S, 2);
+    if (n < 1 || n > MESH3D_MAX_VERTS) { lua_pushboolean(S, 0); return 1; }
+    wcl_vertex3d_t *buf = mesh3d_scratch_for(n);
+    if (!buf) { lua_pushboolean(S, 0); return 1; }
+    for (int i = 0; i < n; i++) {
+        lua_rawgeti(S, 2, i + 1);
+        if (lua_istable(S, -1)) mesh3d_read_vertex(S, lua_gettop(S), &buf[i]);
+        else memset(&buf[i], 0, sizeof buf[i]);
+        lua_pop(S, 1);
+    }
+    lua_pushboolean(S, wcl_r3d_mesh_update(h, buf, n));
+    return 1;
+}
+
+/* mesh3d_set_map(handle, indices) - an index buffer, or nil to clear. */
+static int l_mesh3d_set_map(lua_State *S) {
+    int h = ARGI(1);
+    if (lua_isnoneornil(S, 2)) {
+        lua_pushboolean(S, wcl_r3d_mesh_set_indices(h, NULL, 0));
+        return 1;
+    }
+    luaL_checktype(S, 2, LUA_TTABLE);
+    int n = (int)lua_rawlen(S, 2);
+    if (n < 1) { lua_pushboolean(S, 0); return 1; }
+    uint32_t *idx = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
+    if (!idx) { lua_pushboolean(S, 0); return 1; }
+    for (int i = 0; i < n; i++) {
+        lua_rawgeti(S, 2, i + 1);
+        /* LOVE's vertex maps are 1-based; GL's are 0-based. */
+        lua_Integer u = lua_tointeger(S, -1) - 1;
+        idx[i] = (uint32_t)(u < 0 ? 0 : u);
+        lua_pop(S, 1);
+    }
+    lua_pushboolean(S, wcl_r3d_mesh_set_indices(h, idx, n));
+    free(idx);
+    return 1;
+}
+
+static int l_mesh3d_set_texture(lua_State *S) {
+    int h = ARGI(1);
+    if (lua_isnoneornil(S, 2)) {
+        lua_pushboolean(S, wcl_r3d_mesh_set_texture(h, NULL, 0, 0));
+        return 1;
+    }
+    image_t *im = image_by_id(ARGI(2));
+    if (!im || !im->rgba) { lua_pushboolean(S, 0); return 1; }
+    lua_pushboolean(S, wcl_r3d_mesh_set_texture(h, im->rgba, im->w, im->h));
+    return 1;
+}
+
+static int l_mesh3d_draw(lua_State *S) {
+    int ok = wcl_r3d_mesh_draw(ARGI(1), cur_rgb(), cur_a);
+    if (ok) dbg_draw_calls++;
+    lua_pushboolean(S, ok);
+    return 1;
+}
+
+static int l_mesh3d_release(lua_State *S) {
+    wcl_r3d_mesh_free(ARGI(1));
+    return 0;
+}
+
+/* ── GPU render targets ────────────────────────────────────────────────
+ *
+ * The prelude passes formats and texture types as STRINGS, exactly as LOVE
+ * spells them, and they are mapped to the enum here rather than in Lua so
+ * the name->enum table lives beside the table that implements them.
+ */
+static const char *FMT_NAMES[] = {
+    "rgba8", "r8", "rg8", "r16f", "rg16f", "rgba16f", "r32f", "rgba32f",
+    "depth16", "depth24", "depth32f", "depth24stencil8", NULL
+};
+
+static int fmt_from_name(const char *s) {
+    if (!s) return WCL_FMT_RGBA8;
+    /* LOVE spells the default "normal"; several of its aliases mean rgba8. */
+    if (!strcmp(s, "normal") || !strcmp(s, "rgba8") || !strcmp(s, "srgba8"))
+        return WCL_FMT_RGBA8;
+    if (!strcmp(s, "depth24stencil8") || !strcmp(s, "depth24_stencil8"))
+        return WCL_FMT_DEPTH24_STENCIL8;
+    for (int i = 0; FMT_NAMES[i]; i++)
+        if (!strcmp(s, FMT_NAMES[i])) return i;
+    return -1;
+}
+
+static int textype_from_name(const char *s) {
+    if (!s || !strcmp(s, "2d")) return WCL_TEX_2D;
+    if (!strcmp(s, "cube"))   return WCL_TEX_CUBE;
+    if (!strcmp(s, "array"))  return WCL_TEX_ARRAY;
+    if (!strcmp(s, "volume")) return WCL_TEX_VOLUME;
+    return -1;
+}
+
+/* target_new(w, h, format, type, layers, mipmaps, msaa) -> handle | nil, why */
+static int l_target_new(lua_State *S) {
+    int w = ARGI(1), h = ARGI(2);
+    const char *fname = lua_isnoneornil(S, 3) ? NULL : luaL_checkstring(S, 3);
+    const char *tname = lua_isnoneornil(S, 4) ? NULL : luaL_checkstring(S, 4);
+    int fmt = fmt_from_name(fname);
+    int type = textype_from_name(tname);
+    if (fmt < 0) { lua_pushnil(S); lua_pushstring(S, "format"); return 2; }
+    if (type < 0) { lua_pushnil(S); lua_pushstring(S, "type"); return 2; }
+    if (!wcl_r2d_active()) { lua_pushnil(S); lua_pushstring(S, "nogl"); return 2; }
+    int h2 = wcl_r3d_target_new(w, h, (wcl_format_t)fmt, (wcl_textype_t)type,
+                                OPTI(5, 1), lua_toboolean(S, 6), OPTI(7, 0));
+    if (h2 < 0) { lua_pushnil(S); lua_pushstring(S, "create"); return 2; }
+    lua_pushinteger(S, h2);
+    return 1;
+}
+
+static int l_target_free(lua_State *S) {
+    wcl_r3d_target_free(ARGI(1));
+    return 0;
+}
+
+static int l_target_supported(lua_State *S) {
+    int fmt = fmt_from_name(luaL_checkstring(S, 1));
+    lua_pushboolean(S, fmt >= 0 && wcl_r3d_format_supported((wcl_format_t)fmt));
+    return 1;
+}
+
+static int l_target_mipmaps(lua_State *S) {
+    wcl_r3d_target_generate_mipmaps(ARGI(1));
+    return 0;
+}
+
+/* target_bind(handles, layers, depth, depth_layer)
+ * `handles` is an array of target handles (or nil/empty for the screen). */
+static int l_target_bind(lua_State *S) {
+    int handles[8], layers[8];
+    int n = 0;
+    if (lua_istable(S, 1)) {
+        n = (int)lua_rawlen(S, 1);
+        if (n > 8) n = 8;
+        for (int i = 0; i < n; i++) {
+            lua_rawgeti(S, 1, i + 1);
+            handles[i] = (int)lua_tointeger(S, -1);
+            lua_pop(S, 1);
+            layers[i] = 0;
+            if (lua_istable(S, 2)) {
+                lua_rawgeti(S, 2, i + 1);
+                layers[i] = (int)lua_tointeger(S, -1);
+                lua_pop(S, 1);
+            }
+        }
+    }
+    int depth = lua_isnoneornil(S, 3) ? -1 : (int)lua_tointeger(S, 3);
+    int dlayer = OPTI(4, 0);
+    lua_pushboolean(S, wcl_r3d_target_bind(handles, layers, n, depth, dlayer));
+    return 1;
+}
+
+static int l_target_send(lua_State *S) {
+    lua_pushboolean(S, wcl_r3d_target_send(ARGI(1), luaL_checkstring(S, 2),
+                                           ARGI(3), ARGI(4)));
+    return 1;
+}
+
+/* image3d_new(w, h, type, layers, mipmaps) -> handle | nil */
+static int l_image3d_new(lua_State *S) {
+    int type = textype_from_name(lua_isnoneornil(S, 3) ? NULL : luaL_checkstring(S, 3));
+    if (type < 0) { lua_pushnil(S); lua_pushstring(S, "type"); return 2; }
+    if (!wcl_r2d_active()) { lua_pushnil(S); lua_pushstring(S, "nogl"); return 2; }
+    int h = wcl_r3d_image_new(ARGI(1), ARGI(2), (wcl_textype_t)type,
+                              OPTI(4, 1), lua_toboolean(S, 5));
+    if (h < 0) { lua_pushnil(S); lua_pushstring(S, "create"); return 2; }
+    lua_pushinteger(S, h);
+    return 1;
+}
+
+/* image3d_upload_from(handle, layer, imageId) - copies an already-decoded
+ * 2D image's pixels into one face/layer. Going through the existing image
+ * loader means cube faces get the same PNG decoder, the same asset lookup
+ * and the same error reporting as every other texture in the cart. */
+static int l_image3d_upload_from(lua_State *S) {
+    int handle = ARGI(1), layer = ARGI(2);
+    image_t *im = image_by_id(ARGI(3));
+    if (!im || !im->rgba) { lua_pushboolean(S, 0); return 1; }
+    lua_pushboolean(S, wcl_r3d_image_upload(handle, layer, im->rgba, im->w, im->h));
+    return 1;
+}
+
+static int l_image3d_finish(lua_State *S) {
+    wcl_r3d_image_finish(ARGI(1));
+    return 0;
+}
+
+static int l_image3d_wrap(lua_State *S) {
+    wcl_r3d_image_wrap(ARGI(1), lua_toboolean(S, 2), lua_toboolean(S, 3),
+                       lua_toboolean(S, 4));
+    return 0;
+}
+
+static int l_image3d_filter(lua_State *S) {
+    wcl_r3d_image_filter(ARGI(1), lua_toboolean(S, 2));
+    return 0;
+}
+
+static int l_color_mask(lua_State *S) {
+    wcl_r3d_color_mask(lua_toboolean(S, 1), lua_toboolean(S, 2),
+                       lua_toboolean(S, 3), lua_toboolean(S, 4));
+    return 0;
+}
+
+static int l_get_color_mask(lua_State *S) {
+    int r, g, b, a;
+    wcl_r3d_get_color_mask(&r, &g, &b, &a);
+    lua_pushboolean(S, r); lua_pushboolean(S, g);
+    lua_pushboolean(S, b); lua_pushboolean(S, a);
+    return 4;
+}
+
+static int l_gl_limit(lua_State *S) {
+    lua_pushinteger(S, wcl_r3d_limit(ARGI(1)));
+    return 1;
+}
+
+static int l_mesh3d_draw_instanced(lua_State *S) {
+    int ok = wcl_r3d_mesh_draw_instanced(ARGI(1), ARGI(2), cur_rgb(), cur_a);
+    if (ok) dbg_draw_calls++;
+    lua_pushboolean(S, ok);
+    return 1;
+}
+
+/* depth_mode(compare, write) - compare is a GL enum, 0 to disable. */
+static int l_depth_mode(lua_State *S) {
+    wcl_r3d_depth_mode((uint32_t)luaL_checkinteger(S, 1), lua_toboolean(S, 2));
+    return 0;
+}
+
+static int l_get_depth_mode(lua_State *S) {
+    uint32_t c = 0; int w = 0;
+    wcl_r3d_get_depth_mode(&c, &w);
+    lua_pushinteger(S, (lua_Integer)c);
+    lua_pushboolean(S, w);
+    return 2;
+}
+
+static int l_cull_mode(lua_State *S) {
+    wcl_r3d_cull_mode(ARGI(1));
+    return 0;
+}
+static int l_get_cull_mode(lua_State *S) {
+    lua_pushinteger(S, wcl_r3d_get_cull_mode());
+    return 1;
+}
+static int l_front_face(lua_State *S) {
+    wcl_r3d_front_face(lua_toboolean(S, 1));
+    return 0;
+}
+static int l_get_front_face(lua_State *S) {
+    lua_pushboolean(S, wcl_r3d_get_front_face());
+    return 1;
+}
+
 static int l_asset_exists(lua_State *S) {
     const char *path = luaL_checkstring(S, 1);
     lua_pushboolean(S, wc_asset_size(path, (unsigned int)strlen(path)) >= 0);
@@ -1925,6 +2573,8 @@ static const luaL_Reg wc_lib[] = {
     {"polygon",     l_polygon},
     {"image_load",  l_image_load},
     {"image_draw",  l_image_draw},
+    {"image_pixel", l_image_pixel},
+    {"image_blank", l_image_blank},
     {"canvas_new",  l_canvas_new},
     {"set_canvas",  l_set_canvas},
     {"set_scissor", l_set_scissor},
@@ -1966,6 +2616,38 @@ static const luaL_Reg wc_lib[] = {
     {"mesh_get_range",  l_mesh_get_range},
     {"mesh_draw",       l_mesh_draw},
     {"mesh_release",    l_mesh_release},
+    {"mesh3d_new",          l_mesh3d_new},
+    {"mesh3d_new_format",   l_mesh3d_new_format},
+    {"mesh3d_new_format_empty", l_mesh3d_new_format_empty},
+    {"mesh3d_set_bytes",    l_mesh3d_set_bytes},
+    {"mesh3d_set_map_bytes", l_mesh3d_set_map_bytes},
+    {"mesh3d_set_vertices_format", l_mesh3d_set_vertices_format},
+    {"mesh3d_set_vertices", l_mesh3d_set_vertices},
+    {"mesh3d_set_map",      l_mesh3d_set_map},
+    {"mesh3d_set_texture",  l_mesh3d_set_texture},
+    {"mesh3d_draw",         l_mesh3d_draw},
+    {"mesh3d_release",      l_mesh3d_release},
+    {"mesh3d_draw_instanced", l_mesh3d_draw_instanced},
+    {"target_new",      l_target_new},
+    {"target_free",     l_target_free},
+    {"target_supported", l_target_supported},
+    {"target_mipmaps",  l_target_mipmaps},
+    {"target_bind",     l_target_bind},
+    {"target_send",     l_target_send},
+    {"image3d_new",         l_image3d_new},
+    {"image3d_upload_from", l_image3d_upload_from},
+    {"image3d_finish",      l_image3d_finish},
+    {"image3d_wrap",        l_image3d_wrap},
+    {"image3d_filter",      l_image3d_filter},
+    {"color_mask",      l_color_mask},
+    {"get_color_mask",  l_get_color_mask},
+    {"gl_limit",        l_gl_limit},
+    {"depth_mode",      l_depth_mode},
+    {"get_depth_mode",  l_get_depth_mode},
+    {"cull_mode",       l_cull_mode},
+    {"get_cull_mode",   l_get_cull_mode},
+    {"front_face",      l_front_face},
+    {"get_front_face",  l_get_front_face},
     {"shader_has_uniform", l_shader_has_uniform},
     {"pad_has_rumble",  l_pad_has_rumble},
     {"pad_rumble",      l_pad_rumble},
@@ -2185,6 +2867,12 @@ WC_EXPORT_RENDER void wc_render(void) {
         /* the prelude resets sc_on per frame; keep GL's state in step */
         if (!sc_on) wcl_r2d_scissor(0, 0, -1, -1);
         else wcl_r2d_scissor(sc_x, sc_y, sc_w, sc_h);
+        /* Clear last frame's depths. wcl_r2d_begin's glClear covers colour
+         * only, so without this every frame after the first would test
+         * against the previous frame's depth buffer and geometry would
+         * vanish wherever the old frame happened to be nearer -- which
+         * reads as flickering holes in a model, not as a depth bug. */
+        wcl_r3d_frame_begin();
     }
 #endif
 

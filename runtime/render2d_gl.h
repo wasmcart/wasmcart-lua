@@ -80,8 +80,14 @@ void wcl_r2d_forget(const void *key);
  *
  * wcl_r2d_shader_new returns a handle >= 0, or -1 on compile/link failure
  * (the GL info log is already sent to wc_log by then). `pixel_src` is the
- * LOVE-shaped body containing effect(); `vertex_src` may be NULL. */
-int  wcl_r2d_shader_new(const char *pixel_src, const char *vertex_src);
+ * LOVE-shaped body containing effect(); `vertex_src` may be NULL.
+ *
+ * `is_3d` selects the 3D prologue pair: a vec3 VertexPosition, a
+ * VertexNormal attribute, and no glyph/circle dispatch in the fragment
+ * stage. A 3D shader MUST supply a vertex stage, since that is where the
+ * transform lives; the call is refused otherwise. See render3d_gl.h. */
+int  wcl_r2d_shader_new(const char *pixel_src, const char *vertex_src, int is_3d,
+                        int mrt_outputs);
 /* Bind a shader handle, or -1 for the engine's default program. Flushes any
  * open batch first: the program is pipeline state, not per-vertex. */
 void wcl_r2d_shader_use(int handle);
@@ -188,8 +194,8 @@ static inline int wcl_r2d_glyph(const unsigned char *atlas, int aw, int ah,
     (void)atlas; (void)aw; (void)ah; (void)dx; (void)dy; (void)dw; (void)dh;
     (void)sx; (void)sy; (void)srcw; (void)srch; (void)color; (void)alpha; return 0;
 }
-static inline int wcl_r2d_shader_new(const char *p, const char *v) {
-    (void)p; (void)v; return -1;
+static inline int wcl_r2d_shader_new(const char *p, const char *v, int is_3d, int mrt) {
+    (void)p; (void)v; (void)is_3d; (void)mrt; return -1;
 }
 static inline void wcl_r2d_shader_use(int handle) { (void)handle; }
 static inline int wcl_r2d_shader_send_float(int h, const char *n, const float *v, int c) {

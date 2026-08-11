@@ -536,6 +536,269 @@ async function main() {
     }
   }
 
+  // ── 3D ────────────────────────────────────────────────────────────
+  //
+  // test/g3d runs groverburger's g3d with its sources copied VERBATIM from
+  // upstream, so this gate is not "does 3D work" but "does an unmodified
+  // third-party LOVE 3D library still run". It covers a wide slice of the
+  // LOVE surface at once -- custom vertex formats, setDepthMode,
+  // package.loaded, getCanvas, flat-16 mat4 sends, GLSL ES 1.00 rewriting --
+  // and any one of them regressing turns it red.
+  //
+  // The gate's own control is INTERNAL (it re-renders with depth disabled
+  // and requires the frames to differ), so the control below is a second,
+  // coarser one: with the 3D draws removed the gate must fail outright.
+  if (fs.existsSync(glEngine) &&
+      fs.existsSync(path.join(ROOT, 'test', 'g3d', 'app', 'main.lua'))) {
+    const { execFileSync } = require('child_process');
+    const os = require('os');
+    const tool = path.join(ROOT, 'tools', 'gl-3d-verify.mjs');
+    const g3dDir = path.join(ROOT, 'test', 'g3d');
+    const run3d = (dir) => execFileSync(process.execPath, [tool, glEngine, dir, '3'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+
+    let glMissing = false;
+    try {
+      const out = run3d(g3dDir);
+      const m = out.match(/depth off\)/) ? out.match(/\((\d+) px change/) : null;
+      console.log('\nok    g3d          unmodified g3d renders in perspective; ' +
+                  `depth occludes (${m ? m[1] : '?'} px)`);
+    } catch (err) {
+      const txt = (err.stdout || '') + (err.stderr || '');
+      if (/Cannot find|ERR_MODULE_NOT_FOUND|createWebGL2Context/.test(txt)) {
+        console.log('\nskip  g3d          no GL context available on this machine');
+        glMissing = true;
+      } else {
+        console.log('\nFAIL  g3d          3D did not render, or depth is inert');
+        for (const l of txt.trim().split('\n').slice(-10)) console.log(`      ${l}`);
+        failed++;
+      }
+    }
+
+    if (!glMissing) {
+      const ctl = fs.mkdtempSync(path.join(os.tmpdir(), 'wcl-g3d-ctl-'));
+      fs.cpSync(path.join(g3dDir, 'app'), path.join(ctl, 'app'), { recursive: true });
+      const mainPath = path.join(ctl, 'app', 'main.lua');
+      fs.writeFileSync(mainPath, fs.readFileSync(mainPath, 'utf8')
+        .replace('    nearCube:draw()\n    farCube:draw()\n',
+                 '    -- control: the 3D draws removed\n'));
+      let caught = false;
+      try { run3d(ctl); } catch { caught = true; }
+      fs.rmSync(ctl, { recursive: true, force: true });
+      if (caught) {
+        console.log('ok    g3d-ctl      undrawn control correctly detected');
+      } else {
+        console.log('FAIL  g3d-ctl      the control PASSED: the 3D gate cannot see failure');
+        failed++;
+      }
+    }
+  }
+
+  // ── the deferred-rendering capabilities ───────────────────────────
+  //
+  // MRT, float canvases, cube/array/volume textures, instancing and the
+  // colour mask. Every one of these can FAIL SILENTLY -- a float target that
+  // was quietly created as 8-bit still binds and still draws, MRT that
+  // broadcasts one colour to every attachment still "works" -- so the gate
+  // reads pixels rather than trusting that the calls returned.
+  //
+  // The controls below break each capability in the way it actually breaks
+  // in the wild, and each must turn the gate red.
+  if (fs.existsSync(glEngine) &&
+      fs.existsSync(path.join(ROOT, 'test', 'gpu3d', 'app', 'main.lua'))) {
+    const { execFileSync } = require('child_process');
+    const os = require('os');
+    const tool = path.join(ROOT, 'tools', 'gl-gpu3d-verify.mjs');
+    const dir = path.join(ROOT, 'test', 'gpu3d');
+    const runGpu = (d) => execFileSync(process.execPath, [tool, glEngine, d, '3'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+
+    let glMissing = false;
+    try {
+      runGpu(dir);
+      console.log('\nok    gpu3d        MRT, float canvas, colour mask, ' +
+                  'instancing, cube faces verified by pixel');
+    } catch (err) {
+      const txt = (err.stdout || '') + (err.stderr || '');
+      if (/Cannot find|ERR_MODULE_NOT_FOUND|createWebGL2Context/.test(txt)) {
+        console.log('\nskip  gpu3d        no GL context available on this machine');
+        glMissing = true;
+      } else {
+        console.log('\nFAIL  gpu3d        a GPU capability is not doing what it claims');
+        for (const l of txt.trim().split('\n').slice(-12)) console.log(`      ${l}`);
+        failed++;
+      }
+    }
+
+    // Four controls, one per failure mode. Each edit is the real-world bug:
+    // a format silently downgraded, a mask that does nothing, instancing
+    // ignored, cube faces wired up in the wrong order.
+    if (!glMissing) {
+      const CONTROLS = [
+        ['gpu3d-ctl-float', 'format = "rgba16f" })\n    local b', 'format = "rgba8" })\n    local b'],
+        ['gpu3d-ctl-mask', 'setColorMask(true, false, true, true)',
+                           'setColorMask(true, true, true, true)'],
+        ['gpu3d-ctl-inst', 'love.graphics.drawInstanced, quad, 8',
+                           'love.graphics.drawInstanced, quad, 1'],
+        ['gpu3d-ctl-cube', 'faces[i] = "face" .. i .. ".png"',
+                           'faces[i] = "face" .. ((i == 1) and 2 or (i == 2) and 1 or i) .. ".png"'],
+      ];
+      for (const [name, from, to] of CONTROLS) {
+        const ctl = fs.mkdtempSync(path.join(os.tmpdir(), 'wcl-' + name + '-'));
+        fs.cpSync(path.join(dir, 'app'), path.join(ctl, 'app'), { recursive: true });
+        const mainPath = path.join(ctl, 'app', 'main.lua');
+        const src = fs.readFileSync(mainPath, 'utf8');
+        if (!src.includes(from)) {
+          console.log(`FAIL  ${name.padEnd(12)} the control's anchor text is gone; ` +
+                      'the control is not testing anything');
+          failed++;
+          fs.rmSync(ctl, { recursive: true, force: true });
+          continue;
+        }
+        fs.writeFileSync(mainPath, src.replace(from, to));
+        let caught = false;
+        try { runGpu(ctl); } catch { caught = true; }
+        fs.rmSync(ctl, { recursive: true, force: true });
+        if (caught) {
+          console.log(`ok    ${name.padEnd(12)} broken capability correctly detected`);
+        } else {
+          console.log(`FAIL  ${name.padEnd(12)} the control PASSED: this gate is blind`);
+          failed++;
+        }
+      }
+    }
+  }
+
+  // ── 3DreamEngine ──────────────────────────────────────────────────
+  //
+  // The heaviest LOVE 3D library there is, running with its sources copied
+  // verbatim. It exercises a chain nothing else covers: the ffi shim packs
+  // its vertex buffer, a DECLARED vertex format carries VertexTangent and a
+  // 4-component position, the vertices and index buffer arrive as packed
+  // ByteData, and its .obj loader runs on the asset-index directory
+  // listing. Any one of those regressing turns this red.
+  if (fs.existsSync(glEngine) &&
+      fs.existsSync(path.join(ROOT, 'test', 'dream3d', 'app', 'main.lua'))) {
+    const { execFileSync } = require('child_process');
+    const os = require('os');
+    const tool = path.join(ROOT, 'tools', 'gl-dream3d-verify.mjs');
+    const dir = path.join(ROOT, 'test', 'dream3d');
+    const run3 = (d) => execFileSync(process.execPath, [tool, glEngine, d, '15'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+
+    let glMissing = false;
+    try {
+      const out = run3(dir);
+      const m = out.match(/\((\d+) px, (\d+) shades\)/);
+      console.log('\nok    dream3d      3DreamEngine renders its own model ' +
+                  (m ? `(${m[1]} px, ${m[2]} shades)` : ''));
+    } catch (err) {
+      const txt = (err.stdout || '') + (err.stderr || '');
+      if (/Cannot find|ERR_MODULE_NOT_FOUND|createWebGL2Context/.test(txt)) {
+        console.log('\nskip  dream3d      no GL context available on this machine');
+        glMissing = true;
+      } else {
+        console.log('\nFAIL  dream3d      3DreamEngine did not render correctly');
+        for (const l of txt.trim().split('\n').slice(-10)) console.log(`      ${l}`);
+        failed++;
+      }
+    }
+
+    // Two controls: geometry removed (nothing renders), and the normal
+    // attribute ignored (a model renders, FLAT). The second is the one that
+    // matters -- it is the failure a silhouette check cannot see.
+    if (!glMissing) {
+      const CONTROLS = [
+        ['dream3d-ctl', '  love.graphics.draw(mesh)', '  -- control: not drawn'],
+        ['dream3d-ctl-n',
+         '      vec3 n = normalize(VertexNormal);\n      return vec4(n * 0.5 + 0.5, 1.0);',
+         '      return vec4(0.8, 0.7, 0.6, 1.0);'],
+      ];
+      for (const [name, from, to] of CONTROLS) {
+        const ctl = fs.mkdtempSync(path.join(os.tmpdir(), 'wcl-' + name + '-'));
+        fs.cpSync(path.join(dir, 'app'), path.join(ctl, 'app'), { recursive: true });
+        const mainPath = path.join(ctl, 'app', 'main.lua');
+        const src = fs.readFileSync(mainPath, 'utf8');
+        if (!src.includes(from)) {
+          console.log(`FAIL  ${name.padEnd(12)} the control's anchor text is gone`);
+          failed++;
+          fs.rmSync(ctl, { recursive: true, force: true });
+          continue;
+        }
+        fs.writeFileSync(mainPath, src.replace(from, to));
+        let caught = false;
+        try { run3(ctl); } catch { caught = true; }
+        fs.rmSync(ctl, { recursive: true, force: true });
+        if (caught) {
+          console.log(`ok    ${name.padEnd(12)} broken pipeline correctly detected`);
+        } else {
+          console.log(`FAIL  ${name.padEnd(12)} the control PASSED: this gate is blind`);
+          failed++;
+        }
+      }
+    }
+  }
+
+  // ── texture mapping ON A MODEL ────────────────────────────────────
+  //
+  // Separate from the g3d and dream3d gates because neither asserts it: a
+  // textured quad has no perspective interpolation, no minification and a
+  // trivial uv layout, and a model that samples ONE texel per triangle
+  // renders clean and flat -- which reads as success at a glance.
+  if (fs.existsSync(glEngine) &&
+      fs.existsSync(path.join(ROOT, 'test', 'tex3d', 'app', 'main.lua'))) {
+    const { execFileSync } = require('child_process');
+    const os = require('os');
+    const tool = path.join(ROOT, 'tools', 'gl-tex3d-verify.mjs');
+    const dir = path.join(ROOT, 'test', 'tex3d');
+    const runT = (d) => execFileSync(process.execPath, [tool, glEngine, d, '25'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+
+    let glMissing = false;
+    try {
+      const out = runT(dir);
+      const m = out.match(/\((\d+) texel shades, (\d+) checker/);
+      console.log('\nok    tex3d        texture mapping on a 3D model ' +
+                  (m ? `(${m[1]} shades, ${m[2]} transitions)` : ''));
+    } catch (err) {
+      const txt = (err.stdout || '') + (err.stderr || '');
+      if (/Cannot find|ERR_MODULE_NOT_FOUND|createWebGL2Context/.test(txt)) {
+        console.log('\nskip  tex3d        no GL context available on this machine');
+        glMissing = true;
+      } else {
+        console.log('\nFAIL  tex3d        texture mapping is wrong on a model');
+        for (const l of txt.trim().split('\n').slice(-10)) console.log(`      ${l}`);
+        failed++;
+      }
+    }
+
+    // The control is the failure that looks like success: the model still
+    // renders, lit and clean, but every fragment samples the same texel.
+    if (!glMissing) {
+      const ctl = fs.mkdtempSync(path.join(os.tmpdir(), 'wcl-tex3d-ctl-'));
+      fs.cpSync(path.join(dir, 'app'), path.join(ctl, 'app'), { recursive: true });
+      const mainPath = path.join(ctl, 'app', 'main.lua');
+      const src = fs.readFileSync(mainPath, 'utf8');
+      const from = 'return vec4(Texel(t, uv).rgb * l, 1.0);';
+      if (!src.includes(from)) {
+        console.log("FAIL  tex3d-ctl    the control's anchor text is gone");
+        failed++;
+      } else {
+        fs.writeFileSync(mainPath, src.replace(from,
+          'return vec4(Texel(t, vec2(0.3, 0.3)).rgb * l, 1.0);'));
+        let caught = false;
+        try { runT(ctl); } catch { caught = true; }
+        if (caught) {
+          console.log('ok    tex3d-ctl    single-texel control correctly detected');
+        } else {
+          console.log('FAIL  tex3d-ctl    the control PASSED: this gate is blind');
+          failed++;
+        }
+      }
+      fs.rmSync(ctl, { recursive: true, force: true });
+    }
+  }
+
   // A mesh cannot ride the quad batcher, so each one is its own
   // glDrawArrays. That is the accepted trade; this keeps it from getting
   // worse. 12 meshes must be 12 draws, not 24, and must never re-bind the
@@ -601,8 +864,8 @@ async function main() {
         console.log('\nFAIL  meshfail     newMesh ACCEPTED something it cannot render:');
         for (const l of leaks) console.log(`      ${l}`);
         failed++;
-      } else if (refusals < 5) {
-        console.log(`\nFAIL  meshfail     only ${refusals} refusals, expected >= 5`);
+      } else if (refusals < 9) {
+        console.log(`\nFAIL  meshfail     only ${refusals} refusals, expected >= 9`);
         for (const l of lines.slice(0, 12)) console.log(`      ${l}`);
         failed++;
       } else {

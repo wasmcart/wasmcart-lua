@@ -22,6 +22,7 @@
  *     which a real cart would pay dozens of times per frame.
  */
 #include "render2d_gl.h"
+#include "render3d_gl.h"
 
 #ifdef WCL_ENABLE_GL2D
 
@@ -141,7 +142,13 @@ static int blend_add_on;
 static void flush_batches(void);
 /* Custom shaders (defined further down). Declared here because set_textured
  * and bind_texture, which sit above them, must consult the bound program. */
-#define MAX_SHADERS 8
+/* 8 was sized for a 2D cart, where a shader is an effect and two or three is
+ * a lot. A deferred renderer is the opposite: it compiles one program per
+ * PASS and per material variant -- geometry, lighting, shadow, SSAO, blur,
+ * sky, post -- and 3DreamEngine alone calls newShader 13 times before it
+ * draws anything. Each slot is a handle and a few ints; the programs
+ * themselves live in the driver either way. */
+#define MAX_SHADERS 64
 typedef struct {
     GLuint program;
     GLint tex_uniform, textured_uniform;
@@ -165,6 +172,12 @@ static wcl_r2d_stats_t frame_stats;
 #define ATTR_UV 1
 #define ATTR_COLOR 2
 #define ATTR_RAD 3
+/* The 3D pipeline's one extra attribute, sharing index 3 with a_rad: a
+ * program declares the 2D set or the 3D set, never both. render3d_gl.c
+ * mirrors these as A3_*, and the static asserts there hold the two in step
+ * -- a silent disagreement would render colour from the normal attribute,
+ * which looks plausible rather than broken. */
+#define ATTR_NORMAL 3
 
 static const char *VERTEX_SHADER =
     "#version 300 es\n"
@@ -279,11 +292,26 @@ static GLuint compile_shader(GLenum type, const char *source) {
  */
 /* How many texture units the cart's own Image uniforms may claim. Unit 0 is
  * the engine's (the atlas, a canvas, or a glyph texture) and is never given
- * away, because every draw path binds to it. */
-#define SHADER_TEX_UNITS 4
+ * away, because every draw path binds to it.
+ *
+ * 15 rather than 4 because a deferred renderer's lighting pass samples the
+ * whole g-buffer at once -- albedo, normal, depth, material, plus shadow
+ * maps and a environment cubemap -- and 4 units is not a shader that has to
+ * be split, it is a renderer that cannot be written. GLES 3.0 guarantees at
+ * least 16 fragment texture units, so 15 plus the engine's unit 0 is the
+ * whole guaranteed set.
+ *
+ * NOTE: wcl_r3d_target_send hands out units from this same 1..15 space for
+ * render targets bound as samplers. The two allocators must not overlap;
+ * see the unit assignment there. */
+#define SHADER_TEX_UNITS 15
 typedef struct {
     GLint location;
     GLuint tex;
+    /* The texture TARGET this sampler binds to. A render target may be a
+     * cubemap, an array or a volume, and rebinding one as GL_TEXTURE_2D on a
+     * program switch silently leaves the sampler reading nothing. */
+    GLenum textarget;
     int unit;
     int used;
 } shader_sampler_t;
@@ -347,7 +375,19 @@ static int shader_compile_checked(GLenum type, const char *source, GLuint *out) 
  * shader copied from a LOVE project compiles unchanged. */
 static const char *SHADER_FRAG_PROLOGUE =
     "#version 300 es\n"
-    "precision mediump float;\n"
+    /* LOVE compiles ONE source into BOTH stages and defines VERTEX or
+     * PIXEL so the shader can guard the half that belongs to each. That
+     * is not a nicety -- it is how a single-file LOVE shader is written,
+     * and without the define an `#ifdef PIXEL` body simply vanishes,
+     * leaving a shader with no effect() and a syntax error pointing at
+     * whatever followed. 19 of 3DreamEngine's shaders are written this
+     * way. */
+    "#define PIXEL 1\n"
+    /* highp, matching the vertex stage's default. A uniform a cart declares
+     * once in a source compiled into BOTH stages must come out the same
+     * precision on each or the program fails to link. */
+    "precision highp float;\n"
+    "precision highp int;\n"
     "in vec2 v_uv;\n"
     "in vec4 v_color;\n"
     "in highp vec2 v_centre;\n"
@@ -355,7 +395,7 @@ static const char *SHADER_FRAG_PROLOGUE =
     "out vec4 wc_frag_color;\n"
     "uniform sampler2D u_tex;\n"
     "uniform int u_textured;\n"
-    "uniform vec2 love_ScreenSize;\n"
+    "uniform highp vec2 love_ScreenSize;\n"
     "#define Image sampler2D\n"
     "#define VaryingColor v_color\n"
     "#define VaryingTexCoord vec4(v_uv, 0.0, 1.0)\n"
@@ -381,6 +421,12 @@ static const char *SHADER_FRAG_PROLOGUE =
     "  if (u_textured == 2) return vec4(1.0, 1.0, 1.0, texture(t, uv).r);\n"
     "  return vec4(1.0);\n"
     "}\n"
+    /* LOVE fragment built-ins. love_PixelCoord is the window-space pixel
+     * centre -- LOVE's spelling of gl_FragCoord.xy -- and post-process
+     * shaders use it constantly to sample by pixel rather than by uv.
+     * Missing it fails as "`love_PixelCoord' undeclared" at a line the
+     * author wrote correctly. */
+    "#define love_PixelCoord (gl_FragCoord.xy)\n"
     "#line 1\n";
 
 static const char *SHADER_FRAG_EPILOGUE =
@@ -404,22 +450,45 @@ static const char *SHADER_FRAG_EPILOGUE =
  * than papered over. */
 static const char *SHADER_VERT_PROLOGUE =
     "#version 300 es\n"
-    "in vec2 a_pos;\n"
-    "in vec2 a_uv;\n"
-    "in vec4 a_color;\n"
+    /* LOVE compiles ONE source into BOTH stages and defines VERTEX or
+     * PIXEL so the shader can guard the half that belongs to each. That
+     * is not a nicety -- it is how a single-file LOVE shader is written,
+     * and without the define an `#ifdef PIXEL` body simply vanishes,
+     * leaving a shader with no effect() and a syntax error pointing at
+     * whatever followed. 19 of 3DreamEngine's shaders are written this
+     * way. */
+    "#define VERTEX 1\n"
+    "in vec4 VertexPosition;\n"
+    "in vec4 VertexTexCoord;\n"
+    "in vec4 VertexColor;\n"
     "in highp float a_rad;\n"
+    "#define a_pos VertexPosition.xy\n"
+    "#define a_uv VertexTexCoord.xy\n"
+    "#define a_color VertexColor\n"
     "out vec2 v_uv;\n"
     "out vec4 v_color;\n"
     "out highp vec2 v_centre;\n"
     "out highp float v_rad;\n"
-    "uniform vec2 love_ScreenSize;\n"
+    /* mediump to match the fragment stage's declaration of the same uniform;
+     * see the note in SHADER_VERT3D_PROLOGUE. A cart shader that declares
+     * love_ScreenSize in both stages links only if they agree. */
+    "uniform highp vec2 love_ScreenSize;\n"
     "#define Image sampler2D\n"
+    "#define CubeImage samplerCube\n"
+    "#define ArrayImage sampler2DArray\n"
+    "#define VolumeImage sampler3D\n"
     "#define Texel texture\n"
     "#define number float\n"
     "#define extern uniform\n"
-    "#define VertexPosition vec4(a_pos, 0.0, 1.0)\n"
-    "#define VertexTexCoord vec4(a_uv, 0.0, 1.0)\n"
-    "#define VertexColor a_color\n"
+    /* Real declarations, NOT #defines -- see the note in
+     * SHADER_VERT3D_PROLOGUE. A LOVE shader spells its entry point
+     *     vec4 position(mat4 transform_projection, vec4 VertexPosition)
+     * and a macro expands inside that parameter list, producing
+     * `vec4 vec4(a_pos, 0.0, 1.0)` and a syntax error in generated code.
+     *
+     * The 2D VBO supplies 2 floats for position; GL fills the missing
+     * components with (0, 1), which is exactly what the old macro spelled
+     * out. Same for VertexTexCoord's z/w. */
     "#line 1\n";
 
 static const char *SHADER_VERT_EPILOGUE =
@@ -428,6 +497,341 @@ static const char *SHADER_VERT_EPILOGUE =
     "  v_centre = a_uv; v_rad = a_rad;\n"
     "  gl_Position = position(mat4(1.0), vec4(a_pos, 0.0, 1.0));\n"
     "}\n";
+
+/* ── the 3D variants ──────────────────────────────────────────────────
+ *
+ * A 3D shader differs from the 2D one in exactly two ways, and both are
+ * forced by the vertex format rather than chosen:
+ *
+ *   * VertexPosition is a real vec4 from a vec3 attribute, not a synthesized
+ *     vec4(a_pos, 0, 1). A 3D cart's position() multiplies it by its own
+ *     matrices, so the z it gets has to be the model's z.
+ *   * VertexNormal exists. It is the one attribute LOVE has no built-in name
+ *     for -- g3d declares it in the shader itself -- so it is declared here
+ *     and the cart's own redeclaration is stripped (see the rewrite below).
+ *
+ * transform_projection is the IDENTITY here, as in 2D, and for the same
+ * reason: this engine has no matrix stack, and a 3D cart supplies its own
+ * projection/view/model uniforms. That matches how g3d works -- it ignores
+ * the passed matrix entirely and uses its own three. */
+static const char *SHADER_VERT3D_PROLOGUE =
+    "#version 300 es\n"
+    /* A DEFAULT float precision for the vertex stage too.
+     *
+     * The vertex stage defaults to highp and the fragment stage to
+     * mediump, so a uniform a cart declares ONCE in a source compiled
+     * into both stages -- which is the standard single-file LOVE
+     * shader -- gets a different precision in each and the program
+     * fails to LINK ("declared as type `float16_t' and type
+     * `float'"). LOVE emits a matching default in both stages for
+     * exactly this reason.
+     *
+     * highp on BOTH sides rather than mediump: this is 3D, and
+     * mediump positions visibly jitter. GLES 3.0 guarantees highp in
+     * the fragment stage, so it is safe to ask for. */
+    "precision highp float;\n"
+    "precision highp int;\n"
+    /* LOVE compiles ONE source into BOTH stages and defines VERTEX or
+     * PIXEL so the shader can guard the half that belongs to each. That
+     * is not a nicety -- it is how a single-file LOVE shader is written,
+     * and without the define an `#ifdef PIXEL` body simply vanishes,
+     * leaving a shader with no effect() and a syntax error pointing at
+     * whatever followed. 19 of 3DreamEngine's shaders are written this
+     * way. */
+    "#define VERTEX 1\n"
+    /* Precision is NOT declared globally here: the vertex stage defaults to
+     * highp, and 3D positions need it. Dropping the whole stage to mediump
+     * to match the fragment stage would put ~10 bits of mantissa under a
+     * projected coordinate, which shows up as geometry jitter that looks
+     * like a bad matrix rather than a precision bug.
+     *
+     * Only the SHARED uniforms are pinned, and they must be: a uniform
+     * declared in both stages has to agree on precision or the program fails
+     * to LINK, with "declared as type `f16vec2' and type `vec2'" -- naming a
+     * type neither prologue contains. The fragment stage is mediump, so
+     * these say mediump on both sides. */
+    /* Declared as real attributes, NOT #defines.
+     *
+     * A #define expands wherever the token appears -- including inside a
+     * function's PARAMETER LIST. LOVE shaders are written as
+     *     vec4 position(mat4 transform_projection, vec4 VertexPosition)
+     * and with VertexPosition #defined to vec4(a_pos3,1.0) that becomes
+     * `vec4 vec4(a_pos3, 1.0)`, a syntax error inside generated code the
+     * cart author never saw. Real `in` declarations shadow cleanly instead:
+     * a parameter of the same name simply hides the global, which is what
+     * the shader intends. */
+    "in vec4 VertexPosition;\n"
+    "in vec2 VertexTexCoord;\n"
+    "in vec3 VertexNormal;\n"
+    "in vec4 VertexColor;\n"
+    "out vec2 v_uv;\n"
+    "out vec4 v_color;\n"
+    "out vec3 v_normal;\n"
+    "uniform highp vec2 love_ScreenSize;\n"
+    "uniform highp vec4 love_Color;\n"
+    "#define Image sampler2D\n"
+    "#define Texel texture\n"
+    "#define number float\n"
+    "#define extern uniform\n"
+    "#line 1\n";
+
+static const char *SHADER_VERT3D_EPILOGUE =
+    "\nvoid main() {\n"
+    "  v_uv = VertexTexCoord; v_color = VertexColor * love_Color;\n"
+    "  v_normal = VertexNormal;\n"
+    "  gl_Position = position(mat4(1.0), VertexPosition);\n"
+    "}\n";
+
+/* The 3D fragment side. Texel() does NOT have the 2D version's u_textured
+ * dance for glyph/circle modes -- there are no glyphs or circles in a 3D
+ * draw -- but it keeps the untextured rule, so an untextured model's
+ * `Texel(tex, uv) * color` reduces to the vertex colour instead of sampling
+ * whatever texture happened to be bound. */
+static const char *SHADER_FRAG3D_PROLOGUE =
+    "#version 300 es\n"
+    /* A DEFAULT float precision for the vertex stage too.
+     *
+     * The vertex stage defaults to highp and the fragment stage to
+     * mediump, so a uniform a cart declares ONCE in a source compiled
+     * into both stages -- which is the standard single-file LOVE
+     * shader -- gets a different precision in each and the program
+     * fails to LINK ("declared as type `float16_t' and type
+     * `float'"). LOVE emits a matching default in both stages for
+     * exactly this reason.
+     *
+     * highp on BOTH sides rather than mediump: this is 3D, and
+     * mediump positions visibly jitter. GLES 3.0 guarantees highp in
+     * the fragment stage, so it is safe to ask for. */
+    "precision highp float;\n"
+    "precision highp int;\n"
+    /* LOVE compiles ONE source into BOTH stages and defines VERTEX or
+     * PIXEL so the shader can guard the half that belongs to each. That
+     * is not a nicety -- it is how a single-file LOVE shader is written,
+     * and without the define an `#ifdef PIXEL` body simply vanishes,
+     * leaving a shader with no effect() and a syntax error pointing at
+     * whatever followed. 19 of 3DreamEngine's shaders are written this
+     * way. */
+    "#define PIXEL 1\n"
+    "in vec2 v_uv;\n"
+    "in vec4 v_color;\n"
+    "in vec3 v_normal;\n"
+    "out vec4 wc_frag_color;\n"
+    "uniform sampler2D u_tex;\n"
+    "uniform int u_textured;\n"
+    "uniform highp vec2 love_ScreenSize;\n"
+    "uniform highp vec4 love_Color;\n"
+    "#define Image sampler2D\n"
+    "#define CubeImage samplerCube\n"
+    "#define ArrayImage sampler2DArray\n"
+    "#define VolumeImage sampler3D\n"
+    "#define VaryingColor v_color\n"
+    "#define VaryingTexCoord vec4(v_uv, 0.0, 1.0)\n"
+    "#define VertexNormal v_normal\n"
+    "#define number float\n"
+    "#define extern uniform\n"
+    "vec4 Texel(sampler2D t, vec2 uv) {\n"
+    "  if (u_textured == 1) return texture(t, uv);\n"
+    "  return vec4(1.0);\n"
+    "}\n"
+    /* LOVE fragment built-ins. love_PixelCoord is the window-space
+     * pixel centre -- LOVE's spelling of gl_FragCoord.xy -- and post-
+     * process shaders use it constantly to sample by pixel rather than
+     * by uv. Missing it fails as "`love_PixelCoord' undeclared" at a
+     * line the author wrote correctly. */
+    "#define love_PixelCoord (gl_FragCoord.xy)\n"
+    "#line 1\n";
+
+static const char *SHADER_FRAG3D_EPILOGUE =
+    "\nvoid main() {\n"
+    "  wc_frag_color = effect(v_color, u_tex, v_uv, gl_FragCoord.xy);\n"
+    "}\n";
+
+/* ── multiple render targets in a fragment shader ─────────────────────
+ *
+ * effect() returns ONE colour, which is the whole shape of LOVE's shader
+ * API and cannot express a geometry pass that writes albedo, normals and
+ * material to three attachments at once.
+ *
+ * LOVE's own answer is `void effect(out vec4 c[N])`; this engine spells it
+ *     #pragma wasmcart mrt N
+ *     void effect2(out vec4 c0, out vec4 c1) { ... }
+ * with one `out` parameter per attachment, because a GLSL ES 3.00 array of
+ * `out` parameters is awkward to declare portably and naming them makes the
+ * attachment index explicit at the call site.
+ *
+ * The prologue declares N outputs at pinned locations and the epilogue calls
+ * the cart's function with them. Locations MUST be explicit: without them a
+ * linker is free to assign output 0 to attachment 1, and the resulting
+ * g-buffer is subtly wrong rather than blank.
+ *
+ * Built per output-count, since the declarations differ. */
+static const char *MRT_OUT_DECLS[9] = {
+    "", /* 0 unused */
+    "layout(location = 0) out vec4 wc_out0;\n",
+    "layout(location = 0) out vec4 wc_out0;\n"
+    "layout(location = 1) out vec4 wc_out1;\n",
+    "layout(location = 0) out vec4 wc_out0;\n"
+    "layout(location = 1) out vec4 wc_out1;\n"
+    "layout(location = 2) out vec4 wc_out2;\n",
+    "layout(location = 0) out vec4 wc_out0;\n"
+    "layout(location = 1) out vec4 wc_out1;\n"
+    "layout(location = 2) out vec4 wc_out2;\n"
+    "layout(location = 3) out vec4 wc_out3;\n",
+    "layout(location = 0) out vec4 wc_out0;\n"
+    "layout(location = 1) out vec4 wc_out1;\n"
+    "layout(location = 2) out vec4 wc_out2;\n"
+    "layout(location = 3) out vec4 wc_out3;\n"
+    "layout(location = 4) out vec4 wc_out4;\n",
+    "layout(location = 0) out vec4 wc_out0;\n"
+    "layout(location = 1) out vec4 wc_out1;\n"
+    "layout(location = 2) out vec4 wc_out2;\n"
+    "layout(location = 3) out vec4 wc_out3;\n"
+    "layout(location = 4) out vec4 wc_out4;\n"
+    "layout(location = 5) out vec4 wc_out5;\n",
+    "layout(location = 0) out vec4 wc_out0;\n"
+    "layout(location = 1) out vec4 wc_out1;\n"
+    "layout(location = 2) out vec4 wc_out2;\n"
+    "layout(location = 3) out vec4 wc_out3;\n"
+    "layout(location = 4) out vec4 wc_out4;\n"
+    "layout(location = 5) out vec4 wc_out5;\n"
+    "layout(location = 6) out vec4 wc_out6;\n",
+    "layout(location = 0) out vec4 wc_out0;\n"
+    "layout(location = 1) out vec4 wc_out1;\n"
+    "layout(location = 2) out vec4 wc_out2;\n"
+    "layout(location = 3) out vec4 wc_out3;\n"
+    "layout(location = 4) out vec4 wc_out4;\n"
+    "layout(location = 5) out vec4 wc_out5;\n"
+    "layout(location = 6) out vec4 wc_out6;\n"
+    "layout(location = 7) out vec4 wc_out7;\n",
+};
+
+/* Two ways to write a multi-target fragment shader, and BOTH are supported
+ * because both exist in the wild:
+ *
+ *   void effect() { love_Canvases[0] = ...; love_Canvases[1] = ...; }
+ *       LOVE's own form, and what real LOVE renderers are written against
+ *       (3DreamEngine's sky shaders use exactly this). `love_Canvases` is a
+ *       writable array of the outputs.
+ *
+ *   void effect2(out vec4 c0, out vec4 c1) { ... }
+ *       This engine's named-parameter form, which makes the attachment
+ *       index explicit at the call site.
+ *
+ * The epilogue below declares love_Canvases as an alias array over the
+ * pinned outputs and calls whichever function the cart defined. Which one
+ * that is has to be decided by the caller (it can see the source), so the
+ * two epilogue families are separate. */
+static const char *MRT_EPILOGUES[9] = {
+    "",
+    "\nvoid main() { effect2(wc_out0); }\n",
+    "\nvoid main() { effect2(wc_out0, wc_out1); }\n",
+    "\nvoid main() { effect2(wc_out0, wc_out1, wc_out2); }\n",
+    "\nvoid main() { effect2(wc_out0, wc_out1, wc_out2, wc_out3); }\n",
+    "\nvoid main() { effect2(wc_out0, wc_out1, wc_out2, wc_out3, wc_out4); }\n",
+    "\nvoid main() { effect2(wc_out0, wc_out1, wc_out2, wc_out3, wc_out4,"
+    " wc_out5); }\n",
+    "\nvoid main() { effect2(wc_out0, wc_out1, wc_out2, wc_out3, wc_out4,"
+    " wc_out5, wc_out6); }\n",
+    "\nvoid main() { effect2(wc_out0, wc_out1, wc_out2, wc_out3, wc_out4,"
+    " wc_out5, wc_out6, wc_out7); }\n",
+};
+
+/* The love_Canvases form. GLSL ES 3.00 has no array-of-references, so the
+ * declared outputs are copied out of a local array after effect() runs --
+ * which is also what LOVE's own generated main() does. */
+static const char *MRT_CANVAS_DECLS[9] = {
+    "",
+    "vec4 love_Canvases[1];\n",
+    "vec4 love_Canvases[2];\n",
+    "vec4 love_Canvases[3];\n",
+    "vec4 love_Canvases[4];\n",
+    "vec4 love_Canvases[5];\n",
+    "vec4 love_Canvases[6];\n",
+    "vec4 love_Canvases[7];\n",
+    "vec4 love_Canvases[8];\n",
+};
+
+static const char *MRT_CANVAS_EPILOGUES[9] = {
+    "",
+    "\nvoid main() { effect();\n  wc_out0 = love_Canvases[0];\n}\n",
+    "\nvoid main() { effect();\n  wc_out0 = love_Canvases[0];"
+    "  wc_out1 = love_Canvases[1];\n}\n",
+    "\nvoid main() { effect();\n  wc_out0 = love_Canvases[0];"
+    "  wc_out1 = love_Canvases[1];  wc_out2 = love_Canvases[2];\n}\n",
+    "\nvoid main() { effect();\n  wc_out0 = love_Canvases[0];"
+    "  wc_out1 = love_Canvases[1];  wc_out2 = love_Canvases[2];"
+    "  wc_out3 = love_Canvases[3];\n}\n",
+    "\nvoid main() { effect();\n  wc_out0 = love_Canvases[0];"
+    "  wc_out1 = love_Canvases[1];  wc_out2 = love_Canvases[2];"
+    "  wc_out3 = love_Canvases[3];  wc_out4 = love_Canvases[4];\n}\n",
+    "\nvoid main() { effect();\n  wc_out0 = love_Canvases[0];"
+    "  wc_out1 = love_Canvases[1];  wc_out2 = love_Canvases[2];"
+    "  wc_out3 = love_Canvases[3];  wc_out4 = love_Canvases[4];"
+    "  wc_out5 = love_Canvases[5];\n}\n",
+    "\nvoid main() { effect();\n  wc_out0 = love_Canvases[0];"
+    "  wc_out1 = love_Canvases[1];  wc_out2 = love_Canvases[2];"
+    "  wc_out3 = love_Canvases[3];  wc_out4 = love_Canvases[4];"
+    "  wc_out5 = love_Canvases[5];  wc_out6 = love_Canvases[6];\n}\n",
+    "\nvoid main() { effect();\n  wc_out0 = love_Canvases[0];"
+    "  wc_out1 = love_Canvases[1];  wc_out2 = love_Canvases[2];"
+    "  wc_out3 = love_Canvases[3];  wc_out4 = love_Canvases[4];"
+    "  wc_out5 = love_Canvases[5];  wc_out6 = love_Canvases[6];"
+    "  wc_out7 = love_Canvases[7];\n}\n",
+};
+
+/* The MRT fragment prologue is the 3D one minus its single `out`, plus the
+ * N declared outputs. Built into a static buffer at newShader time. */
+static const char *SHADER_FRAG_MRT_HEAD =
+    "#version 300 es\n"
+    /* A DEFAULT float precision for the vertex stage too.
+     *
+     * The vertex stage defaults to highp and the fragment stage to
+     * mediump, so a uniform a cart declares ONCE in a source compiled
+     * into both stages -- which is the standard single-file LOVE
+     * shader -- gets a different precision in each and the program
+     * fails to LINK ("declared as type `float16_t' and type
+     * `float'"). LOVE emits a matching default in both stages for
+     * exactly this reason.
+     *
+     * highp on BOTH sides rather than mediump: this is 3D, and
+     * mediump positions visibly jitter. GLES 3.0 guarantees highp in
+     * the fragment stage, so it is safe to ask for. */
+    "precision highp float;\n"
+    "precision highp int;\n"
+    /* LOVE compiles ONE source into BOTH stages and defines VERTEX or
+     * PIXEL so the shader can guard the half that belongs to each. That
+     * is not a nicety -- it is how a single-file LOVE shader is written,
+     * and without the define an `#ifdef PIXEL` body simply vanishes,
+     * leaving a shader with no effect() and a syntax error pointing at
+     * whatever followed. 19 of 3DreamEngine's shaders are written this
+     * way. */
+    "#define PIXEL 1\n"
+    "in vec2 v_uv;\n"
+    "in vec4 v_color;\n"
+    "in vec3 v_normal;\n"
+    "uniform sampler2D u_tex;\n"
+    "uniform int u_textured;\n"
+    "uniform highp vec2 love_ScreenSize;\n"
+    "uniform highp vec4 love_Color;\n"
+    "#define Image sampler2D\n"
+    "#define CubeImage samplerCube\n"
+    "#define ArrayImage sampler2DArray\n"
+    "#define VolumeImage sampler3D\n"
+    "#define VaryingColor v_color\n"
+    "#define VaryingTexCoord vec4(v_uv, 0.0, 1.0)\n"
+    "#define VertexNormal v_normal\n"
+    "#define number float\n"
+    "#define extern uniform\n"
+    "vec4 Texel(sampler2D t, vec2 uv) {\n"
+    "  if (u_textured == 1) return texture(t, uv);\n"
+    "  return vec4(1.0);\n"
+    "}\n"
+    /* LOVE fragment built-ins. love_PixelCoord is the window-space
+     * pixel centre -- LOVE's spelling of gl_FragCoord.xy -- and post-
+     * process shaders use it constantly to sample by pixel rather than
+     * by uv. Missing it fails as "`love_PixelCoord' undeclared" at a
+     * line the author wrote correctly. */
+    "#define love_PixelCoord (gl_FragCoord.xy)\n";
 
 /* Composition buffer. Shaders are small and this runs once per newShader, so
  * a single static buffer beats a malloc that has to be freed on every error
@@ -451,6 +855,192 @@ static int shader_compose(const char *prologue, const char *body,
     return 1;
 }
 
+/* ── GLSL ES 1.00 -> 3.00 rewriting ───────────────────────────────────
+ *
+ * LOVE accepts shaders written in the old spellings and rewrites them before
+ * handing them to the driver. This engine has to do the same, because that
+ * is what every LOVE shader in the wild -- and every LOVE 3D library -- is
+ * written in. g3d's vertex shader is the exact case:
+ *
+ *     attribute vec3 VertexNormal;      -> declared by our prologue already
+ *     varying vec4 worldPosition;       -> out (vertex) / in (fragment)
+ *
+ * Three rules, applied to whole identifiers only:
+ *
+ *   attribute -> a comment. The vertex attributes this engine supplies are
+ *       already declared in the prologue with pinned locations, so a cart's
+ *       redeclaration would be a duplicate. Commenting the line out (rather
+ *       than mapping it to `in`) is what lets g3d's `attribute vec3
+ *       VertexNormal;` coexist with our own declaration of it.
+ *   varying   -> `out` in a vertex shader, `in` in a fragment shader. Same
+ *       storage qualifier, opposite direction, which is precisely the
+ *       distinction GLSL 3.00 introduced.
+ *   texture2D -> texture. A straight rename.
+ *
+ * WHOLE IDENTIFIERS ONLY. A substring replace would corrupt a cart's
+ * `varyingScale` uniform or a `texture2DArray` call into something that no
+ * longer parses, and the error would point into generated code. is_ident_ch
+ * guards both ends of every match.
+ *
+ * Returns 1 if anything was rewritten. Writes into `dst`, which must hold
+ * `cap` bytes; on overflow it returns -1 and the caller refuses the shader
+ * rather than compiling a truncated one. */
+static int is_ident_ch(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
+static int shader_rewrite_es100(const char *src, char *dst, size_t cap,
+                                int is_vertex) {
+    size_t o = 0;
+    int changed = 0;
+    const char *p = src;
+
+#define EMIT(str) do {                                    \
+        size_t _n = strlen(str);                          \
+        if (o + _n >= cap) return -1;                     \
+        memcpy(dst + o, (str), _n); o += _n;              \
+    } while (0)
+#define COPY1() do { if (o + 1 >= cap) return -1; dst[o++] = *p++; } while (0)
+
+    while (*p) {
+        /* COMMENTS ARE COPIED THROUGH VERBATIM, never scanned.
+         *
+         * Found the hard way: a shader whose comment read
+         *     vec3 n = VertexNormal;   // keep the attribute live
+         * matched `attribute` INSIDE the comment, and since the rewrite for
+         * `attribute` deletes through the next semicolon, it ate the rest of
+         * the function -- including its `return`. The driver then reported
+         * "function `position' has non-void return type vec4, but no return
+         * statement", pointing at a line the author wrote correctly.
+         *
+         * Any prose containing the words attribute, varying or texture2D is
+         * enough to trigger it, which is most shaders that explain
+         * themselves. */
+        if (p[0] == '/' && p[1] == '/') {
+            while (*p && *p != '\n') COPY1();
+            continue;
+        }
+        if (p[0] == '/' && p[1] == '*') {
+            COPY1(); COPY1();
+            while (*p && !(p[0] == '*' && p[1] == '/')) COPY1();
+            if (*p) { COPY1(); COPY1(); }
+            continue;
+        }
+        /* A preprocessor directive is copied whole for the same reason: an
+         * #if branch that is not taken still gets scanned by this rewriter,
+         * and the tokens inside it are not necessarily live code.
+         *
+         * EXCEPT `#pragma language ...`, which is LOVE's own directive, not
+         * GLSL's. LOVE reads it to pick a shader language version and strips
+         * it before the driver ever sees it; passing it through produces
+         * "syntax error, unexpected NEW_IDENTIFIER" pointing at a line the
+         * author wrote correctly. This engine always emits "#version 300 es"
+         * (GLSL ES 3.00), which is what `glsl3` asks for anyway. */
+        if (*p == '#') {
+            const char *line_end = p;
+            while (*line_end && *line_end != '\n') line_end++;
+            int is_love_pragma = 0;
+            if (!strncmp(p, "#pragma", 7)) {
+                const char *q = p + 7;
+                while (*q == ' ' || *q == '\t') q++;
+                if (!strncmp(q, "language", 8)) is_love_pragma = 1;
+            }
+            if (is_love_pragma) {
+                changed = 1;
+                p = line_end;          /* drop it; the newline is copied below */
+                continue;
+            }
+            while (*p && *p != '\n') COPY1();
+            continue;
+        }
+
+        /* Only try to match at an identifier BOUNDARY, so `myvarying` and
+         * `texture2DArray` are never touched. */
+        int at_boundary = (p == src) || !is_ident_ch(p[-1]);
+        if (at_boundary) {
+            if (!strncmp(p, "attribute", 9) && !is_ident_ch(p[9])) {
+                /* An `attribute` declaration is either a DUPLICATE of one
+                 * the prologue already supplies, or a CUSTOM one this engine
+                 * knows nothing about.
+                 *
+                 *   duplicate -> drop it. The prologue declares the built-in
+                 *       names, and a second declaration is a compile error.
+                 *   custom    -> rewrite to `in`. A declared vertex format
+                 *       can carry arbitrary attributes (VertexTangent,
+                 *       InstancePosition, ...) and the shader must really
+                 *       declare them or they do not exist.
+                 *
+                 * Getting this backwards is silent both ways: dropping a
+                 * custom declaration leaves an undeclared identifier, and
+                 * keeping a duplicate fails to compile at a line the author
+                 * did not write.
+                 *
+                 * The semicolon is found by SCANNING PAST COMMENTS rather
+                 * than with strchr: `attribute vec3 N; // a; b` would
+                 * otherwise be cut at the semicolon inside the comment,
+                 * leaving `b` dangling as a statement fragment. */
+                const char *q = p + 9;
+                while (*q && *q != ';') {
+                    if (q[0] == '/' && q[1] == '/') {
+                        while (*q && *q != '\n') q++;
+                    } else if (q[0] == '/' && q[1] == '*') {
+                        q += 2;
+                        while (*q && !(q[0] == '*' && q[1] == '/')) q++;
+                        if (*q) q += 2;
+                    } else {
+                        q++;
+                    }
+                }
+                /* Is the declared NAME one the prologue already supplies?
+                 * The name is the last identifier before the semicolon. */
+                const char *e = q;
+                while (e > p && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\n')) e--;
+                const char *name_end = e;
+                while (e > p && is_ident_ch(e[-1])) e--;
+                size_t nlen = (size_t)(name_end - e);
+                static const char *builtin[] = {
+                    "VertexPosition", "VertexTexCoord", "VertexColor",
+                    "VertexNormal", NULL
+                };
+                int is_builtin = 0;
+                for (int bi = 0; builtin[bi]; bi++) {
+                    if (strlen(builtin[bi]) == nlen &&
+                        !strncmp(e, builtin[bi], nlen)) { is_builtin = 1; break; }
+                }
+                if (is_builtin) {
+                    EMIT("/* attribute declared by the engine */");
+                    p = *q ? q + 1 : q;
+                } else {
+                    /* Custom: keep the declaration, as `in`. */
+                    EMIT("in");
+                    p += 9;
+                }
+                changed = 1;
+                continue;
+            }
+            if (!strncmp(p, "varying", 7) && !is_ident_ch(p[7])) {
+                EMIT(is_vertex ? "out" : "in");
+                changed = 1;
+                p += 7;
+                continue;
+            }
+            if (!strncmp(p, "texture2D", 9) && !is_ident_ch(p[9])) {
+                EMIT("texture");
+                changed = 1;
+                p += 9;
+                continue;
+            }
+        }
+        if (o + 1 >= cap) return -1;
+        dst[o++] = *p++;
+    }
+#undef EMIT
+    if (o >= cap) return -1;
+    dst[o] = 0;
+    return changed;
+}
+
 /* Pin the attribute indices, then link. Shared by the default program and
  * every cart shader so one VAO stays valid across all of them. */
 static void bind_attribs_and_link(GLuint prog) {
@@ -458,6 +1048,26 @@ static void bind_attribs_and_link(GLuint prog) {
     glBindAttribLocation(prog, ATTR_UV, "a_uv");
     glBindAttribLocation(prog, ATTR_COLOR, "a_color");
     glBindAttribLocation(prog, ATTR_RAD, "a_rad");
+    /* The 3D names. Position, uv and colour share their 2D indices; the one
+     * genuinely new attribute, a_normal, takes the index the 2D layout uses
+     * for a_rad. That reuse is deliberate and is why the two sets can share
+     * this one function: a program declares one set or the other, never
+     * both, and each pipeline binds its own VAO before drawing (see the A3_*
+     * block in render3d_gl.c). Binding a name the program does not declare
+     * is a no-op in GL, so one unconditional list serves both.
+     *
+     * A_COLOR MUST STAY AT ITS 2D INDEX. The 3D VAO's colour pointer is set
+     * up at A3_COLOR, so if this pinned a_color anywhere else the shader
+     * would read colour from whatever the normal attribute supplies -- a
+     * mesh drawn in the colours of its own surface directions, which looks
+     * deliberate enough to survive review. Hence A3_COLOR == ATTR_RAD's
+     * neighbour is NOT how these line up; the asserts below hold them. */
+    /* And every attribute name a declared vertex format has registered, by
+     * its LOVE name (VertexPosition, VertexTangent, ...). A shader written
+     * against a custom format declares those names directly, and without an
+     * explicit binding the linker is free to put VertexTangent on the index
+     * the VBO fills with positions -- which renders, wrongly, silently. */
+    wcl_r3d_bind_format_attribs((unsigned int)prog);
     glLinkProgram(prog);
 }
 
@@ -480,10 +1090,20 @@ static int shader_reject_unsupported(const char *src, const char *which) {
     }
     /* GLES 3.0 has no compute, no geometry/tessellation stages, and no
      * image load/store. These fail in the driver with messages about the
-     * generated preamble, so catch them by name instead. */
+     * generated preamble, so catch them by name instead.
+     *
+     * NOTE what is NOT here: `attribute`, `varying`, `texture2D`. Those are
+     * GLSL ES 1.00 spellings, and LOVE's own shader preprocessor rewrites
+     * them rather than refusing them -- so every LOVE shader in the wild,
+     * and every LOVE 3D library without exception, is written with them.
+     * Refusing them by name rejected the entire ecosystem this engine is
+     * trying to run. They are rewritten in shader_rewrite_es100 below.
+     * `gl_FragColor` stays refused: it has no meaning inside effect(), which
+     * RETURNS its colour, so rewriting it would produce a shader that
+     * compiles and draws nothing. */
     static const char *banned[] = {
         "layout(local_size", "gl_GlobalInvocationID", "imageStore", "imageLoad",
-        "gl_FragColor", "texture2D", "varying", "attribute", NULL
+        "gl_FragColor", NULL
     };
     static const char *why[] = {
         "compute shaders are not in GLES 3.0",
@@ -491,9 +1111,6 @@ static int shader_reject_unsupported(const char *src, const char *which) {
         "image load/store is GLES 3.1+, not available here",
         "image load/store is GLES 3.1+, not available here",
         "gl_FragColor is GLSL ES 1.00; return the colour from effect() instead",
-        "texture2D is GLSL ES 1.00; use Texel(...) or texture(...)",
-        "`varying` is GLSL ES 1.00; use in/out",
-        "`attribute` is GLSL ES 1.00; use in",
         NULL
     };
     for (int i = 0; banned[i]; i++) {
@@ -508,7 +1125,8 @@ static int shader_reject_unsupported(const char *src, const char *which) {
     return 0;
 }
 
-int wcl_r2d_shader_new(const char *pixel_src, const char *vertex_src) {
+int wcl_r2d_shader_new(const char *pixel_src, const char *vertex_src, int is_3d,
+                       int mrt_outputs) {
     if (!ready) {
         shader_log("love.graphics.newShader: no GL context on this host, so "
                    "shaders cannot run (the engine is on the software "
@@ -524,19 +1142,120 @@ int wcl_r2d_shader_new(const char *pixel_src, const char *vertex_src) {
         return -1;
     }
 
+    /* Rewrite GLSL ES 1.00 spellings before composing. The rewrite buffer is
+     * separate from shader_src_buf, which holds the COMPOSED source; both
+     * are static and single-use, which is safe because newShader is not
+     * reentrant. */
+    static char rewrite_buf[SHADER_SRC_MAX];
+
     GLuint vs = 0, fs = 0;
     if (vertex_src) {
         if (shader_reject_unsupported(vertex_src, "vertex")) return -1;
-        if (!shader_compose(SHADER_VERT_PROLOGUE, vertex_src, SHADER_VERT_EPILOGUE))
+        int r = shader_rewrite_es100(vertex_src, rewrite_buf, sizeof rewrite_buf, 1);
+        if (r < 0) {
+            shader_log("love.graphics.newShader: the vertex shader is too "
+                       "large after rewriting GLSL ES 1.00 spellings "
+                       "(limit is 16 KB of cart GLSL)");
             return -1;
+        }
+        if (!shader_compose(is_3d ? SHADER_VERT3D_PROLOGUE : SHADER_VERT_PROLOGUE,
+                            rewrite_buf,
+                            is_3d ? SHADER_VERT3D_EPILOGUE : SHADER_VERT_EPILOGUE))
+            return -1;
+#ifdef WCL_DUMP_SHADER
+        { /* the exact source the driver saw, with line numbers */
+            int ln = 1; char b[128];
+            const char *q = shader_src_buf;
+            while (*q) {
+                const char *e = strchr(q, '\n');
+                int len = e ? (int)(e - q) : (int)strlen(q);
+                if (ln >= 160 && ln <= 175) {
+                    int k = snprintf(b, sizeof b, "V%03d| %.*s", ln,
+                                     len > 90 ? 90 : len, q);
+                    if (k > 0) wc_log(b, (unsigned)k);
+                }
+                ln++; if (!e) break; q = e + 1;
+            }
+        }
+#endif
         if (!shader_compile_checked(GL_VERTEX_SHADER, shader_src_buf, &vs)) return -1;
+    } else if (is_3d && mrt_outputs == 0) {
+        /* A 3D program with no cart vertex shader has no transform at all,
+         * so it would draw model-space coordinates as clip space. Refuse it
+         * here rather than render a shape that is technically on screen.
+         *
+         * NOT for an MRT shader, though. A multi-target FRAGMENT shader with
+         * no vertex stage is an ordinary post-process -- it writes several
+         * attachments while drawing a full-screen quad through the engine's
+         * own vertex path, and needs no transform of its own. 3DreamEngine's
+         * blur_cube_multi (six cube faces in one pass) is exactly that, and
+         * refusing it broke a renderer that was doing nothing wrong. */
+        shader_log("love.graphics.newShader: a 3D shader must supply a vertex "
+                   "stage with position(), which is where the model/view/"
+                   "projection transform lives.");
+        return -1;
     } else {
         vs = compile_shader(GL_VERTEX_SHADER, VERTEX_SHADER);
     }
 
     if (pixel_src) {
         if (shader_reject_unsupported(pixel_src, "pixel")) { glDeleteShader(vs); return -1; }
-        if (!shader_compose(SHADER_FRAG_PROLOGUE, pixel_src, SHADER_FRAG_EPILOGUE)) {
+        int r = shader_rewrite_es100(pixel_src, rewrite_buf, sizeof rewrite_buf, 0);
+        if (r < 0) {
+            shader_log("love.graphics.newShader: the pixel shader is too "
+                       "large after rewriting GLSL ES 1.00 spellings "
+                       "(limit is 16 KB of cart GLSL)");
+            glDeleteShader(vs);
+            return -1;
+        }
+        /* An MRT shader replaces the whole fragment scaffold: N declared
+         * outputs instead of one, and a main() that calls effect2 with them.
+         * mrt_outputs is 0 for an ordinary shader. */
+        static char mrt_prologue[SHADER_SRC_MAX];
+        const char *frag_pro, *frag_epi;
+        if (mrt_outputs != 0) {
+            /* NEGATIVE selects LOVE's own `void effect()` + love_Canvases[]
+             * form; positive selects the named-parameter effect2 form. The
+             * caller decides, because only it has seen the source. */
+            const int canvases = mrt_outputs < 0;
+            int n = canvases ? -mrt_outputs : mrt_outputs;
+            if (n > 8) n = 8;
+            snprintf(mrt_prologue, sizeof mrt_prologue, "%s%s%s#line 1\n",
+                     SHADER_FRAG_MRT_HEAD, MRT_OUT_DECLS[n],
+                     canvases ? MRT_CANVAS_DECLS[n] : "");
+            frag_pro = mrt_prologue;
+            frag_epi = canvases ? MRT_CANVAS_EPILOGUES[n] : MRT_EPILOGUES[n];
+        } else {
+            frag_pro = is_3d ? SHADER_FRAG3D_PROLOGUE : SHADER_FRAG_PROLOGUE;
+            frag_epi = is_3d ? SHADER_FRAG3D_EPILOGUE : SHADER_FRAG_EPILOGUE;
+        }
+        if (!shader_compose(frag_pro, rewrite_buf, frag_epi)) {
+            glDeleteShader(vs);
+            return -1;
+        }
+#ifdef WCL_DUMP_SHADER
+        { int ln = 1; char b[128]; const char *q = shader_src_buf;
+          while (*q) { const char *e = strchr(q, '\n');
+            int len = e ? (int)(e - q) : (int)strlen(q);
+            if (ln >= 160 && ln <= 175) {
+                int k = snprintf(b, sizeof b, "F%03d| %.*s", ln,
+                                 len > 90 ? 90 : len, q);
+                if (k > 0) wc_log(b, (unsigned)k); }
+            ln++; if (!e) break; q = e + 1; } }
+#endif
+        if (!shader_compile_checked(GL_FRAGMENT_SHADER, shader_src_buf, &fs)) {
+            glDeleteShader(vs);
+            return -1;
+        }
+    } else if (is_3d) {
+        /* No cart fragment stage: supply a default that samples the texture
+         * and modulates by vertex colour, which is what an untextured or
+         * plainly-textured model wants and what g3d's own default does. */
+        if (!shader_compose(SHADER_FRAG3D_PROLOGUE,
+                            "vec4 effect(vec4 color, Image tex, vec2 uv, vec2 sc) {\n"
+                            "  return Texel(tex, uv) * color;\n"
+                            "}\n",
+                            SHADER_FRAG3D_EPILOGUE)) {
             glDeleteShader(vs);
             return -1;
         }
@@ -619,7 +1338,11 @@ void wcl_r2d_shader_use(int handle) {
             shader_sampler_t *s = &shader_samplers[handle][i];
             if (!s->used) continue;
             glActiveTexture((GLenum)(GL_TEXTURE0 + s->unit));
-            glBindTexture(GL_TEXTURE_2D, s->tex);
+            /* s->textarget, not GL_TEXTURE_2D: a render target bound as a
+             * sampler may be a cubemap/array/volume, and rebinding it to the
+             * 2D target on a program switch leaves the sampler reading
+             * nothing at all. */
+            glBindTexture(s->textarget ? s->textarget : GL_TEXTURE_2D, s->tex);
         }
         glActiveTexture(GL_TEXTURE0);
     }
@@ -656,7 +1379,34 @@ int wcl_r2d_shader_send_float(int handle, const char *name, const float *v, int 
         case 2: glUniform2f(loc, v[0], v[1]); break;
         case 3: glUniform3f(loc, v[0], v[1], v[2]); break;
         case 4: glUniform4f(loc, v[0], v[1], v[2], v[3]); break;
-        case 16: glUniformMatrix4fv(loc, 1, 0, v); break;
+        /* TRANSPOSE = TRUE, and this is not a detail.
+         *
+         * LOVE's Shader:send takes matrices in ROW-major order (its own docs
+         * call the flat form "row-major"), and every LOVE library writes them
+         * that way -- g3d's setProjectionMatrix assigns the perspective row
+         * `0,0,-1,0` to elements 13..16, i.e. the last ROW. GL reads a flat
+         * array as COLUMN-major, so uploading it untransposed puts that row
+         * in the last COLUMN, which makes w = -z... for the wrong term and
+         * sends every vertex outside the clip volume.
+         *
+         * The failure mode is why this is called out: there is no GL error,
+         * no shader warning, and no missing uniform. The draw executes
+         * perfectly and rasterizes nothing, so it reads as "3D doesn't work"
+         * rather than "the matrix is transposed". */
+        case 16:
+#ifdef WCL_R3D_TRACE
+            {
+                char b[300];
+                int k = snprintf(b, sizeof b,
+                    "send mat4 %s = [%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | "
+                    "%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f]", name,
+                    v[0],v[1],v[2],v[3], v[4],v[5],v[6],v[7],
+                    v[8],v[9],v[10],v[11], v[12],v[13],v[14],v[15]);
+                if (k > 0) wc_log(b, (unsigned)k);
+            }
+#endif
+            glUniformMatrix4fv(loc, 1, 1, v);
+            break;
         default: glUseProgram(program); shader_restore_program(); return 0;
     }
     shader_restore_program();
@@ -681,6 +1431,31 @@ int wcl_r2d_shader_send_int(int handle, const char *name, const int *v, int n) {
 
 static texture_t *get_texture(const void *pixels, int w, int h);
 
+/* Standalone textures for images bound to SAMPLER uniforms, keyed by the
+ * image's RGBA payload pointer. Separate from the atlas because a sampler
+ * needs the whole 0..1 image; separate from the 3D target table because
+ * these are plain 2D cart images. */
+GLuint wcl_r2d__upload_standalone(const void *pixels, int w, int h);
+#define MAX_SAMPLER_TEX 32
+static struct { const void *key; GLuint tex; int used; } sampler_texs[MAX_SAMPLER_TEX];
+
+static GLuint sampler_texture_for(const void *pixels, int w, int h) {
+    for (int i = 0; i < MAX_SAMPLER_TEX; i++)
+        if (sampler_texs[i].used && sampler_texs[i].key == pixels)
+            return sampler_texs[i].tex;
+    for (int i = 0; i < MAX_SAMPLER_TEX; i++) {
+        if (sampler_texs[i].used) continue;
+        GLuint t = wcl_r2d__upload_standalone(pixels, w, h);
+        if (!t) return 0;
+        sampler_texs[i].key = pixels;
+        sampler_texs[i].tex = t;
+        sampler_texs[i].used = 1;
+        return t;
+    }
+    shader_log("Shader:send: out of sampler textures (32 max)");
+    return 0;
+}
+
 int wcl_r2d_shader_send_image(int handle, const char *name,
                               const void *pixels, int w, int h) {
     shader_t *sh = NULL;
@@ -696,25 +1471,21 @@ int wcl_r2d_shader_send_image(int handle, const char *name,
     if (tgt) {
         tex = tgt->tex;
     } else {
-        texture_t *t = get_texture(pixels, w, h);
-        if (!t) return 0;
-        if (t->w != ATLAS_SIZE || t->h != ATLAS_SIZE) {
-            /* Not fatal: many shaders use a lookup texture at fixed
-             * coordinates and do not care. Say what the uv range actually is
-             * so a cart author can scale for it. */
-            char line[256];
-            snprintf(line, sizeof line,
-                     "Shader:send(\"%s\", image): sprite images live in a shared "
-                     "atlas, so this sampler's uv range is (%g..%g, %g..%g), not "
-                     "0..1. Use a Canvas for a 0..1 sampler.",
-                     name,
-                     (double)t->atlas_x / ATLAS_SIZE,
-                     (double)(t->atlas_x + t->w) / ATLAS_SIZE,
-                     (double)t->atlas_y / ATLAS_SIZE,
-                     (double)(t->atlas_y + t->h) / ATLAS_SIZE);
-            shader_log(line);
-        }
-        tex = atlas_texture;
+        /* A STANDALONE texture, not the shared atlas.
+         *
+         * An atlas entry is a sub-rect, so a shader sampling it would need
+         * uv scaled into that rect -- which no shader written for LOVE
+         * does, because in LOVE a sampler uniform is the whole image at
+         * 0..1. This used to hand over the atlas with a warning explaining
+         * the wrong uv range; the warning was correct and useless, since a
+         * cart cannot act on it without rewriting its shaders.
+         *
+         * Uploading the image once on its own fixes the uv range and gets
+         * REPEAT wrapping and mipmaps as a side effect, which is what a
+         * texture used by a 3D material wants anyway. Cached per payload
+         * pointer so it uploads once, not per send. */
+        tex = sampler_texture_for(pixels, w, h);
+        if (!tex) return 0;
     }
 
     /* Find (or claim) a texture unit for this uniform. Unit 0 belongs to the
@@ -730,8 +1501,8 @@ int wcl_r2d_shader_send_image(int handle, const char *name,
             if (!shader_samplers[handle][i].used) { idx = i; break; }
     }
     if (idx < 0) {
-        shader_log("Shader:send: out of texture units (4 image uniforms max "
-                   "per shader)");
+        shader_log("Shader:send: out of texture units (15 sampler uniforms "
+                   "max per shader)");
         return 0;
     }
     shader_sampler_t *s = &shader_samplers[handle][idx];
@@ -745,6 +1516,7 @@ int wcl_r2d_shader_send_image(int handle, const char *name,
     glUniform1i(loc, s->unit);
     glActiveTexture((GLenum)(GL_TEXTURE0 + s->unit));
     glBindTexture(GL_TEXTURE_2D, tex);
+    s->textarget = GL_TEXTURE_2D;
     glActiveTexture(GL_TEXTURE0);
     shader_restore_program();
     return 1;
@@ -1012,8 +1784,148 @@ void wcl_r2d_end(const uint32_t *fb) {
  * frame, and 60 identical log lines a second buries the one that matters. */
 static int warned_shader_dropped;
 
+/* ── the seam render3d_gl.c reaches through ───────────────────────────
+ *
+ * The 3D pipeline is a separate translation unit with its own VAO, buffers
+ * and program, but it shares this file's GL context and has to cooperate
+ * with its batcher and its texture cache. Rather than expose the whole
+ * static state, these five entry points are the entire contract:
+ *
+ *   flush   - a 3D draw must not land in the middle of pending 2D vertices,
+ *             so it flushes first, exactly as a texture change does
+ *   program - the bound cart shader, which for 3D is where the transform
+ *             lives; 0 means the default 2D program, which cannot draw 3D
+ *   rebind  - restore the 2D VAO/buffer after a 3D draw, since a VAO records
+ *             attribute state per index and the two layouts disagree
+ *   invalidate - drop the cached texture binding, which the 3D path changes
+ *             behind this file's back
+ *
+ * Declared in render3d_gl.c as extern; deliberately NOT in a header, since
+ * nothing outside these two files may call them. */
+void wcl_r2d__flush_for_3d(void) {
+    if (wcl_r2d_active()) flush_batches();
+}
+
+GLuint wcl_r2d__active_program(void) {
+    if (active_shader < 0) return 0;
+    shader_t *sh = shader_by_handle(active_shader);
+    return sh ? sh->program : 0;
+}
+
+void wcl_r2d__rebind_2d_state(void) {
+    if (!ready) return;
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, buffer);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, index_buffer);
+}
+
+void wcl_r2d__invalidate_texture_binding(void) {
+    bound_texture = 0;
+}
+
+/* Restore the screen's viewport and the clip-space scale derived from it.
+ * A GPU render target sets its own viewport, and leaving that in place after
+ * unbinding would rescale every subsequent 2D draw -- silently, since the
+ * geometry is still "on screen", just the wrong size. Mirrors what
+ * wcl_r2d_target(NULL,...) does for the 2D canvas path. */
+void wcl_r2d__set_clip_size(int w, int h) {
+    if (!ready || w < 1 || h < 1) return;
+    ndc_scale_x = 2.0f / (float)w;
+    ndc_scale_y = 2.0f / (float)h;
+}
+
+void wcl_r2d__screen_viewport(void) {
+    if (!ready) return;
+    if (current_target) {
+        glViewport(0, 0, current_target->w, current_target->h);
+        ndc_scale_x = 2.0f / (float)current_target->w;
+        ndc_scale_y = 2.0f / (float)current_target->h;
+        return;
+    }
+    glViewport(0, 0, width, height);
+    ndc_scale_x = 2.0f / (float)width;
+    ndc_scale_y = 2.0f / (float)height;
+}
+
+/* The program object behind a shader HANDLE, whether or not it is bound.
+ * Shader:send sets uniforms on a shader the cart may not have bound yet,
+ * which is legal in LOVE and is how a renderer configures several programs
+ * up front. */
+GLuint wcl_r2d__program_of(int handle) {
+    shader_t *sh = shader_by_handle(handle);
+    return sh ? sh->program : 0;
+}
+
+void wcl_r2d__restore_program(void) {
+    if (!ready) return;
+    shader_restore_program();
+}
+
+/* Claim a texture unit for `loc` in shader `handle`, from the SAME table the
+ * 2D image path uses.
+ *
+ * This has to be shared. Both paths hand out units 1..15, and two
+ * independent allocators would each hand out unit 1 -- so a shader sampling
+ * an Image and a render target would have the second binding silently
+ * replace the first, and the g-buffer read would return the atlas. Returns
+ * the unit, or 0 when the shader is out of units.
+ *
+ * The unit is remembered per (shader, uniform location), so re-sending the
+ * same uniform reuses its unit rather than exhausting the table. `tex` and
+ * `target` are recorded so wcl_r2d_shader_use can re-establish the binding
+ * on a program switch, which is where a texture unit's binding would
+ * otherwise be lost. */
+int wcl_r2d__claim_texture_unit(int handle, GLint loc, GLuint tex, GLenum textarget) {
+    if (handle < 0 || handle >= MAX_SHADERS || loc < 0) return 0;
+    int idx = -1;
+    for (int i = 0; i < SHADER_TEX_UNITS; i++)
+        if (shader_samplers[handle][i].used &&
+            shader_samplers[handle][i].location == loc) { idx = i; break; }
+    if (idx < 0)
+        for (int i = 0; i < SHADER_TEX_UNITS; i++)
+            if (!shader_samplers[handle][i].used) { idx = i; break; }
+    if (idx < 0) return 0;
+    shader_sampler_t *s = &shader_samplers[handle][idx];
+    s->location = loc;
+    s->tex = tex;
+    s->textarget = textarget;
+    s->unit = idx + 1;
+    s->used = 1;
+    return s->unit;
+}
+
+/* The cart's RGBA payload for an image, uploaded as a STANDALONE texture
+ * rather than an atlas slot. See render3d_gl.h for why 3D cannot use the
+ * atlas: a model's uv leaves 0..1 and relies on GL_REPEAT. Returns 0 on
+ * failure. The 3D side owns and caches the result. */
+GLuint wcl_r2d__upload_standalone(const void *pixels, int w, int h) {
+    if (!ready || !pixels || w <= 0 || h <= 0) return 0;
+    flush_batches();
+    GLuint t = 0;
+    glGenTextures(1, &t);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    /* REPEAT is the whole reason this texture is not in the atlas. */
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    /* Trilinear + mips: a 3D surface is routinely minified far below 1:1
+     * (a floor receding to the horizon), where NEAREST aliases into moire.
+     * The 2D path's NEAREST is right for pixel art at 1:1 and wrong here. */
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    bound_texture = 0;   /* we changed the binding behind the cache's back */
+    return t;
+}
+
 void wcl_r2d_disable(void) {
     if (wcl_r2d_active()) flush_batches();
+    /* Depth testing and culling are global GL state. Leaving them enabled
+     * while the frame falls back to the software path would apply them to
+     * wc_gl_blit's fullscreen present quad, which can discard it entirely. */
+    wcl_r3d_reset();
     /* A bound shader cannot follow the frame onto the software rasterizer --
      * there is no CPU path that runs GLSL. Rendering would carry on looking
      * plausible while the shader did nothing at all, so say it out loud. */
@@ -1685,7 +2597,27 @@ void wcl_r2d_clear(uint32_t color, int alpha) {
                  (float)alpha / 255.0f);
     /* the cached screen-clear colour no longer reflects GL state */
     current_clear_color = 0xFFFFFFFFu;
-    glClear(GL_COLOR_BUFFER_BIT);
+    /* DEPTH TOO, whenever a depth mode is live.
+     *
+     * A freshly bound render target's depth attachment holds undefined
+     * values. With the depth test on -- which a 3D pass turns on before it
+     * binds its g-buffer -- every fragment is compared against that garbage
+     * and, at lequal, discarded. The pass then runs perfectly and writes
+     * nothing: geometry submitted, no GL error, black canvas.
+     *
+     * LOVE's clear() clears depth as well, so this also matches what a
+     * renderer written against LOVE expects when it calls clear() right
+     * after setCanvas(). glClear honours the depth write MASK, so the mask
+     * is forced on for the clear and put back after. */
+    GLbitfield bits = GL_COLOR_BUFFER_BIT;
+    uint32_t dcmp = 0; int dwrite = 0;
+    wcl_r3d_get_depth_mode(&dcmp, &dwrite);
+    if (dcmp) {
+        bits |= GL_DEPTH_BUFFER_BIT;
+        glDepthMask(1);
+    }
+    glClear(bits);
+    if (dcmp && !dwrite) glDepthMask(0);
 }
 
 void wcl_r2d_forget(const void *key) {

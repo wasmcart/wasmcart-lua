@@ -160,8 +160,28 @@ local function test_api()
   -- cut features must FAIL LOUDLY, not silently no-op
   local ok = pcall(function() return love.graphics.newShader("x") end)
   eq(ok, false, "newShader errors loudly")
-  local ok2 = pcall(function() return love.thread.newThread() end)
-  eq(ok2, false, "love.thread errors loudly")
+  -- love.thread deliberately does NOT error any more. A Thread is inert
+  -- (there is one wasm instance and there cannot be two) but Channels are
+  -- real queues, so producer/consumer code runs unchanged. Assert that
+  -- split, because it is the part that would silently rot: a Channel that
+  -- quietly dropped pushes would look identical to a busy worker.
+  local ok2, thread = pcall(function() return love.thread.newThread() end)
+  eq(ok2, true, "love.thread.newThread returns an (inert) Thread")
+  eq(thread:isRunning(), false, "a Thread never actually runs")
+
+  local ch = love.thread.getChannel("unit-test")
+  ch:clear()
+  ch:push("a")
+  ch:push("b")
+  eq(ch:getCount(), 2, "Channel:push queues")
+  eq(ch:pop(), "a", "Channel:pop is FIFO")
+  eq(ch:getCount(), 1, "Channel:pop removes")
+  -- getChannel must return the SAME channel for the same name, or a
+  -- producer and a consumer that look each other up separately never meet.
+  eq(love.thread.getChannel("unit-test"):getCount(), 1,
+     "getChannel returns the same channel by name")
+  ch:clear()
+  eq(ch:demand(), nil, "Channel:demand does not block when empty")
 end
 
 -- ── default font coverage ──────────────────────────────────────────

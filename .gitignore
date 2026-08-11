@@ -26,3 +26,7 @@ ports/*/*.wasc
 
 node_modules/
 *.log
+
+# test carts get their engine copied in at pack time; the source of truth is
+# build/engine.wasm, and a committed copy would be a stale 669KB duplicate
+test/*/main.wasm
