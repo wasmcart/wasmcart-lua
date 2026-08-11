@@ -499,6 +499,58 @@ Up to 4 independent worlds. Contacts are polled per step (`:enter` after
 `world:update`), not delivered by callback. Joints, ray casts, and
 preSolve/postSolve are not implemented and error clearly.
 
+## b3 (Box3D)
+
+3D rigid bodies, from Erin Catto's Box3D. There is no LOVE equivalent to
+imitate -- LOVE has no 3D physics -- so this is Box3D's own vocabulary
+rather than a LOVE-shaped wrapper. Shaped like the `b2` table above:
+integer handles, the same pixels/meter convention, and the same argument
+order (position first, type last).
+
+```lua
+b3.info()          -- { simd = "neon", threads = true, workers = 12, hw_threads = 12 }
+b3.set_meter(64)   -- pixels per meter (default 64)
+b3.get_meter()
+
+local w = b3.world_new(gx, gy, gz [, workers])   -- gravity in px/s^2
+b3.world_step(w, dt [, subSteps])                -- subSteps default 4
+b3.world_destroy(w)
+
+-- type: 0 static, 1 kinematic, 2 dynamic (default)
+local body = b3.body_new(w, x, y, z [, type])
+b3.body_destroy(body)
+b3.body_position(body)                  -- -> x, y, z
+b3.body_rotation(body)                  -- -> quaternion x, y, z, w
+b3.body_set_transform(body, x,y,z, ax,ay,az, radians)   -- axis + angle
+b3.body_velocity(body)                  -- -> vx, vy, vz
+b3.body_set_velocity(body, vx, vy, vz)
+b3.body_apply_force(body, fx, fy, fz)
+b3.body_apply_impulse(body, ix, iy, iz)
+b3.body_mass(body)
+
+b3.shape_box(body, hx, hy, hz [, density])       -- HALF-extents
+b3.shape_sphere(body, radius [, density])
+b3.shape_capsule(body, halfHeight, radius [, density])   -- along local Y
+
+-- nil when nothing is hit
+local hx,hy,hz, nx,ny,nz, frac = b3.raycast(w, ox,oy,oz, dx,dy,dz)
+```
+
+Rotation is a quaternion, not an angle -- in 3D there is no single angle
+to return. `body_set_transform` takes an axis and an angle so a cart never
+has to build one by hand.
+
+**SIMD and threads are properties of the BUILD, and `b3.info()` reports
+what it actually got rather than what it asked for.** Natively that is
+NEON or AVX2 with a real worker pool across every hardware thread; under
+plain wasm it is `wasm-simd128` and `workers = 0`, because worker threads
+need SharedArrayBuffer and a host that can provide it. The solver runs
+serially in that case -- correct, just not parallel. Results are identical
+either way: `examples/physics` asserts the same numbers on both targets.
+
+Up to 4 worlds, 2048 bodies, 4096 shapes. Joints, sensors, and contact
+events are not exposed yet.
+
 ## love.math
 
 ```lua
