@@ -13,7 +13,7 @@ To regenerate:
 node tools/apistatus/gen-status.mjs api-dump.txt
 ```
 
-**194 of 320 LOVE functions implemented (61%).**
+**206 of 320 LOVE functions implemented (64%).**
 
 A caveat worth stating plainly: this table measures PRESENCE. A
 function can be exported and still be wrong. `test/apiconform/`
@@ -27,17 +27,17 @@ list, so this percentage and Lutro's are directly comparable.
 
 | module | implemented | total | coverage |
 |---|---:|---:|---:|
-| `love` | 0 | 4 | 0% |
+| `love` | 4 | 4 | 100% |
 | `love.audio` | 3 | 26 | 12% |
 | `love.data` | 9 | 10 | 90% |
 | `love.event` | 5 | 6 | 83% |
 | `love.filesystem` | 14 | 31 | 45% |
 | `love.font` | 1 | 5 | 20% |
-| `love.graphics` | 78 | 105 | 74% |
+| `love.graphics` | 84 | 105 | 80% |
 | `love.image` | 3 | 3 | 100% |
 | `love.joystick` | 2 | 6 | 33% |
 | `love.keyboard` | 9 | 9 | 100% |
-| `love.math` | 11 | 16 | 69% |
+| `love.math` | 13 | 16 | 81% |
 | `love.mouse` | 8 | 18 | 44% |
 | `love.physics` | 11 | 22 | 50% |
 | `love.sound` | 2 | 2 | 100% |
@@ -50,14 +50,14 @@ list, so this percentage and Lutro's are directly comparable.
 
 ## Function by function
 
-### `love` — 0/4
+### `love` — 4/4
 
 | | function |
 |---|---|
-| :white_medium_square: | `love.getVersion` |
-| :white_medium_square: | `love.hasDeprecationOutput` |
-| :white_medium_square: | `love.isVersionCompatible` |
-| :white_medium_square: | `love.setDeprecationOutput` |
+| :white_check_mark: | `love.getVersion` |
+| :white_check_mark: | `love.hasDeprecationOutput` |
+| :white_check_mark: | `love.isVersionCompatible` |
+| :white_check_mark: | `love.setDeprecationOutput` |
 
 ### `love.audio` — 3/26
 
@@ -162,7 +162,7 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_check_mark: | `love.font.newRasterizer` |
 | :white_medium_square: | `love.font.newTrueTypeRasterizer` |
 
-### `love.graphics` — 78/105
+### `love.graphics` — 84/105
 
 | | function |
 |---|---|
@@ -171,7 +171,7 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_medium_square: | `love.graphics.Canvas.getMipmapMode` |
 | :white_medium_square: | `love.graphics.Canvas.newImageData` |
 | :white_medium_square: | `love.graphics.Canvas.renderTo` |
-| :white_medium_square: | `love.graphics.applyTransform` |
+| :white_check_mark: | `love.graphics.applyTransform` |
 | :white_check_mark: | `love.graphics.arc` |
 | :white_check_mark: | `love.graphics.captureScreenshot` |
 | :white_check_mark: | `love.graphics.circle` |
@@ -180,7 +180,7 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_check_mark: | `love.graphics.draw` |
 | :white_check_mark: | `love.graphics.drawInstanced` |
 | :white_medium_square: | `love.graphics.drawLayer` |
-| :white_medium_square: | `love.graphics.ellipse` |
+| :white_check_mark: | `love.graphics.ellipse` |
 | :white_medium_square: | `love.graphics.flushBatch` |
 | :white_check_mark: | `love.graphics.getBackgroundColor` |
 | :white_check_mark: | `love.graphics.getBlendMode` |
@@ -215,7 +215,7 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_medium_square: | `love.graphics.getTextureTypes` |
 | :white_check_mark: | `love.graphics.getWidth` |
 | :white_medium_square: | `love.graphics.intersectScissor` |
-| :white_medium_square: | `love.graphics.inverseTransformPoint` |
+| :white_check_mark: | `love.graphics.inverseTransformPoint` |
 | :white_check_mark: | `love.graphics.isActive` |
 | :white_medium_square: | `love.graphics.isGammaCorrect` |
 | :white_medium_square: | `love.graphics.isWireframe` |
@@ -243,7 +243,7 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_check_mark: | `love.graphics.printf` |
 | :white_check_mark: | `love.graphics.push` |
 | :white_check_mark: | `love.graphics.rectangle` |
-| :white_medium_square: | `love.graphics.replaceTransform` |
+| :white_check_mark: | `love.graphics.replaceTransform` |
 | :white_check_mark: | `love.graphics.reset` |
 | :white_check_mark: | `love.graphics.rotate` |
 | :white_check_mark: | `love.graphics.scale` |
@@ -266,9 +266,9 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_check_mark: | `love.graphics.setShader` |
 | :white_medium_square: | `love.graphics.setStencilTest` |
 | :white_medium_square: | `love.graphics.setWireframe` |
-| :white_medium_square: | `love.graphics.shear` |
+| :white_check_mark: | `love.graphics.shear` |
 | :white_medium_square: | `love.graphics.stencil` |
-| :white_medium_square: | `love.graphics.transformPoint` |
+| :white_check_mark: | `love.graphics.transformPoint` |
 | :white_check_mark: | `love.graphics.translate` |
 | :white_check_mark: | `love.graphics.validateShader` |
 
@@ -305,7 +305,7 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_check_mark: | `love.keyboard.setKeyRepeat` |
 | :white_check_mark: | `love.keyboard.setTextInput` |
 
-### `love.math` — 11/16
+### `love.math` — 13/16
 
 | | function |
 |---|---|
@@ -316,9 +316,9 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_medium_square: | `love.math.getRandomState` |
 | :white_check_mark: | `love.math.isConvex` |
 | :white_check_mark: | `love.math.linearToGamma` |
-| :white_medium_square: | `love.math.newBezierCurve` |
+| :white_check_mark: | `love.math.newBezierCurve` |
 | :white_check_mark: | `love.math.newRandomGenerator` |
-| :white_medium_square: | `love.math.newTransform` |
+| :white_check_mark: | `love.math.newTransform` |
 | :white_check_mark: | `love.math.noise` |
 | :white_check_mark: | `love.math.random` |
 | :white_check_mark: | `love.math.randomNormal` |

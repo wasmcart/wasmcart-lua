@@ -297,6 +297,85 @@ local function run()
     return d:isDestroyed()
   end)())
 
+  -- ── transforms ────────────────────────────────────────────────────
+  --
+  -- transformPoint/inverseTransformPoint are how a game turns a mouse
+  -- position into world space. If the inverse is subtly wrong the game
+  -- still runs and just clicks in the wrong place, so assert the ROUND
+  -- TRIP rather than either direction alone.
+  g.push()
+  g.origin()
+  g.translate(100, 50)
+  g.scale(2, 3)
+  g.rotate(0.4)
+  local wx, wy = g.transformPoint(7, 11)
+  local bx, by = g.inverseTransformPoint(wx, wy)
+  ok("transform round-trips", near(bx, 7, 1e-3) and near(by, 11, 1e-3),
+     ("%.4f,%.4f"):format(bx, by))
+  -- and it must not be the identity, or the round-trip proves nothing
+  ok("transform actually moved the point", math.abs(wx - 7) > 1,
+     ("%.2f"):format(wx))
+
+  -- shear must survive push/pop, which is where a leak would show
+  g.origin()
+  g.shear(0.5, 0)
+  local sx1 = g.transformPoint(0, 10)
+  g.push()
+  g.shear(1.5, 0)
+  g.pop()
+  local sx2 = g.transformPoint(0, 10)
+  ok("shear survives push/pop", near(sx1, sx2, 1e-6),
+     ("%.4f vs %.4f"):format(sx1, sx2))
+  ok("shear actually shears", math.abs(sx1) > 1, sx1)
+  g.origin()
+  g.pop()
+
+  -- ── love.math.Transform ───────────────────────────────────────────
+  local tr = m.newTransform(10, 20, 0, 2, 2)
+  local tpx, tpy = tr:transformPoint(3, 4)
+  ok("Transform applies scale+translate", near(tpx, 16) and near(tpy, 28),
+     ("%.2f,%.2f"):format(tpx, tpy))
+  local ipx, ipy = tr:inverseTransformPoint(tpx, tpy)
+  ok("Transform round-trips", near(ipx, 3) and near(ipy, 4),
+     ("%.2f,%.2f"):format(ipx, ipy))
+  ok("Transform:clone is independent", (function()
+    local c = tr:clone(); c:translate(100, 0)
+    return tr.tx == 10 and c.tx == 110
+  end)())
+  ok("Transform:reset clears", (function()
+    local c = tr:clone():reset()
+    return c.tx == 0 and c.sx == 1 and c.rot == 0
+  end)())
+
+  -- ── BezierCurve ───────────────────────────────────────────────────
+  --
+  -- Known answers: a curve must pass through its first and last control
+  -- points exactly, and a symmetric quadratic must be symmetric at t=0.5.
+  local bz = m.newBezierCurve({0,0, 50,100, 100,0})
+  ok("bezier degree", bz:getDegree() == 2, bz:getDegree())
+  ok("bezier control count", bz:getControlPointCount() == 3,
+     bz:getControlPointCount())
+  local ex0, ey0 = bz:evaluate(0)
+  ok("bezier at t=0 is first point", near(ex0, 0) and near(ey0, 0),
+     ("%.2f,%.2f"):format(ex0, ey0))
+  local ex1, ey1 = bz:evaluate(1)
+  ok("bezier at t=1 is last point", near(ex1, 100) and near(ey1, 0),
+     ("%.2f,%.2f"):format(ex1, ey1))
+  -- midpoint of this symmetric quadratic is (50, 50), not (50, 100):
+  -- the curve does not reach its control point
+  local exm, eym = bz:evaluate(0.5)
+  ok("bezier midpoint is 50,50", near(exm, 50) and near(eym, 50),
+     ("%.2f,%.2f"):format(exm, eym))
+  ok("bezier render returns points", #bz:render(3) == (2 ^ 3 + 1) * 2,
+     #bz:render(3))
+
+  -- ── version ───────────────────────────────────────────────────────
+  local maj, min = love.getVersion()
+  ok("getVersion returns numbers", type(maj) == "number" and type(min) == "number",
+     tostring(maj) .. "." .. tostring(min))
+  ok("isVersionCompatible accepts own version", love.isVersionCompatible(maj, min))
+  ok("isVersionCompatible rejects the future", love.isVersionCompatible(99, 0) == false)
+
   print(("APICONFORM %d passed, %d failed"):format(pass, fail))
   print(fail == 0 and "APICONFORM OK" or "APICONFORM FAILED")
 end

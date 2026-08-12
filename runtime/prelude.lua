@@ -35,9 +35,17 @@ local frame_n = 0
 
 -- transform stack (Lua-side; C is a dumb rasterizer in world coords)
 local tx, ty, tsx, tsy, trot = 0, 0, 1, 1, 0
+-- Shear, kept as its own pair rather than folded into a full 3x3 matrix.
+-- apply() runs for EVERY transformed vertex of every draw, so the cheap
+-- representation earns its keep: the common case (no shear) costs one
+-- branch, where a general matrix would cost four multiplies always.
+local tkx, tky = 0, 0
 local tstack = {}
 
 local function apply(x, y)
+  if tkx ~= 0 or tky ~= 0 then
+    x, y = x + y * tkx, y + x * tky
+  end
   x, y = x * tsx, y * tsy
   if trot ~= 0 then
     local c, s = math.cos(trot), math.sin(trot)
@@ -138,6 +146,23 @@ end
 function graphics.circle(mode, x, y, r)
   local px, py = apply(x, y)
   wc.circle(mode == "fill" and 1 or 0, px, py, r * tsx)
+end
+
+-- An ellipse is a circle with independent radii, so it cannot go through
+-- wc.circle. Emitted as a polygon, which is what LOVE does internally too
+-- (a circle IS an ellipse with rx == ry there). Segment count follows the
+-- larger radius so a big ellipse does not turn into a visible polygon.
+function graphics.ellipse(mode, x, y, rx, ry, segments)
+  ry = ry or rx
+  local n = segments or math.max(8, math.floor(math.max(rx, ry) / 2) + 8)
+  if n > 256 then n = 256 end
+  local pts = {}
+  for i = 0, n - 1 do
+    local a = i / n * math.pi * 2
+    pts[#pts + 1] = x + math.cos(a) * rx
+    pts[#pts + 1] = y + math.sin(a) * ry
+  end
+  graphics.polygon(mode, pts)
 end
 
 function graphics.line(...)
@@ -937,11 +962,14 @@ function graphics.push(stacktype)
   tdepth = d
   local t = tstack[d]
   if not t then
-    t = { 0, 0, 0, 0, 0, canvas = false, shader = false,
+    t = { 0, 0, 0, 0, 0, 0, 0, canvas = false, shader = false,
           r = 0, g = 0, b = 0, a = 0, all = false }
     tstack[d] = t
   end
   t[1], t[2], t[3], t[4], t[5] = tx, ty, tsx, tsy, trot
+  -- shear is part of the transform and MUST be saved with it, or a push/pop
+  -- pair silently leaks a shear into whatever drew next
+  t[6], t[7] = tkx, tky
   t.canvas = cur_canvas
   t.shader = cur_shader
   t.r, t.g, t.b, t.a = cr, cg, cb, ca
@@ -958,6 +986,7 @@ function graphics.pop()
   local t = tstack[d]
   if not t then return end
   tx, ty, tsx, tsy, trot = t[1], t[2], t[3], t[4], t[5]
+  tkx, tky = t[6] or 0, t[7] or 0
   -- Restore the render target only when it actually changed, so a pop does
   -- not re-bind (and re-clear the clip scale for) the target already bound.
   if t.canvas ~= cur_canvas then
@@ -977,7 +1006,52 @@ function graphics.translate(x, y)
 end
 function graphics.scale(sx, sy) tsx = tsx * (sx or 1); tsy = tsy * (sy or sx or 1) end
 function graphics.rotate(r) trot = trot + (r or 0) end
-function graphics.origin() tx, ty, tsx, tsy, trot = 0, 0, 1, 1, 0 end
+function graphics.origin() tx, ty, tsx, tsy, trot = 0, 0, 1, 1, 0; tkx, tky = 0, 0 end
+
+function graphics.shear(kx, ky)
+  tkx = tkx + (kx or 0)
+  tky = tky + (ky or 0)
+end
+
+-- Map a point through the CURRENT transform, and back again. Games use
+-- these to turn a mouse position into world space, which is otherwise
+-- guesswork once the camera has scaled or rotated.
+function graphics.transformPoint(x, y) return apply(x, y) end
+
+function graphics.inverseTransformPoint(x, y)
+  -- undo in reverse order: translate, rotate, scale, shear
+  x, y = x - tx, y - ty
+  if trot ~= 0 then
+    local c, sn = math.cos(-trot), math.sin(-trot)
+    x, y = x * c - y * sn, x * sn + y * c
+  end
+  if tsx ~= 0 then x = x / tsx end
+  if tsy ~= 0 then y = y / tsy end
+  if tkx ~= 0 or tky ~= 0 then
+    -- invert [1 kx; ky 1], determinant 1 - kx*ky
+    local det = 1 - tkx * tky
+    if det ~= 0 then
+      x, y = (x - y * tkx) / det, (y - x * tky) / det
+    end
+  end
+  return x, y
+end
+
+-- love.math.Transform objects. applyTransform composes one onto the
+-- current state; replaceTransform overwrites it outright.
+function graphics.applyTransform(t)
+  graphics.translate(t.tx, t.ty)
+  graphics.rotate(t.rot)
+  graphics.scale(t.sx, t.sy)
+  graphics.shear(t.kx, t.ky)
+end
+
+function graphics.replaceTransform(t)
+  tx, ty = t.tx, t.ty
+  tsx, tsy = t.sx, t.sy
+  trot = t.rot
+  tkx, tky = t.kx, t.ky
+end
 
 local sc_rect = nil
 function graphics.setScissor(x, y, w, h)
@@ -2529,6 +2603,93 @@ end
 
 function lmath.setRandomSeed() end -- host owns the seed; no-op by design
 
+-- Transform objects. Deliberately a TRS+shear record rather than a 3x3
+-- matrix: it is what graphics.applyTransform consumes, and the engine's own
+-- transform state has the same shape, so the two compose without a matrix
+-- decomposition step that could not always succeed anyway.
+local Transform = {}
+Transform.__index = Transform
+
+function lmath.newTransform(x, y, rot, sx, sy)
+  return setmetatable({ tx = x or 0, ty = y or 0, rot = rot or 0,
+                        sx = sx or 1, sy = sy or sx or 1,
+                        kx = 0, ky = 0 }, Transform)
+end
+
+function Transform:translate(x, y) self.tx = self.tx + x; self.ty = self.ty + y; return self end
+function Transform:rotate(r) self.rot = self.rot + r; return self end
+function Transform:scale(sx, sy) self.sx = self.sx * sx; self.sy = self.sy * (sy or sx); return self end
+function Transform:shear(kx, ky) self.kx = self.kx + kx; self.ky = self.ky + ky; return self end
+function Transform:reset()
+  self.tx, self.ty, self.rot, self.sx, self.sy, self.kx, self.ky = 0, 0, 0, 1, 1, 0, 0
+  return self
+end
+function Transform:clone()
+  local t = lmath.newTransform(self.tx, self.ty, self.rot, self.sx, self.sy)
+  t.kx, t.ky = self.kx, self.ky
+  return t
+end
+function Transform:transformPoint(x, y)
+  if self.kx ~= 0 or self.ky ~= 0 then x, y = x + y * self.kx, y + x * self.ky end
+  x, y = x * self.sx, y * self.sy
+  if self.rot ~= 0 then
+    local c, sn = math.cos(self.rot), math.sin(self.rot)
+    x, y = x * c - y * sn, x * sn + y * c
+  end
+  return x + self.tx, y + self.ty
+end
+function Transform:inverseTransformPoint(x, y)
+  x, y = x - self.tx, y - self.ty
+  if self.rot ~= 0 then
+    local c, sn = math.cos(-self.rot), math.sin(-self.rot)
+    x, y = x * c - y * sn, x * sn + y * c
+  end
+  if self.sx ~= 0 then x = x / self.sx end
+  if self.sy ~= 0 then y = y / self.sy end
+  return x, y
+end
+
+-- Bezier curves. Pure maths, no host involvement, and games use them for
+-- paths and easing curves.
+local Bezier = {}
+Bezier.__index = Bezier
+
+function lmath.newBezierCurve(...)
+  local a = ...
+  local pts = (type(a) == "table") and a or { ... }
+  return setmetatable({ pts = pts }, Bezier)
+end
+
+function Bezier:getControlPointCount() return #self.pts / 2 end
+function Bezier:getDegree() return #self.pts / 2 - 1 end
+
+-- de Casteljau: numerically stable, and the standard way to evaluate.
+function Bezier:evaluate(t)
+  local n = #self.pts / 2
+  if n < 2 then error("BezierCurve:evaluate: need at least 2 control points", 2) end
+  local x, y = {}, {}
+  for i = 1, n do x[i], y[i] = self.pts[i*2-1], self.pts[i*2] end
+  for k = 1, n - 1 do
+    for i = 1, n - k do
+      x[i] = x[i] * (1 - t) + x[i+1] * t
+      y[i] = y[i] * (1 - t) + y[i+1] * t
+    end
+  end
+  return x[1], y[1]
+end
+
+function Bezier:render(depth)
+  depth = depth or 5
+  local steps = 2 ^ depth
+  local out = {}
+  for i = 0, steps do
+    local px, py = self:evaluate(i / steps)
+    out[#out + 1] = px
+    out[#out + 1] = py
+  end
+  return out
+end
+
 -- Colour helpers. Pure arithmetic, and the reason they matter is that
 -- LOVE 11 changed colours from 0-255 to 0-1: every port of an older game
 -- reaches for these, and without them the game draws in the wrong colours
@@ -4004,6 +4165,24 @@ end
 
 -- ── debug helpers for the harness ──────────────────────────────────
 love.debugValue = function(slot, v) wc.debug_set(slot, math.floor(v)) end
+-- Version identity. Libraries branch on this to pick an API shape, and a
+-- missing getVersion means they guess -- usually at the oldest one.
+-- Reported as LOVE 11.4, which is the API generation this engine follows
+-- (colours are 0-1, love.graphics.newText exists, and so on).
+function love.getVersion() return 11, 4, 0, "Mysterious Mysteries" end
+function love.isVersionCompatible(major, minor, rev)
+  if type(major) == "string" then
+    local a, b, c = major:match("^(%d+)%.(%d+)%.?(%d*)$")
+    if not a then return false end
+    major, minor, rev = tonumber(a), tonumber(b), tonumber(c) or 0
+  end
+  return major == 11 and (minor or 0) <= 4
+end
+
+local deprecation_output = true
+function love.setDeprecationOutput(v) deprecation_output = v and true or false end
+function love.hasDeprecationOutput() return deprecation_output end
+
 love.mark = function(id) wc.mark(id) end
 love.log = function(...)
   local parts = {}
@@ -4085,6 +4264,7 @@ function __wasmcart_frame(b1, lx1, ly1, rx1, ry1,
 
   -- reset per-frame graphics state, then clear to the background color
   tx, ty, tsx, tsy, trot = 0, 0, 1, 1, 0
+  tkx, tky = 0, 0
   -- Reset the DEPTH, not the storage: the frames are pooled and reused next
   -- frame. Clearing the array would throw away exactly what push() recycles.
   graphics.__resetStack()
