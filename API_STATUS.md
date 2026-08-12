@@ -13,7 +13,7 @@ To regenerate:
 node tools/apistatus/gen-status.mjs api-dump.txt
 ```
 
-**230 of 320 LOVE functions implemented (72%).**
+**236 of 320 LOVE functions implemented (74%).**
 
 A caveat worth stating plainly: this table measures PRESENCE. A
 function can be exported and still be wrong. `test/apiconform/`
@@ -33,7 +33,7 @@ list, so this percentage and Lutro's are directly comparable.
 | `love.event` | 5 | 6 | 83% |
 | `love.filesystem` | 14 | 31 | 45% |
 | `love.font` | 1 | 5 | 20% |
-| `love.graphics` | 99 | 105 | 94% |
+| `love.graphics` | 105 | 105 | 100% |
 | `love.image` | 3 | 3 | 100% |
 | `love.joystick` | 2 | 6 | 33% |
 | `love.keyboard` | 9 | 9 | 100% |
@@ -162,14 +162,14 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_check_mark: | `love.font.newRasterizer` |
 | :white_medium_square: | `love.font.newTrueTypeRasterizer` |
 
-### `love.graphics` — 99/105
+### `love.graphics` — 105/105
 
 | | function |
 |---|---|
-| :white_medium_square: | `love.graphics.Canvas.generateMipmaps` |
+| :white_check_mark: | `love.graphics.Canvas.generateMipmaps` |
 | :white_check_mark: | `love.graphics.Canvas.getMSAA` |
 | :white_check_mark: | `love.graphics.Canvas.getMipmapMode` |
-| :white_medium_square: | `love.graphics.Canvas.newImageData` |
+| :white_check_mark: | `love.graphics.Canvas.newImageData` |
 | :white_check_mark: | `love.graphics.Canvas.renderTo` |
 | :white_check_mark: | `love.graphics.applyTransform` |
 | :white_check_mark: | `love.graphics.arc` |
@@ -179,7 +179,7 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_check_mark: | `love.graphics.discard` |
 | :white_check_mark: | `love.graphics.draw` |
 | :white_check_mark: | `love.graphics.drawInstanced` |
-| :white_medium_square: | `love.graphics.drawLayer` |
+| :white_check_mark: | `love.graphics.drawLayer` |
 | :white_check_mark: | `love.graphics.ellipse` |
 | :white_check_mark: | `love.graphics.flushBatch` |
 | :white_check_mark: | `love.graphics.getBackgroundColor` |
@@ -225,7 +225,7 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_check_mark: | `love.graphics.newCubeImage` |
 | :white_check_mark: | `love.graphics.newFont` |
 | :white_check_mark: | `love.graphics.newImage` |
-| :white_medium_square: | `love.graphics.newImageFont` |
+| :white_check_mark: | `love.graphics.newImageFont` |
 | :white_check_mark: | `love.graphics.newMesh` |
 | :white_check_mark: | `love.graphics.newParticleSystem` |
 | :white_check_mark: | `love.graphics.newQuad` |
@@ -264,10 +264,10 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_check_mark: | `love.graphics.setPointSize` |
 | :white_check_mark: | `love.graphics.setScissor` |
 | :white_check_mark: | `love.graphics.setShader` |
-| :white_medium_square: | `love.graphics.setStencilTest` |
+| :white_check_mark: | `love.graphics.setStencilTest` |
 | :white_check_mark: | `love.graphics.setWireframe` |
 | :white_check_mark: | `love.graphics.shear` |
-| :white_medium_square: | `love.graphics.stencil` |
+| :white_check_mark: | `love.graphics.stencil` |
 | :white_check_mark: | `love.graphics.transformPoint` |
 | :white_check_mark: | `love.graphics.translate` |
 | :white_check_mark: | `love.graphics.validateShader` |
@@ -483,7 +483,7 @@ implemented and are excluded from the count above.
 
 ## Object methods (real LOVE, not in the denominator)
 
-120 methods on objects this engine returns --
+122 methods on objects this engine returns --
 `Canvas:getWidth`, `Text:getFont` and the like. These exist in desktop
 LOVE and port fine; they are simply not enumerated by the lutro-status
 list used as the denominator, so counting them would inflate the score
@@ -509,6 +509,7 @@ against a yardstick that never measured them.
 - `love.graphics.Font.getHeight`
 - `love.graphics.Font.getWidth`
 - `love.graphics.Font.type`
+- `love.graphics.Image.generateMipmaps`
 - `love.graphics.Image.getDepth`
 - `love.graphics.Image.getDimensions`
 - `love.graphics.Image.getFilter`
@@ -522,6 +523,7 @@ against a yardstick that never measured them.
 - `love.graphics.Image.getWidth`
 - `love.graphics.Image.getWrap`
 - `love.graphics.Image.isReadable`
+- `love.graphics.Image.newImageData`
 - `love.graphics.Image.release`
 - `love.graphics.Image.renderTo`
 - `love.graphics.Image.setFilter`

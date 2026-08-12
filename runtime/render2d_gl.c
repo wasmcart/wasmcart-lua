@@ -96,6 +96,10 @@ typedef struct {
     GLuint tex, fbo;
     int w, h;
     int used;
+    /* Lazily attached, and ONLY if a cart actually stencils into this
+     * canvas. Colour-only FBOs stay colour-only, which is what keeps
+     * stencil support free for the carts that never touch it. */
+    GLuint stencil_rb;
 } target_t;
 #define MAX_TARGETS 16
 static target_t targets[MAX_TARGETS];
@@ -2637,6 +2641,11 @@ int wcl_r2d_target(const void *key, int w, int h) {
     if (!t) {
         for (int i = 0; i < MAX_TARGETS && !t; i++) if (!targets[i].used) t = &targets[i];
         if (!t) return 0;             /* out of targets: caller falls back */
+        /* A RECYCLED slot may still carry the previous canvas's stencil
+         * renderbuffer, sized for the previous canvas. Drop it: a stale
+         * one is both a leak and the wrong dimensions, and the next
+         * stencil() on this target reallocates at the right size. */
+        if (t->stencil_rb) { glDeleteRenderbuffers(1, &t->stencil_rb); t->stencil_rb = 0; }
         glGenTextures(1, &t->tex);
         glBindTexture(GL_TEXTURE_2D, t->tex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
@@ -2734,6 +2743,150 @@ void wcl_r2d_scissor(int x, int y, int w, int h) {
     }
     if (!scissor_on) { glEnable(GL_SCISSOR_TEST); scissor_on = 1; }
     glScissor(x, height - (y + h), w, h);
+}
+
+/* ── stencil ──────────────────────────────────────────────────────────
+ *
+ * love.graphics.stencil(fn, action, value) draws `fn` into the stencil
+ * buffer instead of the colour buffer; setStencilTest then keeps or
+ * rejects later fragments by comparing against it. That is how a game
+ * masks to a non-rectangular region -- a circular spotlight, a torn page
+ * edge, a health bar clipped to a curve. Scissor only does rectangles.
+ *
+ * PERFORMANCE: everything here is OFF and COSTS NOTHING until a cart
+ * calls stencil(). The stencil renderbuffer is allocated lazily on first
+ * use, GL_STENCIL_TEST is only enabled while a test is active, and the
+ * hot draw path is untouched -- no per-draw branch was added. A cart that
+ * never stencils runs exactly the code it ran before.
+ *
+ * The default framebuffer's stencil bits are requested by the host at
+ * context creation; when they are absent (or an FBO cannot get a stencil
+ * attachment) these calls refuse and the caller reports it, rather than
+ * silently drawing an unmasked frame that looks almost right. */
+
+/* Two enums the vendored GL header does not carry. Defined here rather
+ * than added to wasmcart.h, which is a vendored copy that a dependency
+ * bump would overwrite. Values are from the GLES2/GL spec and are not
+ * implementation-specific. */
+#ifndef GL_STENCIL_INDEX8
+#define GL_STENCIL_INDEX8 0x8D48
+#endif
+#ifndef GL_STENCIL_BITS
+#define GL_STENCIL_BITS   0x0D57
+#endif
+
+static int stencil_rb_ok = -1;      /* -1 unknown, 0 unavailable, 1 ready */
+static int stencil_test_on;
+
+/* Attach a stencil renderbuffer to the CURRENT target if it has none.
+ * Screen targets use whatever the context was created with. */
+static int stencil_ensure(void) {
+    if (current_target) {
+        /* A canvas FBO is colour-only by default; give it a stencil the
+         * first time one is actually needed, and remember per-target so a
+         * second stencil pass on the same canvas costs nothing. */
+        if (!current_target->stencil_rb) {
+            GLuint rb = 0;
+            glGenRenderbuffers(1, &rb);
+            glBindRenderbuffer(GL_RENDERBUFFER, rb);
+            glRenderbufferStorage(GL_RENDERBUFFER, GL_STENCIL_INDEX8,
+                                  current_target->w, current_target->h);
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
+                                      GL_RENDERBUFFER, rb);
+            glBindRenderbuffer(GL_RENDERBUFFER, 0);
+            if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+                glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
+                                          GL_RENDERBUFFER, 0);
+                glDeleteRenderbuffers(1, &rb);
+                return 0;
+            }
+            current_target->stencil_rb = rb;
+        }
+        return 1;
+    }
+    if (stencil_rb_ok < 0) {
+        GLint bits = 0;
+        glGetIntegerv(GL_STENCIL_BITS, &bits);
+        stencil_rb_ok = (bits > 0) ? 1 : 0;
+    }
+    return stencil_rb_ok;
+}
+
+/* Begin writing the mask. Colour and depth writes are masked off so the
+ * callback's geometry only touches stencil -- LOVE's stencil() draws
+ * nothing visible. */
+int wcl_r2d_stencil_begin(int action, int value) {
+    if (!wcl_r2d_active()) return 0;
+    flush_batches();
+    if (!stencil_ensure()) return 0;
+
+    glEnable(GL_STENCIL_TEST);
+    /* glClear OBEYS THE SCISSOR TEST and the stencil write mask. An
+     * earlier draw may have left a scissor enabled, which would clear
+     * only part of the buffer and leave stale mask bits outside it --
+     * and glStencilMask(0x00) from a previous test would make the clear
+     * a no-op entirely. Force both open across the clear, then restore
+     * the scissor the cart actually asked for. */
+    int had_scissor = scissor_on;
+    if (had_scissor) glDisable(GL_SCISSOR_TEST);
+    glStencilMask(0xFF);
+    glClearStencil(0);
+    glClear(GL_STENCIL_BUFFER_BIT);
+    if (had_scissor) glEnable(GL_SCISSOR_TEST);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glDepthMask(GL_FALSE);
+    glStencilFunc(GL_ALWAYS, value, 0xFF);
+    glStencilMask(0xFF);
+
+    GLenum op = GL_REPLACE;
+    switch (action) {
+        case 0: op = GL_REPLACE; break;   /* "replace"   */
+        case 1: op = GL_INCR;    break;   /* "increment" */
+        case 2: op = GL_DECR;    break;   /* "decrement" */
+        case 3: op = GL_INVERT;  break;   /* "invert"    */
+        case 4: op = GL_INCR_WRAP; break; /* "incrementwrap" */
+        case 5: op = GL_DECR_WRAP; break; /* "decrementwrap" */
+        default: op = GL_REPLACE; break;
+    }
+    glStencilOp(GL_KEEP, GL_KEEP, op);
+    return 1;
+}
+
+/* Finish the mask: colour writes back on, stencil writes off. The TEST is
+ * left in whatever state setStencilTest last chose. */
+void wcl_r2d_stencil_end(void) {
+    if (!wcl_r2d_active()) return;
+    flush_batches();
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_TRUE);
+    glStencilMask(0x00);
+    if (!stencil_test_on) glDisable(GL_STENCIL_TEST);
+}
+
+/* compare: 0 off, else a GL func chosen by the caller's enum. */
+void wcl_r2d_stencil_test(int compare, int value) {
+    if (!wcl_r2d_active()) return;
+    flush_batches();
+    if (compare <= 0) {
+        stencil_test_on = 0;
+        glDisable(GL_STENCIL_TEST);
+        return;
+    }
+    if (!stencil_ensure()) return;
+    GLenum f = GL_ALWAYS;
+    switch (compare) {
+        case 1: f = GL_EQUAL;    break;   /* "equal"        */
+        case 2: f = GL_NOTEQUAL; break;   /* "notequal"     */
+        case 3: f = GL_LESS;     break;   /* "less"         */
+        case 4: f = GL_LEQUAL;   break;   /* "lequal"       */
+        case 5: f = GL_GREATER;  break;   /* "greater"      */
+        case 6: f = GL_GEQUAL;   break;   /* "gequal"       */
+        default: f = GL_ALWAYS;  break;
+    }
+    stencil_test_on = 1;
+    glEnable(GL_STENCIL_TEST);
+    glStencilFunc(f, value, 0xFF);
+    glStencilMask(0x00);              /* test only; never write */
 }
 
 #endif /* WCL_ENABLE_GL2D */

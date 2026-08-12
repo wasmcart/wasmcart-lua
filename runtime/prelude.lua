@@ -272,6 +272,53 @@ function Image:getMipmapMode() return "none" end
 -- pcall so a throwing callback cannot leave the canvas bound for the rest
 -- of the frame -- which paints every later draw into the wrong target and
 -- looks like the screen froze.
+-- Canvas:newImageData([slice, mipmap, x, y, w, h]) -- read the canvas back
+-- into an ImageData a cart can inspect pixel by pixel. Used for
+-- screenshots, colour picking and procedural texture generation.
+--
+-- An ordinary canvas here IS a CPU-backed image, so the "readback" is a
+-- straight pixel copy. A GPU-only canvas (float formats, cube, array) has
+-- no CPU representation at all and says so rather than handing back a
+-- blank image that silently reads as transparent black.
+function Image:newImageData(slice, mipmap, x, y, w, h)
+  if not self.id then
+    error("Canvas:newImageData: this canvas lives on the GPU only " ..
+          "(float/cube/array formats have no CPU pixels to read back).", 2)
+  end
+  -- ON THE GL PATH A CANVAS IS A GPU TEXTURE and its pixels never reach
+  -- the CPU-side buffer image_pixel reads, so a "readback" here would
+  -- hand back a uniformly transparent image that LOOKS like a valid
+  -- result. Refuse instead. Doing it properly means a glReadPixels round
+  -- trip, which stalls the pipeline hard -- that is a real feature with a
+  -- real cost, and it should be added deliberately, not smuggled in
+  -- behind a call that silently returns blanks today.
+  if wc.gpu2d and wc.gpu2d() then
+    error("Canvas:newImageData: this frame renders on the GPU, where a " ..
+          "canvas is a texture with no CPU-side pixels. Reading one back " ..
+          "needs a glReadPixels stall that this engine does not do yet. " ..
+          "(It works on the software path.)", 2)
+  end
+  x, y = x or 0, y or 0
+  w, h = w or self.w, h or self.h
+  local out = love.image.newImageData(w, h)
+  if not out then return nil end
+  for yy = 0, h - 1 do
+    for xx = 0, w - 1 do
+      local r, g2, b, a = wc.image_pixel(self.id, x + xx, y + yy)
+      out:setPixel(xx, yy, r, g2, b, a)
+    end
+  end
+  return out
+end
+
+-- Mipmaps are not generated for CPU-backed canvases: every draw here is a
+-- NEAREST sample at 1:1 or an explicit scale, so there is no level for a
+-- mip to serve. A no-op is the honest answer -- erroring would break the
+-- common "make canvas, generate mips, draw it" idiom for no benefit, and
+-- pretending to build them would be worse.
+function Image:generateMipmaps() end
+function Image:getMipmapCount() return 1 end
+
 function Image:renderTo(fn, ...)
   if type(fn) ~= "function" then return end
   local prev = graphics.getCanvas and graphics.getCanvas() or nil
@@ -1286,7 +1333,18 @@ function ParticleSystem:type() return "ParticleSystem" end
 local Font = {}
 Font.__index = Font
 function Font:getHeight() return self.px end
-function Font:getWidth(s) local w = wc.text_size(s, self.id, self.scale) return w end
+function Font:getWidth(s)
+  if self.imagefont then
+    local w = 0
+    for i = 1, #s do
+      local q = self.quads[s:sub(i, i)]
+      if q then w = w + q.w + self.spacing
+      elseif s:sub(i, i) == " " then w = w + self.px * 0.4 + self.spacing end
+    end
+    return w
+  end
+  return wc.text_size(s, self.id, self.scale)
+end
 function Font:type() return "Font" end
 
 function graphics.newFont(a, b)
@@ -1309,6 +1367,64 @@ function graphics.setFont(f) cur_font = f end
 -- setNewFont(...) == setFont(newFont(...)), and RETURNS the font. Games
 -- use it as a one-liner at startup; the return value is what they keep to
 -- measure text with later.
+-- newImageFont(image, glyphs [, extraspacing])
+--
+-- A bitmap font: one image holding the glyphs side by side, separated by
+-- whatever colour the top-left pixel is, and a string naming them in
+-- order. Old LOVE games ship these constantly.
+--
+-- The glyph WIDTHS come from scanning for that separator colour, so a
+-- proportional image font measures correctly rather than assuming a fixed
+-- cell -- which is the difference between text that lines up and text
+-- that drifts across a menu.
+function graphics.newImageFont(image, glyphs, extraspacing)
+  if rawtype(image) == "string" then image = graphics.newImage(image) end
+  if not image or not image.id then
+    error("love.graphics.newImageFont: first argument must be an Image " ..
+          "or a path to one", 2)
+  end
+  local sepR, sepG, sepB = wc.image_pixel(image.id, 0, 0)
+  local function isSep(x)
+    local r, g2, b = wc.image_pixel(image.id, x, 0)
+    return r == sepR and g2 == sepG and b == sepB
+  end
+  -- walk the top row, cutting a glyph at each run between separators
+  local quads, order = {}, {}
+  local x, n = 0, 0
+  local w, h = image.w, image.h
+  while x < w and n < #glyphs do
+    while x < w and isSep(x) do x = x + 1 end
+    if x >= w then break end
+    local start = x
+    while x < w and not isSep(x) do x = x + 1 end
+    n = n + 1
+    local ch = glyphs:sub(n, n)
+    quads[ch] = graphics.newQuad(start, 0, x - start, h, w, h)
+    order[#order + 1] = ch
+  end
+  return setmetatable({
+    id = -2,                       -- not a wc font: drawn as quads
+    image = image, quads = quads,
+    px = h, scale = 1,
+    spacing = extraspacing or 0,
+    imagefont = true,
+  }, getmetatable(graphics.newFont(12)))
+end
+
+-- drawLayer(texture, layer, ...) -- one slice of an array texture.
+--
+-- Array textures are a GPU-only canvas type here, and an ordinary 2D
+-- image has exactly one layer, so this forwards to draw() for layer 1 and
+-- refuses anything else rather than silently drawing the wrong slice.
+function graphics.drawLayer(tex, layer, ...)
+  if (layer or 1) ~= 1 then
+    error("love.graphics.drawLayer: only layer 1 exists for a 2D texture " ..
+          "on this engine (array textures are GPU-only and cannot be " ..
+          "sampled per-layer from the 2D path).", 2)
+  end
+  return graphics.draw(tex, ...)
+end
+
 function graphics.setNewFont(a, b)
   local f = graphics.newFont(a, b)
   cur_font = f
@@ -1319,8 +1435,29 @@ function graphics.getFont()
   return cur_font
 end
 
+-- Draw a string with an IMAGE font: one quad per glyph, advancing by each
+-- glyph's own width. Separate from the wc.print path because an image
+-- font has no engine-side glyph table -- the widths live in the quads
+-- this cart built at newImageFont time.
+local function printImageFont(f, text, x, y)
+  local cx = x
+  for i = 1, #text do
+    local ch = text:sub(i, i)
+    local q = f.quads[ch]
+    if q then
+      graphics.draw(f.image, q, cx, y)
+      cx = cx + q.w + f.spacing
+    elseif ch == " " then
+      -- no glyph for space: advance by a plausible width rather than
+      -- collapsing the gap, which would run words together
+      cx = cx + (f.px * 0.4) + f.spacing
+    end
+  end
+end
+
 function graphics.print(text, x, y)
   local f = graphics.getFont()
+  if f.imagefont then return printImageFont(f, tostring(text), x or 0, y or 0) end
   local px, py = apply(x or 0, y or 0)
   wc.print(tostring(text), px, py, f.id, f.scale)
 end
@@ -1644,6 +1781,73 @@ function graphics.getScissor()
   return sc_rect[1], sc_rect[2], sc_rect[3], sc_rect[4]
 end
 
+-- ── stencil ────────────────────────────────────────────────────────
+--
+-- Masking to a NON-RECTANGULAR region, which is the one thing scissor
+-- cannot do: a circular spotlight, a health bar clipped to a curve, a
+-- torn page edge.
+--
+--   love.graphics.stencil(fn, action, value, keepvalues)
+--       runs fn with colour writes masked off, so whatever it draws lands
+--       only in the stencil buffer
+--   love.graphics.setStencilTest(compare, value)
+--       keeps or rejects later fragments by comparing against it
+--
+-- GL ONLY, and it says so. The software rasterizer has no stencil buffer,
+-- and giving it one would put a per-pixel test in the innermost blend
+-- loop -- a cost every cart pays to serve the few that mask. A cart that
+-- calls stencil() on the CPU path gets a named error rather than an
+-- unmasked frame that looks almost right and is wrong in a way nobody
+-- notices until a screenshot.
+local STENCIL_ACTION = {
+  replace = 0, increment = 1, decrement = 2, invert = 3,
+  incrementwrap = 4, decrementwrap = 5,
+}
+local STENCIL_COMPARE = {
+  never = 0,            -- no GL never in our enum; treated as "off"
+  equal = 1, notequal = 2, less = 3, lequal = 4,
+  greater = 5, gequal = 6, always = 0,
+}
+
+function graphics.stencil(fn, action, value, keepvalues)
+  if type(fn) ~= "function" then return end
+  local act = STENCIL_ACTION[action or "replace"] or 0
+  local val = value or 1
+  if not wc.stencil_begin(act, val) then
+    error("love.graphics.stencil needs the GPU path, and this frame is " ..
+          "software-rendered (see gpu2d). A stencil cannot be honoured on " ..
+          "the CPU rasterizer, and drawing the mask unmasked would be " ..
+          "silently wrong.", 2)
+  end
+  -- pcall so a throwing mask callback cannot leave colour writes masked
+  -- off for the rest of the frame, which renders everything after it
+  -- invisible and looks like the game hung.
+  local ok, err = pcall(fn)
+  wc.stencil_end()
+  if not ok then error(err, 2) end
+end
+
+-- LOVE returns the mode and value last set, and libraries save/restore it
+-- around their own masking, so the state is tracked here rather than
+-- queried back out of GL.
+local stencil_cmp, stencil_val = "always", 0
+
+function graphics.setStencilTest(compare, value)
+  if compare == nil then
+    wc.stencil_test(0, 0)
+    stencil_cmp, stencil_val = "always", 0
+    return
+  end
+  local cmp = STENCIL_COMPARE[compare]
+  if cmp == nil then
+    error("unknown stencil compare mode: " .. tostring(compare), 2)
+  end
+  wc.stencil_test(cmp, value or 0)
+  stencil_cmp, stencil_val = compare, value or 0
+end
+
+function graphics.getStencilTest() return stencil_cmp, stencil_val end
+
 -- Clip to the INTERSECTION of the current scissor and this rect.
 --
 -- The nesting primitive: a UI library clips to a panel, then a widget
@@ -1727,10 +1931,6 @@ function graphics.getRendererInfo()
 end
 
 function graphics.getStackDepth() return tdepth end
-
--- Stencil is not implemented. Report it OFF rather than erroring, so the
--- common "read it, set it, restore it" idiom round-trips.
-function graphics.getStencilTest() return "always", 0 end
 
 -- ── shaders ────────────────────────────────────────────────────────
 --

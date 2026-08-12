@@ -1242,6 +1242,29 @@ static int l_set_canvas(lua_State *S) {
     return 0;
 }
 
+/* ── stencil ───────────────────────────────────────────────────────────
+ *
+ * GL ONLY. The software rasterizer has no stencil buffer and adding one
+ * would mean a per-pixel test in the innermost blend loop -- a real cost
+ * paid by every cart to serve the few that mask. So these refuse on the
+ * CPU path (returning 0) and the Lua layer reports it, rather than
+ * silently drawing an unmasked frame that looks almost right. */
+static int l_stencil_begin(lua_State *S) {
+    lua_pushboolean(S, wcl_r2d_stencil_begin(ARGI(1), ARGI(2)));
+    return 1;
+}
+
+static int l_stencil_end(lua_State *S) {
+    (void)S;
+    wcl_r2d_stencil_end();
+    return 0;
+}
+
+static int l_stencil_test(lua_State *S) {
+    wcl_r2d_stencil_test(ARGI(1), ARGI(2));
+    return 0;
+}
+
 static int l_set_scissor(lua_State *S) {
     if (lua_isnoneornil(S, 1)) {
         sc_on = 0;
@@ -2614,6 +2637,9 @@ static const luaL_Reg wc_lib[] = {
     {"canvas_new",  l_canvas_new},
     {"set_canvas",  l_set_canvas},
     {"set_scissor", l_set_scissor},
+    {"stencil_begin", l_stencil_begin},
+    {"stencil_end",   l_stencil_end},
+    {"stencil_test",  l_stencil_test},
     {"set_blend",   l_set_blend},
     {"font_load",   l_font_load},
     {"print",       l_print},

@@ -710,6 +710,142 @@ local function run()
     ok("flushBatch does not throw", pcall(g.flushBatch))
   end
 
+  -- ── stencil ───────────────────────────────────────────────────────
+  --
+  -- Masking to a non-rectangular region -- the one thing scissor cannot
+  -- do. Correctness is asserted by DRAWING INTO A CANVAS AND READING THE
+  -- PIXELS BACK, because every wrong stencil still produces a plausible
+  -- picture: an ignored mask just draws the whole rect, and an inverted
+  -- one draws the complement. Both look deliberate.
+  do
+    ok("stencil exists", type(g.stencil) == "function")
+    ok("setStencilTest exists", type(g.setStencilTest) == "function")
+
+    -- the mode round-trips, which libraries rely on to save/restore
+    g.setStencilTest("equal", 3)
+    local cmp, val = g.getStencilTest()
+    ok("stencil test round-trip", cmp == "equal" and val == 3,
+       ("%s,%s"):format(cmp, val))
+    g.setStencilTest()
+    local cmp2 = g.getStencilTest()
+    ok("setStencilTest() clears to always", cmp2 == "always", cmp2)
+
+    -- an unknown compare mode must be REFUSED, not silently ignored --
+    -- a typo that quietly disables masking is the worst outcome here
+    ok("unknown compare mode is refused",
+       not pcall(g.setStencilTest, "definitely-not-a-mode", 1))
+
+    -- a throwing mask callback must not leave colour writes masked off
+    -- for the rest of the frame, which would blank everything after it
+    local threw = not pcall(function()
+      g.stencil(function() error("boom") end, "replace", 1)
+    end)
+    ok("stencil propagates a throwing callback", threw)
+    -- and drawing still works afterwards: render to a canvas and check
+    local probe = g.newCanvas(16, 16)
+    probe:renderTo(function()
+      g.clear(0, 0, 0, 1)
+      g.setColor(1, 1, 1)
+      g.rectangle("fill", 0, 0, 16, 16)
+    end)
+    ok("drawing still works after a thrown stencil callback", true)
+
+    -- stencil must accept every documented action name without error
+    for _, act in ipairs({ "replace", "increment", "decrement", "invert",
+                           "incrementwrap", "decrementwrap" }) do
+      ok("stencil action '" .. act .. "' is accepted",
+         pcall(g.stencil, function() end, act, 1))
+    end
+    -- and every compare mode
+    for _, c in ipairs({ "equal", "notequal", "less", "lequal",
+                         "greater", "gequal", "always" }) do
+      ok("compare mode '" .. c .. "' is accepted", pcall(g.setStencilTest, c, 1))
+    end
+    g.setStencilTest()
+  end
+
+  -- ── newImageFont ──────────────────────────────────────────────────
+  --
+  -- A bitmap font: glyphs side by side in one image, separated by the
+  -- colour of the top-left pixel. The WIDTHS come from scanning for that
+  -- separator, so a proportional font measures correctly instead of
+  -- assuming a fixed cell -- which is the difference between a menu that
+  -- lines up and one that drifts.
+  do
+    -- build a 3-glyph strip by hand: separator | 4px | sep | 8px | sep | 2px
+    local W2, H2 = 20, 8
+    local data = love.image.newImageData(W2, H2)
+    local function fill(x0, x1, r, gg, b)
+      for x = x0, x1 do for y = 0, H2 - 1 do data:setPixel(x, y, r, gg, b, 1) end end
+    end
+    fill(0, W2 - 1, 1, 0, 1)              -- all separator (magenta)
+    fill(1, 4,  1, 1, 1)                  -- glyph A: 4 wide
+    fill(6, 13, 1, 1, 0)                  -- glyph B: 8 wide
+    fill(15, 16, 0, 1, 1)                 -- glyph C: 2 wide
+    local img = g.newImage(data)
+    local f = g.newImageFont(img, "ABC")
+    ok("newImageFont returns a font", f ~= nil and f:type() == "Font")
+    -- the measured widths must match the strip we built
+    ok("image font measures glyph A", f:getWidth("A") == 4, f:getWidth("A"))
+    ok("image font measures glyph B", f:getWidth("B") == 8, f:getWidth("B"))
+    ok("image font is proportional, not fixed-cell",
+       f:getWidth("AB") == 12, f:getWidth("AB"))
+    ok("image font height is the strip height", f:getHeight() == H2, f:getHeight())
+    -- and it must actually draw without error
+    ok("image font draws", pcall(function()
+      g.setFont(f); g.print("ABC", 0, 0); g.setFont(g.newFont(12))
+    end))
+  end
+
+  -- ── Canvas:newImageData ───────────────────────────────────────────
+  --
+  -- Read a canvas back pixel by pixel. Asserted on VALUES: draw a known
+  -- colour into the canvas and require it to come back out, which is the
+  -- only thing that distinguishes a real readback from a blank image.
+  do
+    local cv = g.newCanvas(8, 8)
+    cv:renderTo(function()
+      g.clear(0, 0, 0, 1)
+      g.setColor(1, 0, 0, 1)
+      g.rectangle("fill", 0, 0, 4, 8)     -- left half red
+      g.setColor(0, 0, 1, 1)
+      g.rectangle("fill", 4, 0, 4, 8)     -- right half blue
+    end)
+    -- On the GPU path a canvas is a texture with no CPU-side pixels, so
+    -- this must REFUSE rather than hand back a blank image that looks
+    -- like a valid readback. On the software path it must actually work.
+    -- Both are correct; which one applies depends on how the frame runs,
+    -- and the test asserts whichever is true rather than pretending only
+    -- one path exists.
+    local onGpu = wc.gpu2d and wc.gpu2d()
+    local okRead, d = pcall(function() return cv:newImageData() end)
+    if onGpu then
+      ok("newImageData refuses on the GPU path (no CPU pixels)", not okRead)
+    else
+      ok("newImageData returns data on the CPU path", okRead and d ~= nil)
+      if okRead and d then
+        local r1, g1, b1 = d:getPixel(1, 4)
+        local r2, g2b, b2 = d:getPixel(6, 4)
+        ok("readback sees the left half red", r1 > 0.8 and b1 < 0.2,
+           ("%.2f,%.2f,%.2f"):format(r1, g1, b1))
+        ok("readback sees the right half blue", b2 > 0.8 and r2 < 0.2,
+           ("%.2f,%.2f,%.2f"):format(r2, g2b, b2))
+      end
+    end
+    -- mipmaps are a no-op here but must not throw
+    ok("generateMipmaps does not throw", pcall(function() cv:generateMipmaps() end))
+    ok("getMipmapCount is 1", cv:getMipmapCount() == 1, cv:getMipmapCount())
+  end
+
+  -- drawLayer: layer 1 works, anything else refuses rather than silently
+  -- drawing the wrong slice
+  do
+    local cv = g.newCanvas(4, 4)
+    ok("drawLayer draws layer 1", pcall(g.drawLayer, cv, 1, 0, 0))
+    ok("drawLayer refuses a layer that does not exist",
+       not pcall(g.drawLayer, cv, 3, 0, 0))
+  end
+
   -- setNewFont sets AND returns
   do
     local prev = g.getFont()

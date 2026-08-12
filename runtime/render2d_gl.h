@@ -56,6 +56,31 @@ int  wcl_r2d_sprite(const void *pixels, int sw, int sh,
 /* Scissor rect in cart pixels; w<0 disables. */
 void wcl_r2d_scissor(int x, int y, int w, int h);
 
+/* ── stencil (love.graphics.stencil / setStencilTest) ─────────────────
+ *
+ * Masking to a NON-RECTANGULAR region, which scissor cannot express: a
+ * circular spotlight, a curved health bar, a torn page edge.
+ *
+ * wcl_r2d_stencil_begin masks off colour writes and points the stencil op
+ * at `value`, so whatever the caller draws next lands only in the stencil
+ * buffer. wcl_r2d_stencil_end restores colour writes. wcl_r2d_stencil_test
+ * then keeps or rejects later fragments by comparing against it.
+ *
+ * Costs nothing when unused: the stencil renderbuffer is allocated lazily
+ * on a canvas's FIRST stencil call, GL_STENCIL_TEST is only enabled while
+ * a test is live, and no branch was added to the batched draw path.
+ *
+ * begin() returns 0 when no stencil buffer is obtainable, so the caller
+ * can refuse loudly instead of drawing an unmasked frame.
+ *
+ * action:  0 replace, 1 increment, 2 decrement, 3 invert,
+ *          4 incrementwrap, 5 decrementwrap
+ * compare: 0 off, 1 equal, 2 notequal, 3 less, 4 lequal, 5 greater,
+ *          6 gequal */
+int  wcl_r2d_stencil_begin(int action, int value);
+void wcl_r2d_stencil_end(void);
+void wcl_r2d_stencil_test(int compare, int value);
+
 /* Fill a CONVEX polygon as a triangle fan. Returns 0 for a concave one --
  * a fan would cover area outside it -- so the caller falls back. */
 int  wcl_r2d_poly(const double *xs, const double *ys, int n,
@@ -186,6 +211,13 @@ static inline int wcl_r2d_sprite(const void *pixels, int sw, int sh,
 }
 static inline void wcl_r2d_scissor(int x, int y, int w, int h) {
     (void)x; (void)y; (void)w; (void)h;
+}
+static inline int wcl_r2d_stencil_begin(int action, int value) {
+    (void)action; (void)value; return 0;
+}
+static inline void wcl_r2d_stencil_end(void) {}
+static inline void wcl_r2d_stencil_test(int compare, int value) {
+    (void)compare; (void)value;
 }
 static inline void wcl_r2d_blend_add(int on) { (void)on; }
 static inline int wcl_r2d_circle(int cx, int cy, int r, uint32_t color, int alpha) {
