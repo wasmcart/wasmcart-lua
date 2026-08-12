@@ -69,10 +69,25 @@ const love = readFileSync(join(HERE, "love-api.txt"), "utf8")
   .map((l) => l.trim())
   .filter(Boolean);
 
-// Functions this engine has that LOVE does not. Not padding for the score:
-// they are listed separately and excluded from the percentage, because a
-// cart author needs to know which calls will NOT port back to desktop LOVE.
-const extras = [...ours].filter((f) => !love.includes(f)).sort();
+// Functions this engine has that the DENOMINATOR does not list.
+//
+// Two very different things end up here and must not be conflated:
+//
+//   * genuine extensions (wc.*, love.log, love.net.*) -- a cart using one
+//     will NOT port back to desktop LOVE, which is what an author needs
+//     warning about.
+//   * ordinary LOVE object methods (Canvas:getWidth, Text:getFont, ...)
+//     that simply are not enumerated by libretro's lutro-status list. These
+//     exist in real LOVE and port fine; they are "beyond the list", not
+//     beyond LOVE, and calling them extensions would be a lie in the
+//     flattering direction.
+//
+// Split on whether the name looks like Module.Type.method, which is how
+// the enumerator spells object methods.
+const allExtras = [...ours].filter((f) => !love.includes(f)).sort();
+const isObjectMethod = (f) => /^love\.[a-z]+\.[A-Z]\w*\.\w+$/.test(f);
+const extras = allExtras.filter((f) => !isObjectMethod(f));
+const objectMethods = allExtras.filter(isObjectMethod);
 
 const moduleOf = (f) => {
   const p = f.split(".");
@@ -155,16 +170,34 @@ if (refusedList.length) {
   lines.push("");
 }
 
+if (objectMethods.length) {
+  lines.push("## Object methods (real LOVE, not in the denominator)");
+  lines.push("");
+  lines.push(`${objectMethods.length} methods on objects this engine returns --`);
+  lines.push("`Canvas:getWidth`, `Text:getFont` and the like. These exist in desktop");
+  lines.push("LOVE and port fine; they are simply not enumerated by the lutro-status");
+  lines.push("list used as the denominator, so counting them would inflate the score");
+  lines.push("against a yardstick that never measured them.");
+  lines.push("");
+  lines.push("<details><summary>show all</summary>");
+  lines.push("");
+  for (const fn of objectMethods) lines.push(`- \`${fn}\``);
+  lines.push("");
+  lines.push("</details>");
+  lines.push("");
+}
+
 if (extras.length) {
   lines.push("## Beyond LOVE");
   lines.push("");
-  lines.push("Functions this engine adds. **These do not exist in desktop LOVE**, so a");
-  lines.push("cart using them is not portable back to it. Excluded from the");
-  lines.push("percentage above.");
+  lines.push("Genuine extensions. **These do not exist in desktop LOVE**, so a cart");
+  lines.push("using them is not portable back to it. Excluded from the percentage");
+  lines.push("above.");
   lines.push("");
   for (const fn of extras) lines.push(`- \`${fn}\``);
   lines.push("");
 }
 
 writeFileSync(outPath, lines.join("\n"));
-console.log(`${outPath}: ${have}/${love.length} (${pct}%), ${extras.length} beyond LOVE`);
+console.log(`${outPath}: ${have}/${love.length} (${pct}%), ` +
+            `${extras.length} extensions, ${objectMethods.length} object methods`);

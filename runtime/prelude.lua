@@ -235,6 +235,7 @@ end
 
 local SpriteBatch
 local ParticleSystem
+local Text
 local Mesh
 local Mesh3D
 local new_mesh_3d
@@ -260,6 +261,25 @@ function Image:isReadable() return true end
 function Image:getMSAA() return 0 end
 function Image:getTextureType() return "2d" end
 function Image:getMipmapMode() return "none" end
+
+-- Canvas:renderTo(fn, ...) -- draw into this canvas, then restore.
+--
+-- The value over setCanvas/setCanvas() by hand is that the previous target
+-- is RESTORED rather than reset to the screen. Nested renderTo is common
+-- (a canvas built from another canvas), and a plain setCanvas() at the end
+-- of the inner one would silently drop the outer target on the floor.
+--
+-- pcall so a throwing callback cannot leave the canvas bound for the rest
+-- of the frame -- which paints every later draw into the wrong target and
+-- looks like the screen froze.
+function Image:renderTo(fn, ...)
+  if type(fn) ~= "function" then return end
+  local prev = graphics.getCanvas and graphics.getCanvas() or nil
+  graphics.setCanvas(self)
+  local ok, err = pcall(fn, ...)
+  if prev then graphics.setCanvas(prev) else graphics.setCanvas() end
+  if not ok then error(err, 2) end
+end
 function Image:getMipmapCount() return 1 end
 function Image:getDepth() return 1 end
 function Image:getLayerCount() return 1 end
@@ -640,6 +660,66 @@ end
 
 function graphics.getCanvas() return cur_canvas end
 
+-- ── capability queries ─────────────────────────────────────────────
+--
+-- Libraries probe these ON STARTUP to pick a code path, so a missing one
+-- is a nil-index crash before the game draws a single frame. They are
+-- cheap to answer honestly and expensive to be wrong about: claiming a
+-- feature we lack sends a library down a path that then fails obscurely.
+
+function graphics.getSupported()
+  return {
+    -- real, and exercised by test/shaders and test/gpu3d
+    glsl3          = true,
+    instancing     = true,
+    multicanvas    = true,
+    fullnpot       = true,
+    pixelshaderhighp = true,
+    -- NOT implemented. Said plainly so a library picks its fallback
+    -- rather than discovering the gap mid-render.
+    clampzero      = false,
+    lighten        = false,
+    texelbuffer    = false,
+    indexbuffer32  = false,
+    copybuffer     = false,
+    copytexturetobuffer = false,
+    glsl4          = false,
+  }
+end
+
+function graphics.getTextureTypes()
+  return { ["2d"] = true, cube = true, array = false, volume = false }
+end
+
+function graphics.getImageFormats()
+  -- Mirrors getCanvasFormats for the plain readable formats a cart can
+  -- actually create an image in.
+  return { normal = true, rgba8 = true, r8 = true, rg8 = true,
+           rgba16f = true, rgba32f = true }
+end
+
+-- Gamma-correct rendering is OFF: the framebuffer is plain 8-bit sRGB and
+-- nothing linearises on write. love.math.gammaToLinear exists for carts
+-- that want to do it themselves.
+function graphics.isGammaCorrect() return false end
+
+-- Wireframe is not implemented. Report it rather than pretending, and
+-- make the setter a no-op instead of an error so a debug key that toggles
+-- it does not take the game down.
+local wireframe = false
+function graphics.setWireframe(v) wireframe = v and true or false end
+function graphics.isWireframe() return false end
+
+-- discard() hints that the current target's contents can be thrown away
+-- instead of loaded. That is a bandwidth optimisation for tiled GPUs; here
+-- there is nothing to discard, and a no-op is CORRECT rather than a stub --
+-- the visible result is identical either way.
+function graphics.discard() end
+
+-- flushBatch forces pending draws out. Nothing is buffered across calls
+-- here, so this is likewise genuinely a no-op.
+function graphics.flushBatch() end
+
 -- draw(image, [quad], x, y, r, sx, sy, ox, oy)
 -- Drawing a GPU render target as an IMAGE.
 --
@@ -744,6 +824,12 @@ function graphics.draw(img, a, b, c, d, e, f, g, h)
   -- image table and find someone else's texture.
   if getmetatable(img) == Canvas3D then
     draw_gpu_target(img, a, b, c, d, e, f, g)
+    return
+  end
+
+  -- a Text object draws its own pre-wrapped lines
+  if getmetatable(img) == Text then
+    img:draw(a, b, c, d, e, f, g)
     return
   end
 
@@ -1219,6 +1305,15 @@ function graphics.newFont(a, b)
 end
 
 function graphics.setFont(f) cur_font = f end
+
+-- setNewFont(...) == setFont(newFont(...)), and RETURNS the font. Games
+-- use it as a one-liner at startup; the return value is what they keep to
+-- measure text with later.
+function graphics.setNewFont(a, b)
+  local f = graphics.newFont(a, b)
+  cur_font = f
+  return f
+end
 function graphics.getFont()
   if not cur_font then cur_font = graphics.newFont(12) end
   return cur_font
@@ -1273,6 +1368,135 @@ function graphics.printf(text, x, y, limit, align)
     local px = x or 0
     if align == "center" then px = px + (limit - lw) / 2
     elseif align == "right" then px = px + limit - lw end
+    local ax, ay = apply(px, y or 0)
+    wc.print(line, ax, ay + (i - 1) * lineH, f.id, f.scale)
+  end
+end
+
+-- ── Text objects ──────────────────────────────────────────────────
+--
+-- love.graphics.newText holds a string and draws it as one object. In real
+-- LOVE it is a genuine optimisation: the glyph quads are baked once into a
+-- vertex buffer instead of re-laid-out every frame.
+--
+-- Here the win is smaller but real -- the WRAP is computed once at set()
+-- time rather than per draw, and printf's greedy word-wrap over a long
+-- string is the expensive part, not the blit. More importantly, games use
+-- Text objects for their measurement API (getWidth/getHeight on wrapped
+-- text is otherwise painful to compute) and for setf's alignment.
+Text = {}                    -- declared up top; see the forward-decl note
+Text.__index = Text
+
+-- Lay a string out into lines, honouring an optional wrap limit. Shared
+-- with printf's algorithm deliberately: two different wrap rules in one
+-- engine means text measured with one and drawn with the other disagrees.
+local function layoutText(font, str, limit, align)
+  local lines = {}
+  str = tostring(str)
+  if limit then
+    for paragraph in (str .. "\n"):gmatch("([^\n]*)\n") do
+      if paragraph == "" then
+        lines[#lines + 1] = ""
+      else
+        local cur = nil
+        for word in paragraph:gmatch("%S+") do
+          local try = cur and (cur .. " " .. word) or word
+          if wc.text_size(try, font.id, font.scale) <= limit or not cur then
+            cur = try
+          else
+            lines[#lines + 1] = cur
+            cur = word
+          end
+        end
+        if cur then lines[#lines + 1] = cur end
+      end
+    end
+  else
+    for line in (str .. "\n"):gmatch("([^\n]*)\n") do
+      lines[#lines + 1] = line
+    end
+  end
+  return lines
+end
+
+local function textRemeasure(t)
+  local w = 0
+  for _, line in ipairs(t.lines) do
+    local lw = wc.text_size(line, t.font.id, t.font.scale)
+    if lw > w then w = lw end
+  end
+  t.w = t.limit or w
+  t.rawW = w
+  t.h = math.max(1, #t.lines) * (t.font.px * 1.2)
+end
+
+function graphics.newText(font, str)
+  local t = setmetatable({ font = font or graphics.getFont(),
+                           lines = {}, w = 0, rawW = 0, h = 0,
+                           limit = nil, align = "left" }, Text)
+  if str then t:set(str) end
+  return t
+end
+
+function Text:set(str)
+  if str == nil or str == "" then
+    self.lines, self.limit, self.align = {}, nil, "left"
+    self.w, self.rawW, self.h = 0, 0, 0
+    return
+  end
+  self.limit, self.align = nil, "left"
+  self.lines = layoutText(self.font, str, nil, "left")
+  textRemeasure(self)
+end
+
+function Text:setf(str, limit, align)
+  if str == nil or str == "" then
+    self.lines = {}
+    self.w, self.rawW, self.h = 0, 0, 0
+    return
+  end
+  self.limit, self.align = limit, align or "left"
+  self.lines = layoutText(self.font, str, limit, self.align)
+  textRemeasure(self)
+end
+
+function Text:add(str, x, y)
+  -- LOVE appends and returns an index. Appending as its own line keeps
+  -- measurement honest; a game using add() for inline runs would need the
+  -- real vertex-buffer version, and this at least does not lie about size.
+  local extra = layoutText(self.font, str, nil, "left")
+  for _, l in ipairs(extra) do self.lines[#self.lines + 1] = l end
+  textRemeasure(self)
+  return #self.lines
+end
+Text.addf = Text.add
+
+function Text:clear()
+  self.lines = {}
+  self.w, self.rawW, self.h = 0, 0, 0
+end
+
+function Text:getWidth()  return self.w end
+function Text:getHeight() return self.h end
+function Text:getDimensions() return self.w, self.h end
+function Text:getFont() return self.font end
+function Text:setFont(f)
+  self.font = f
+  textRemeasure(self)
+end
+function Text:type() return "Text" end
+
+function Text:draw(x, y, r, sx, sy, ox, oy)
+  local f = self.font
+  local lineH = f.px * 1.2
+  local limit = self.limit
+  for i, line in ipairs(self.lines) do
+    local lw = wc.text_size(line, f.id, f.scale)
+    local px = x or 0
+    if limit then
+      if self.align == "center" then px = px + (limit - lw) / 2
+      elseif self.align == "right" then px = px + limit - lw end
+    end
     local ax, ay = apply(px, y or 0)
     wc.print(line, ax, ay + (i - 1) * lineH, f.id, f.scale)
   end
@@ -1418,6 +1642,28 @@ end
 function graphics.getScissor()
   if not sc_rect then return nil end
   return sc_rect[1], sc_rect[2], sc_rect[3], sc_rect[4]
+end
+
+-- Clip to the INTERSECTION of the current scissor and this rect.
+--
+-- The nesting primitive: a UI library clips to a panel, then a widget
+-- inside it clips to its own bounds and must not be able to draw outside
+-- the panel. Plain setScissor would let the inner one widen the clip,
+-- which is the bug that puts a dropdown outside its own window.
+--
+-- With no scissor set, LOVE treats this as a plain setScissor.
+function graphics.intersectScissor(x, y, w, h)
+  if not x then return graphics.setScissor() end
+  if not sc_rect then return graphics.setScissor(x, y, w, h) end
+  local ax, ay, aw, ah = sc_rect[1], sc_rect[2], sc_rect[3], sc_rect[4]
+  local x1 = math.max(ax, x)
+  local y1 = math.max(ay, y)
+  local x2 = math.min(ax + aw, x + w)
+  local y2 = math.min(ay + ah, y + h)
+  -- A non-overlapping intersection is EMPTY, not "unclipped". Clamping to
+  -- zero rather than letting w/h go negative is what stops a disjoint
+  -- clip from drawing the whole screen.
+  graphics.setScissor(x1, y1, math.max(0, x2 - x1), math.max(0, y2 - y1))
 end
 
 -- Line width is not implemented by the rasterizer (all lines are 1px), but

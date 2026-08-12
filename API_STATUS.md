@@ -13,7 +13,7 @@ To regenerate:
 node tools/apistatus/gen-status.mjs api-dump.txt
 ```
 
-**216 of 320 LOVE functions implemented (68%).**
+**230 of 320 LOVE functions implemented (72%).**
 
 A caveat worth stating plainly: this table measures PRESENCE. A
 function can be exported and still be wrong. `test/apiconform/`
@@ -33,7 +33,7 @@ list, so this percentage and Lutro's are directly comparable.
 | `love.event` | 5 | 6 | 83% |
 | `love.filesystem` | 14 | 31 | 45% |
 | `love.font` | 1 | 5 | 20% |
-| `love.graphics` | 85 | 105 | 81% |
+| `love.graphics` | 99 | 105 | 94% |
 | `love.image` | 3 | 3 | 100% |
 | `love.joystick` | 2 | 6 | 33% |
 | `love.keyboard` | 9 | 9 | 100% |
@@ -162,26 +162,26 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_check_mark: | `love.font.newRasterizer` |
 | :white_medium_square: | `love.font.newTrueTypeRasterizer` |
 
-### `love.graphics` — 85/105
+### `love.graphics` — 99/105
 
 | | function |
 |---|---|
 | :white_medium_square: | `love.graphics.Canvas.generateMipmaps` |
-| :white_medium_square: | `love.graphics.Canvas.getMSAA` |
-| :white_medium_square: | `love.graphics.Canvas.getMipmapMode` |
+| :white_check_mark: | `love.graphics.Canvas.getMSAA` |
+| :white_check_mark: | `love.graphics.Canvas.getMipmapMode` |
 | :white_medium_square: | `love.graphics.Canvas.newImageData` |
-| :white_medium_square: | `love.graphics.Canvas.renderTo` |
+| :white_check_mark: | `love.graphics.Canvas.renderTo` |
 | :white_check_mark: | `love.graphics.applyTransform` |
 | :white_check_mark: | `love.graphics.arc` |
 | :white_check_mark: | `love.graphics.captureScreenshot` |
 | :white_check_mark: | `love.graphics.circle` |
 | :white_check_mark: | `love.graphics.clear` |
-| :white_medium_square: | `love.graphics.discard` |
+| :white_check_mark: | `love.graphics.discard` |
 | :white_check_mark: | `love.graphics.draw` |
 | :white_check_mark: | `love.graphics.drawInstanced` |
 | :white_medium_square: | `love.graphics.drawLayer` |
 | :white_check_mark: | `love.graphics.ellipse` |
-| :white_medium_square: | `love.graphics.flushBatch` |
+| :white_check_mark: | `love.graphics.flushBatch` |
 | :white_check_mark: | `love.graphics.getBackgroundColor` |
 | :white_check_mark: | `love.graphics.getBlendMode` |
 | :white_check_mark: | `love.graphics.getCanvas` |
@@ -195,7 +195,7 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_check_mark: | `love.graphics.getFont` |
 | :white_check_mark: | `love.graphics.getFrontFaceWinding` |
 | :white_check_mark: | `love.graphics.getHeight` |
-| :white_medium_square: | `love.graphics.getImageFormats` |
+| :white_check_mark: | `love.graphics.getImageFormats` |
 | :white_check_mark: | `love.graphics.getLineJoin` |
 | :white_check_mark: | `love.graphics.getLineStyle` |
 | :white_check_mark: | `love.graphics.getLineWidth` |
@@ -210,15 +210,15 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_check_mark: | `love.graphics.getStackDepth` |
 | :white_check_mark: | `love.graphics.getStats` |
 | :white_check_mark: | `love.graphics.getStencilTest` |
-| :white_medium_square: | `love.graphics.getSupported` |
+| :white_check_mark: | `love.graphics.getSupported` |
 | :white_check_mark: | `love.graphics.getSystemLimits` |
-| :white_medium_square: | `love.graphics.getTextureTypes` |
+| :white_check_mark: | `love.graphics.getTextureTypes` |
 | :white_check_mark: | `love.graphics.getWidth` |
-| :white_medium_square: | `love.graphics.intersectScissor` |
+| :white_check_mark: | `love.graphics.intersectScissor` |
 | :white_check_mark: | `love.graphics.inverseTransformPoint` |
 | :white_check_mark: | `love.graphics.isActive` |
-| :white_medium_square: | `love.graphics.isGammaCorrect` |
-| :white_medium_square: | `love.graphics.isWireframe` |
+| :white_check_mark: | `love.graphics.isGammaCorrect` |
+| :white_check_mark: | `love.graphics.isWireframe` |
 | :white_check_mark: | `love.graphics.line` |
 | :white_check_mark: | `love.graphics.newArrayImage` |
 | :white_check_mark: | `love.graphics.newCanvas` |
@@ -231,7 +231,7 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_check_mark: | `love.graphics.newQuad` |
 | :white_check_mark: | `love.graphics.newShader` |
 | :white_check_mark: | `love.graphics.newSpriteBatch` |
-| :white_medium_square: | `love.graphics.newText` |
+| :white_check_mark: | `love.graphics.newText` |
 | :white_check_mark: | `love.graphics.newVideo` |
 | :white_check_mark: | `love.graphics.newVolumeImage` |
 | :white_check_mark: | `love.graphics.origin` |
@@ -260,12 +260,12 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_check_mark: | `love.graphics.setLineStyle` |
 | :white_check_mark: | `love.graphics.setLineWidth` |
 | :white_check_mark: | `love.graphics.setMeshCullMode` |
-| :white_medium_square: | `love.graphics.setNewFont` |
+| :white_check_mark: | `love.graphics.setNewFont` |
 | :white_check_mark: | `love.graphics.setPointSize` |
 | :white_check_mark: | `love.graphics.setScissor` |
 | :white_check_mark: | `love.graphics.setShader` |
 | :white_medium_square: | `love.graphics.setStencilTest` |
-| :white_medium_square: | `love.graphics.setWireframe` |
+| :white_check_mark: | `love.graphics.setWireframe` |
 | :white_check_mark: | `love.graphics.shear` |
 | :white_medium_square: | `love.graphics.stencil` |
 | :white_check_mark: | `love.graphics.transformPoint` |
@@ -481,11 +481,144 @@ implemented and are excluded from the count above.
 | `love.physics.newGearJoint` | Box2D 3.x removed the gear joint; no primitive to build one on |
 | `love.physics.newPulleyJoint` | Box2D 3.x removed the pulley joint; no primitive to build one on |
 
+## Object methods (real LOVE, not in the denominator)
+
+120 methods on objects this engine returns --
+`Canvas:getWidth`, `Text:getFont` and the like. These exist in desktop
+LOVE and port fine; they are simply not enumerated by the lutro-status
+list used as the denominator, so counting them would inflate the score
+against a yardstick that never measured them.
+
+<details><summary>show all</summary>
+
+- `love.graphics.Canvas.getDepth`
+- `love.graphics.Canvas.getDimensions`
+- `love.graphics.Canvas.getFilter`
+- `love.graphics.Canvas.getFormat`
+- `love.graphics.Canvas.getHeight`
+- `love.graphics.Canvas.getLayerCount`
+- `love.graphics.Canvas.getMipmapCount`
+- `love.graphics.Canvas.getTextureType`
+- `love.graphics.Canvas.getWidth`
+- `love.graphics.Canvas.getWrap`
+- `love.graphics.Canvas.isReadable`
+- `love.graphics.Canvas.release`
+- `love.graphics.Canvas.setFilter`
+- `love.graphics.Canvas.setWrap`
+- `love.graphics.Canvas.type`
+- `love.graphics.Font.getHeight`
+- `love.graphics.Font.getWidth`
+- `love.graphics.Font.type`
+- `love.graphics.Image.getDepth`
+- `love.graphics.Image.getDimensions`
+- `love.graphics.Image.getFilter`
+- `love.graphics.Image.getFormat`
+- `love.graphics.Image.getHeight`
+- `love.graphics.Image.getLayerCount`
+- `love.graphics.Image.getMSAA`
+- `love.graphics.Image.getMipmapCount`
+- `love.graphics.Image.getMipmapMode`
+- `love.graphics.Image.getTextureType`
+- `love.graphics.Image.getWidth`
+- `love.graphics.Image.getWrap`
+- `love.graphics.Image.isReadable`
+- `love.graphics.Image.release`
+- `love.graphics.Image.renderTo`
+- `love.graphics.Image.setFilter`
+- `love.graphics.Image.setWrap`
+- `love.graphics.Image.type`
+- `love.graphics.ParticleSystem.clone`
+- `love.graphics.ParticleSystem.draw`
+- `love.graphics.ParticleSystem.emit`
+- `love.graphics.ParticleSystem.getBufferSize`
+- `love.graphics.ParticleSystem.getColors`
+- `love.graphics.ParticleSystem.getCount`
+- `love.graphics.ParticleSystem.getDirection`
+- `love.graphics.ParticleSystem.getEmissionArea`
+- `love.graphics.ParticleSystem.getEmissionRate`
+- `love.graphics.ParticleSystem.getInsertMode`
+- `love.graphics.ParticleSystem.getLinearAcceleration`
+- `love.graphics.ParticleSystem.getLinearDamping`
+- `love.graphics.ParticleSystem.getOffset`
+- `love.graphics.ParticleSystem.getParticleLifetime`
+- `love.graphics.ParticleSystem.getPosition`
+- `love.graphics.ParticleSystem.getQuads`
+- `love.graphics.ParticleSystem.getRadialAcceleration`
+- `love.graphics.ParticleSystem.getRotation`
+- `love.graphics.ParticleSystem.getSizeVariation`
+- `love.graphics.ParticleSystem.getSizes`
+- `love.graphics.ParticleSystem.getSpeed`
+- `love.graphics.ParticleSystem.getSpin`
+- `love.graphics.ParticleSystem.getSpinVariation`
+- `love.graphics.ParticleSystem.getSpread`
+- `love.graphics.ParticleSystem.getTangentialAcceleration`
+- `love.graphics.ParticleSystem.getTexture`
+- `love.graphics.ParticleSystem.hasRelativeRotation`
+- `love.graphics.ParticleSystem.isActive`
+- `love.graphics.ParticleSystem.isPaused`
+- `love.graphics.ParticleSystem.isStopped`
+- `love.graphics.ParticleSystem.moveTo`
+- `love.graphics.ParticleSystem.pause`
+- `love.graphics.ParticleSystem.reset`
+- `love.graphics.ParticleSystem.setBufferSize`
+- `love.graphics.ParticleSystem.setColors`
+- `love.graphics.ParticleSystem.setDirection`
+- `love.graphics.ParticleSystem.setEmissionArea`
+- `love.graphics.ParticleSystem.setEmissionRate`
+- `love.graphics.ParticleSystem.setInsertMode`
+- `love.graphics.ParticleSystem.setLinearAcceleration`
+- `love.graphics.ParticleSystem.setLinearDamping`
+- `love.graphics.ParticleSystem.setOffset`
+- `love.graphics.ParticleSystem.setParticleLifetime`
+- `love.graphics.ParticleSystem.setPosition`
+- `love.graphics.ParticleSystem.setQuads`
+- `love.graphics.ParticleSystem.setRadialAcceleration`
+- `love.graphics.ParticleSystem.setRelativeRotation`
+- `love.graphics.ParticleSystem.setRotation`
+- `love.graphics.ParticleSystem.setSizeVariation`
+- `love.graphics.ParticleSystem.setSizes`
+- `love.graphics.ParticleSystem.setSpeed`
+- `love.graphics.ParticleSystem.setSpin`
+- `love.graphics.ParticleSystem.setSpinVariation`
+- `love.graphics.ParticleSystem.setSpread`
+- `love.graphics.ParticleSystem.setTangentialAcceleration`
+- `love.graphics.ParticleSystem.setTexture`
+- `love.graphics.ParticleSystem.start`
+- `love.graphics.ParticleSystem.stop`
+- `love.graphics.ParticleSystem.type`
+- `love.graphics.ParticleSystem.update`
+- `love.graphics.Quad.getViewport`
+- `love.graphics.Quad.setViewport`
+- `love.graphics.Quad.type`
+- `love.graphics.SpriteBatch.add`
+- `love.graphics.SpriteBatch.clear`
+- `love.graphics.SpriteBatch.flush`
+- `love.graphics.SpriteBatch.getCount`
+- `love.graphics.SpriteBatch.getTexture`
+- `love.graphics.SpriteBatch.set`
+- `love.graphics.SpriteBatch.setColor`
+- `love.graphics.SpriteBatch.setTexture`
+- `love.graphics.SpriteBatch.type`
+- `love.graphics.Text.add`
+- `love.graphics.Text.addf`
+- `love.graphics.Text.clear`
+- `love.graphics.Text.draw`
+- `love.graphics.Text.getDimensions`
+- `love.graphics.Text.getFont`
+- `love.graphics.Text.getHeight`
+- `love.graphics.Text.getWidth`
+- `love.graphics.Text.set`
+- `love.graphics.Text.setFont`
+- `love.graphics.Text.setf`
+- `love.graphics.Text.type`
+
+</details>
+
 ## Beyond LOVE
 
-Functions this engine adds. **These do not exist in desktop LOVE**, so a
-cart using them is not portable back to it. Excluded from the
-percentage above.
+Genuine extensions. **These do not exist in desktop LOVE**, so a cart
+using them is not portable back to it. Excluded from the percentage
+above.
 
 - `love.audio.beep`
 - `love.debugValue`

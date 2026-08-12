@@ -583,6 +583,142 @@ local function run()
        ("%.1f,%.1f"):format(ps.parts[1].x, ps.parts[1].y))
   end
 
+  -- ── intersectScissor ──────────────────────────────────────────────
+  --
+  -- The nesting primitive: a UI library clips to a panel, then a widget
+  -- clips to its own bounds and MUST NOT be able to widen the clip back
+  -- out. Asserted on the resulting rect, since a wrong intersection draws
+  -- perfectly and just puts a dropdown outside its window.
+  do
+    g.setScissor(100, 100, 200, 200)
+    g.intersectScissor(150, 150, 200, 200)          -- overlaps bottom-right
+    local sx, sy, sw, sh = g.getScissor()
+    ok("intersectScissor clips to the overlap",
+       sx == 150 and sy == 150 and sw == 150 and sh == 150,
+       ("%s,%s,%s,%s"):format(sx, sy, sw, sh))
+
+    -- an inner rect LARGER than the outer must not widen it
+    g.setScissor(100, 100, 50, 50)
+    g.intersectScissor(0, 0, 500, 500)
+    local _, _, w2, h2 = g.getScissor()
+    ok("intersectScissor never widens", w2 == 50 and h2 == 50,
+       ("%s,%s"):format(w2, h2))
+
+    -- DISJOINT rects must give an EMPTY clip, not a negative size that
+    -- wraps around and draws everything
+    g.setScissor(0, 0, 10, 10)
+    g.intersectScissor(500, 500, 10, 10)
+    local _, _, w3, h3 = g.getScissor()
+    ok("disjoint intersect is empty, not negative", w3 == 0 and h3 == 0,
+       ("%s,%s"):format(w3, h3))
+
+    -- with no scissor set it behaves as a plain setScissor
+    g.setScissor()
+    g.intersectScissor(20, 30, 40, 50)
+    local ix, iy, iw, ih = g.getScissor()
+    ok("intersectScissor with no prior clip sets it",
+       ix == 20 and iy == 30 and iw == 40 and ih == 50,
+       ("%s,%s,%s,%s"):format(ix, iy, iw, ih))
+    g.setScissor()
+  end
+
+  -- ── Canvas:renderTo ───────────────────────────────────────────────
+  --
+  -- The value over setCanvas by hand is that it RESTORES the previous
+  -- target rather than resetting to the screen, so nesting works.
+  do
+    local outer = g.newCanvas(32, 32)
+    local inner = g.newCanvas(16, 16)
+    local ran = false
+    ok("renderTo leaves no canvas bound afterwards", (function()
+      outer:renderTo(function() ran = true end)
+      return g.getCanvas() == nil
+    end)())
+    ok("renderTo actually ran the callback", ran)
+
+    -- NESTED: the inner renderTo must put us back on `outer`, not screen
+    local seenInside
+    outer:renderTo(function()
+      inner:renderTo(function() end)
+      seenInside = g.getCanvas()          -- must still be outer
+    end)
+    ok("nested renderTo restores the outer canvas", seenInside == outer,
+       tostring(seenInside))
+    ok("nested renderTo still ends on the screen", g.getCanvas() == nil)
+
+    -- a THROWING callback must not leave the canvas bound for the frame
+    local threw = not pcall(function()
+      outer:renderTo(function() error("boom") end)
+    end)
+    ok("renderTo propagates the error", threw)
+    ok("renderTo unbinds even when the callback throws", g.getCanvas() == nil,
+       tostring(g.getCanvas()))
+  end
+
+  -- ── newText ───────────────────────────────────────────────────────
+  do
+    local f = g.newFont(16)
+    local t = g.newText(f, "hello")
+    ok("newText reports its type", t:type() == "Text", t:type())
+    ok("text has a width", t:getWidth() > 0, t:getWidth())
+    ok("text has a height", t:getHeight() > 0, t:getHeight())
+    ok("text keeps its font", t:getFont() == f)
+
+    -- a LONGER string must measure wider. This is the assertion that
+    -- catches a Text object that stores the string and measures nothing.
+    local wShort = t:getWidth()
+    t:set("hello there this is much longer")
+    ok("longer string measures wider", t:getWidth() > wShort,
+       ("%s -> %s"):format(wShort, t:getWidth()))
+
+    -- clear must zero it
+    t:clear()
+    ok("clear empties the text", t:getWidth() == 0 and t:getHeight() == 0,
+       ("%s,%s"):format(t:getWidth(), t:getHeight()))
+
+    -- setf WRAPS: a narrow limit must produce more height than a wide one
+    t:setf("the quick brown fox jumps over the lazy dog", 400, "left")
+    local hWide = t:getHeight()
+    t:setf("the quick brown fox jumps over the lazy dog", 80, "left")
+    local hNarrow = t:getHeight()
+    ok("narrower wrap is taller", hNarrow > hWide,
+       ("wide %s, narrow %s"):format(hWide, hNarrow))
+    ok("wrapped width reports the limit", t:getWidth() == 80, t:getWidth())
+  end
+
+  -- ── capability queries ────────────────────────────────────────────
+  --
+  -- Libraries probe these at STARTUP to choose a code path, so a missing
+  -- one crashes before the first frame. They must also be honest: saying
+  -- yes to something absent sends the library down a path that fails
+  -- obscurely later.
+  do
+    local sup = g.getSupported()
+    ok("getSupported returns a table", type(sup) == "table")
+    ok("getSupported reports glsl3", sup.glsl3 == true, tostring(sup.glsl3))
+    ok("getSupported admits missing features", sup.glsl4 == false,
+       tostring(sup.glsl4))
+    local tt = g.getTextureTypes()
+    ok("getTextureTypes reports 2d", tt["2d"] == true)
+    ok("getTextureTypes admits no volume textures", tt.volume == false)
+    ok("getImageFormats returns a table", type(g.getImageFormats()) == "table")
+    ok("isGammaCorrect is false here", g.isGammaCorrect() == false)
+    ok("isWireframe is false", g.isWireframe() == false)
+    -- the no-ops must not throw
+    ok("setWireframe does not throw", pcall(g.setWireframe, true))
+    ok("discard does not throw", pcall(g.discard))
+    ok("flushBatch does not throw", pcall(g.flushBatch))
+  end
+
+  -- setNewFont sets AND returns
+  do
+    local prev = g.getFont()
+    local nf = g.setNewFont(20)
+    ok("setNewFont returns the font", nf ~= nil and nf.type and nf:type() == "Font")
+    ok("setNewFont makes it current", g.getFont() == nf)
+    g.setFont(prev)
+  end
+
   -- The two joints Box2D 3.x removed must REFUSE, not silently no-op.
   -- A fake gear joint that quietly did nothing is the exact failure this
   -- whole section exists to prevent.
