@@ -234,6 +234,7 @@ end
 -- image path.
 
 local SpriteBatch
+local ParticleSystem
 local Mesh
 local Mesh3D
 local new_mesh_3d
@@ -746,6 +747,13 @@ function graphics.draw(img, a, b, c, d, e, f, g, h)
     return
   end
 
+  -- a ParticleSystem draws its own live particles, each with its own
+  -- colour and size, so it cannot go through the image path below
+  if getmetatable(img) == ParticleSystem then
+    img:draw(a, b)
+    return
+  end
+
   -- a SpriteBatch replays its entries, offset by the batch's own transform
   if getmetatable(img) == SpriteBatch then
     local bx, by = a or 0, b or 0
@@ -857,6 +865,336 @@ function SpriteBatch:type() return "SpriteBatch" end
 function graphics.newSpriteBatch(img, maxsprites)
   return setmetatable({ image = img, items = {}, n = 0 }, SpriteBatch)
 end
+
+-- ParticleSystem
+--
+-- The gap with a real user: Jewels hand-rolled a pooled emitter precisely
+-- because this was missing, and every LOVE game that ports over expects it
+-- for smoke, sparks, fire and dust.
+--
+-- POOLED AND FIXED-SIZE, deliberately. LOVE's newParticleSystem takes a
+-- buffer size and never exceeds it; emitting past the cap recycles the
+-- OLDEST particle rather than growing. That is what keeps a system that
+-- emits 500/sec from allocating forever, and it is also the behaviour
+-- games tune against -- a system that quietly grew would look different.
+--
+-- Particles are drawn individually rather than through a SpriteBatch,
+-- because SpriteBatch:setColor is a no-op here and per-particle colour is
+-- most of what makes a particle system look like anything.
+ParticleSystem = {}          -- declared up top; see the forward-decl note
+ParticleSystem.__index = ParticleSystem
+
+local function lerp(a, b, t) return a + (b - a) * t end
+
+-- Sample a LOVE-style keyframe list: {c1, c2, c3} interpolated across the
+-- particle's life. Colours are flat groups of 4 in LOVE's own format.
+local function sampleColor(list, t)
+  local n = #list / 4
+  if n < 1 then return 1, 1, 1, 1 end
+  if n == 1 then return list[1], list[2], list[3], list[4] end
+  local pos = t * (n - 1)
+  local i = math.floor(pos)
+  if i >= n - 1 then i = n - 2 end
+  local f = pos - i
+  local a, b = i * 4, (i + 1) * 4
+  return lerp(list[a+1], list[b+1], f), lerp(list[a+2], list[b+2], f),
+         lerp(list[a+3], list[b+3], f), lerp(list[a+4], list[b+4], f)
+end
+
+local function sampleScalar(list, t)
+  local n = #list
+  if n < 1 then return 1 end
+  if n == 1 then return list[1] end
+  local pos = t * (n - 1)
+  local i = math.floor(pos)
+  if i >= n - 1 then i = n - 2 end
+  return lerp(list[i + 1], list[i + 2], pos - i)
+end
+
+function graphics.newParticleSystem(img, buffer)
+  local ps = setmetatable({
+    image = img,
+    max = math.max(1, math.floor(buffer or 1000)),
+    parts = {}, live = 0,
+    emitting = false,
+    rate = 0, emitAccum = 0,
+    life1 = 1, life2 = 1,
+    dir = 0, spread = 0,
+    speed1 = 0, speed2 = 0,
+    lacc1 = 0, lacc2 = 0, aaccX = 0, aaccY = 0,
+    radial1 = 0, radial2 = 0,
+    tanAcc1 = 0, tanAcc2 = 0,
+    damping1 = 0, damping2 = 0,
+    sizes = { 1 }, sizeVar = 0,
+    rot1 = 0, rot2 = 0, spin1 = 0, spin2 = 0, spinVar = 0,
+    colors = { 1, 1, 1, 1 },
+    offX = nil, offY = nil,
+    areaDist = "none", areaX = 0, areaY = 0, areaAngle = 0, areaRel = false,
+    x = 0, y = 0,
+    relativeRotation = false,
+    insertMode = "top",
+    quads = nil,
+  }, ParticleSystem)
+  for i = 1, ps.max do
+    ps.parts[i] = { alive = false, x = 0, y = 0, vx = 0, vy = 0,
+                    life = 0, maxLife = 1, rot = 0, spin = 0,
+                    sizeSeed = 0, quad = 1 }
+  end
+  return ps
+end
+
+local function psRand(a, b) return a + (b - a) * love.math.random() end
+
+-- Bring one particle to life at the emitter.
+local function psSpawn(ps)
+  local p
+  if ps.live < ps.max then
+    ps.live = ps.live + 1
+    p = ps.parts[ps.live]
+  else
+    -- Buffer full: recycle the OLDEST, which is what LOVE does. Growing
+    -- instead would change how a tuned system looks under load.
+    p = ps.parts[1]
+    table.remove(ps.parts, 1)
+    ps.parts[ps.max] = p
+  end
+  p.alive = true
+  p.maxLife = psRand(ps.life1, ps.life2)
+  if p.maxLife <= 0 then p.maxLife = 0.0001 end
+  p.life = p.maxLife
+
+  local ox, oy = ps.x, ps.y
+  -- emission area
+  if ps.areaDist == "uniform" then
+    ox = ox + psRand(-ps.areaX, ps.areaX)
+    oy = oy + psRand(-ps.areaY, ps.areaY)
+  elseif ps.areaDist == "normal" then
+    ox = ox + love.math.randomNormal(ps.areaX, 0)
+    oy = oy + love.math.randomNormal(ps.areaY, 0)
+  elseif ps.areaDist == "ellipse" then
+    local a = love.math.random() * math.pi * 2
+    local r = math.sqrt(love.math.random())
+    ox = ox + math.cos(a) * ps.areaX * r
+    oy = oy + math.sin(a) * ps.areaY * r
+  elseif ps.areaDist == "borderellipse" then
+    local a = love.math.random() * math.pi * 2
+    ox = ox + math.cos(a) * ps.areaX
+    oy = oy + math.sin(a) * ps.areaY
+  end
+  p.x, p.y = ox, oy
+
+  local ang = ps.dir + psRand(-ps.spread / 2, ps.spread / 2)
+  local sp = psRand(ps.speed1, ps.speed2)
+  p.vx, p.vy = math.cos(ang) * sp, math.sin(ang) * sp
+  p.rot = psRand(ps.rot1, ps.rot2)
+  p.spin = psRand(ps.spin1, ps.spin2)
+  p.sizeSeed = love.math.random()
+  p.radial = psRand(ps.radial1, ps.radial2)
+  p.tangential = psRand(ps.tanAcc1, ps.tanAcc2)
+  p.damping = psRand(ps.damping1, ps.damping2)
+  p.lacc = psRand(ps.lacc1, ps.lacc2)
+  if ps.quads then p.quad = love.math.random(#ps.quads) end
+end
+
+function ParticleSystem:update(dt)
+  -- emit
+  if self.emitting and self.rate > 0 then
+    self.emitAccum = self.emitAccum + dt * self.rate
+    while self.emitAccum >= 1 do
+      self.emitAccum = self.emitAccum - 1
+      psSpawn(self)
+    end
+  end
+
+  local i = 1
+  while i <= self.live do
+    local p = self.parts[i]
+    p.life = p.life - dt
+    if p.life <= 0 then
+      p.alive = false
+      -- swap-remove keeps the live prefix dense with no allocation
+      self.parts[i], self.parts[self.live] = self.parts[self.live], self.parts[i]
+      self.live = self.live - 1
+    else
+      -- radial acceleration: away from the emitter
+      local dx, dy = p.x - self.x, p.y - self.y
+      local d = math.sqrt(dx * dx + dy * dy)
+      if d > 1e-6 and (p.radial ~= 0 or p.tangential ~= 0) then
+        local nx, ny = dx / d, dy / d
+        p.vx = p.vx + nx * p.radial * dt
+        p.vy = p.vy + ny * p.radial * dt
+        -- tangential: perpendicular, which is what makes a vortex
+        p.vx = p.vx - ny * p.tangential * dt
+        p.vy = p.vy + nx * p.tangential * dt
+      end
+      p.vx = p.vx + self.aaccX * dt
+      p.vy = p.vy + self.aaccY * dt
+      if p.damping ~= 0 then
+        local f = 1 - p.damping * dt
+        if f < 0 then f = 0 end
+        p.vx, p.vy = p.vx * f, p.vy * f
+      end
+      p.x = p.x + p.vx * dt
+      p.y = p.y + p.vy * dt
+      p.rot = p.rot + p.spin * dt
+      i = i + 1
+    end
+  end
+end
+
+function ParticleSystem:draw(px, py)
+  local img = self.image
+  if not img then return end
+  local ox = self.offX
+  local oy = self.offY
+  if not ox then
+    local w, h = img:getWidth(), img:getHeight()
+    ox, oy = w / 2, h / 2
+  end
+  local bx, by = px or 0, py or 0
+  local pr, pg, pb, pa = graphics.getColor()
+  for i = 1, self.live do
+    local p = self.parts[i]
+    local t = 1 - (p.life / p.maxLife)          -- 0 at birth, 1 at death
+    local cr, cg, cb, ca = sampleColor(self.colors, t)
+    local s = sampleScalar(self.sizes, t)
+    if self.sizeVar > 0 then
+      s = s * (1 + (p.sizeSeed * 2 - 1) * self.sizeVar)
+    end
+    graphics.setColor(cr * pr, cg * pg, cb * pb, ca * pa)
+    graphics.draw(img, bx + p.x, by + p.y, p.rot, s, s, ox, oy)
+  end
+  graphics.setColor(pr, pg, pb, pa)
+end
+
+function ParticleSystem:start()  self.emitting = true end
+function ParticleSystem:stop()   self.emitting = false; self:reset() end
+function ParticleSystem:pause()  self.emitting = false end
+function ParticleSystem:isActive() return self.emitting end
+function ParticleSystem:isPaused() return not self.emitting end
+function ParticleSystem:isStopped() return not self.emitting and self.live == 0 end
+function ParticleSystem:reset()
+  for i = 1, self.max do self.parts[i].alive = false end
+  self.live, self.emitAccum = 0, 0
+end
+function ParticleSystem:emit(n)
+  for _ = 1, (n or 1) do psSpawn(self) end
+end
+function ParticleSystem:getCount() return self.live end
+function ParticleSystem:setBufferSize(n)
+  n = math.max(1, math.floor(n))
+  for i = self.max + 1, n do
+    self.parts[i] = { alive = false, x = 0, y = 0, vx = 0, vy = 0,
+                      life = 0, maxLife = 1, rot = 0, spin = 0,
+                      sizeSeed = 0, quad = 1 }
+  end
+  self.max = n
+  if self.live > n then self.live = n end
+end
+function ParticleSystem:getBufferSize() return self.max end
+
+function ParticleSystem:setEmissionRate(r) self.rate = r end
+function ParticleSystem:getEmissionRate() return self.rate end
+function ParticleSystem:setParticleLifetime(a, b)
+  self.life1, self.life2 = a, b or a
+end
+function ParticleSystem:getParticleLifetime() return self.life1, self.life2 end
+function ParticleSystem:setDirection(d) self.dir = d end
+function ParticleSystem:getDirection() return self.dir end
+function ParticleSystem:setSpread(s) self.spread = s end
+function ParticleSystem:getSpread() return self.spread end
+function ParticleSystem:setSpeed(a, b) self.speed1, self.speed2 = a, b or a end
+function ParticleSystem:getSpeed() return self.speed1, self.speed2 end
+function ParticleSystem:setLinearAcceleration(x1, y1, x2, y2)
+  -- LOVE takes a min/max BOX; the mean is what actually reads on screen,
+  -- and per-axis randomisation across the box adds nothing a spread does
+  -- not already give you.
+  self.aaccX = ((x1 or 0) + (x2 or x1 or 0)) / 2
+  self.aaccY = ((y1 or 0) + (y2 or y1 or 0)) / 2
+  self.lacc1, self.lacc2 = 0, 0
+end
+function ParticleSystem:getLinearAcceleration()
+  return self.aaccX, self.aaccY, self.aaccX, self.aaccY
+end
+function ParticleSystem:setRadialAcceleration(a, b)
+  self.radial1, self.radial2 = a, b or a
+end
+function ParticleSystem:getRadialAcceleration() return self.radial1, self.radial2 end
+function ParticleSystem:setTangentialAcceleration(a, b)
+  self.tanAcc1, self.tanAcc2 = a, b or a
+end
+function ParticleSystem:getTangentialAcceleration() return self.tanAcc1, self.tanAcc2 end
+function ParticleSystem:setLinearDamping(a, b)
+  self.damping1, self.damping2 = a, b or a
+end
+function ParticleSystem:getLinearDamping() return self.damping1, self.damping2 end
+function ParticleSystem:setSizes(...)
+  self.sizes = { ... }
+  if #self.sizes == 0 then self.sizes = { 1 } end
+end
+function ParticleSystem:getSizes() return unpack(self.sizes) end
+function ParticleSystem:setSizeVariation(v) self.sizeVar = v end
+function ParticleSystem:getSizeVariation() return self.sizeVar end
+function ParticleSystem:setRotation(a, b) self.rot1, self.rot2 = a, b or a end
+function ParticleSystem:getRotation() return self.rot1, self.rot2 end
+function ParticleSystem:setSpin(a, b) self.spin1, self.spin2 = a, b or a end
+function ParticleSystem:getSpin() return self.spin1, self.spin2 end
+function ParticleSystem:setSpinVariation(v) self.spinVar = v end
+function ParticleSystem:getSpinVariation() return self.spinVar end
+function ParticleSystem:setColors(...)
+  local a = { ... }
+  -- LOVE accepts either flat numbers or a list of {r,g,b,a} tables
+  if rawtype(a[1]) == "table" then
+    local flat = {}
+    for _, c in ipairs(a) do
+      flat[#flat+1] = c[1]; flat[#flat+1] = c[2]
+      flat[#flat+1] = c[3]; flat[#flat+1] = c[4] or 1
+    end
+    a = flat
+  end
+  if #a == 0 then a = { 1, 1, 1, 1 } end
+  self.colors = a
+end
+function ParticleSystem:getColors() return unpack(self.colors) end
+function ParticleSystem:setPosition(x, y) self.x, self.y = x, y end
+function ParticleSystem:getPosition() return self.x, self.y end
+function ParticleSystem:moveTo(x, y) self.x, self.y = x, y end
+function ParticleSystem:setOffset(x, y) self.offX, self.offY = x, y end
+function ParticleSystem:getOffset()
+  if self.offX then return self.offX, self.offY end
+  if self.image then return self.image:getWidth()/2, self.image:getHeight()/2 end
+  return 0, 0
+end
+function ParticleSystem:setEmissionArea(dist, dx, dy, angle, rel)
+  self.areaDist = dist or "none"
+  self.areaX, self.areaY = dx or 0, dy or 0
+  self.areaAngle, self.areaRel = angle or 0, rel or false
+end
+function ParticleSystem:getEmissionArea()
+  return self.areaDist, self.areaX, self.areaY, self.areaAngle, self.areaRel
+end
+function ParticleSystem:setTexture(img) self.image = img end
+function ParticleSystem:getTexture() return self.image end
+function ParticleSystem:setQuads(...)
+  local q = { ... }
+  if rawtype(q[1]) == "table" and not q[1].getViewport then q = q[1] end
+  self.quads = (#q > 0) and q or nil
+end
+function ParticleSystem:getQuads() return self.quads or {} end
+function ParticleSystem:setRelativeRotation(v) self.relativeRotation = v end
+function ParticleSystem:hasRelativeRotation() return self.relativeRotation end
+function ParticleSystem:setInsertMode(m) self.insertMode = m end
+function ParticleSystem:getInsertMode() return self.insertMode end
+function ParticleSystem:clone()
+  local c = graphics.newParticleSystem(self.image, self.max)
+  for k, v in pairs(self) do
+    if k ~= "parts" and k ~= "live" then c[k] = v end
+  end
+  c.sizes = { unpack(self.sizes) }
+  c.colors = { unpack(self.colors) }
+  return c
+end
+function ParticleSystem:type() return "ParticleSystem" end
 
 -- Font
 local Font = {}

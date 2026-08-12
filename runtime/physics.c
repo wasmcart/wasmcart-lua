@@ -577,9 +577,16 @@ static b2JointId joint_get(lua_State *L, int i) {
 }
 
 /* Fill the shared base of every joint def: the two bodies, and each
- * body's local frame derived from a world-space anchor in pixels. */
-static void joint_base_from(lua_State *L, b2JointDef *base,
-                            int bodyA, int bodyB, int argAnchor) {
+ * body's local frame derived from a world-space anchor in pixels.
+ *
+ * argCollide is where the collideConnected flag lives. It is passed
+ * SEPARATELY rather than assumed to be argAnchor+2, because the joints
+ * that take an axis put two more numbers in between: joint_prismatic and
+ * joint_wheel were both reading their axisX as the collide flag, so any
+ * caller passing an axis silently turned collision on as well. */
+static void joint_base_from_at(lua_State *L, b2JointDef *base,
+                               int bodyA, int bodyB, int argAnchor,
+                               int argCollide) {
     body_slot_t *ba = &bodies[bodyA - 1];
     body_slot_t *bb = &bodies[bodyB - 1];
     base->bodyIdA = ba->id;
@@ -591,7 +598,13 @@ static void joint_base_from(lua_State *L, b2JointDef *base,
     base->localFrameA.q = b2Rot_identity;
     base->localFrameB.p = b2Body_GetLocalPoint(bb->id, anchor);
     base->localFrameB.q = b2Rot_identity;
-    base->collideConnected = lua_toboolean(L, argAnchor + 2);
+    base->collideConnected = lua_toboolean(L, argCollide);
+}
+
+/* The common case: collide flag sits right after the anchor pair. */
+static void joint_base_from(lua_State *L, b2JointDef *base,
+                            int bodyA, int bodyB, int argAnchor) {
+    joint_base_from_at(L, base, bodyA, bodyB, argAnchor, argAnchor + 2);
 }
 
 static int two_bodies(lua_State *L, int *a, int *b) {
@@ -624,7 +637,7 @@ static int l_joint_distance(lua_State *L) {
     b2WorldId world = world_get(L, wh);
     int a, b; two_bodies(L, &a, &b);
     b2DistanceJointDef def = b2DefaultDistanceJointDef();
-    joint_base_from(L, &def.base, a, b, 4);
+    joint_base_from_at(L, &def.base, a, b, 4, 7);   /* length occupies 6 */
     /* A distance joint measures between the two local frames, so unlike a
      * hinge the frames must NOT be the same world point: anchoring both at
      * one spot leaves a zero-length separation and the rest length has
@@ -640,13 +653,23 @@ static int l_joint_distance(lua_State *L) {
 }
 
 /* b2.joint_prismatic(world, bodyA, bodyB, ax, ay, axisX, axisY [, collide])
- * A slider along an axis. */
+ * A slider along an axis.
+ *
+ * THE TWO BODIES MUST NOT SHARE AN ORIGIN. If they do, both local frames
+ * land on the same point, the solver has a zero-length separation to work
+ * from, and the slider jitters a few pixels sideways instead of sliding.
+ * Measured: co-located bodies under a pure +x force moved (+0.16, -3.63);
+ * the same rig with the bodies half a pixel apart moved (+7220.48, +0.00).
+ *
+ * This is the same degeneracy already noted on joint_distance below, and
+ * it looks exactly like "the axis argument is being ignored" -- every axis
+ * value produces the same non-motion. It is not; the axis is fine. */
 static int l_joint_prismatic(lua_State *L) {
     int wh = (int)luaL_checkinteger(L, 1);
     b2WorldId world = world_get(L, wh);
     int a, b; two_bodies(L, &a, &b);
     b2PrismaticJointDef def = b2DefaultPrismaticJointDef();
-    joint_base_from(L, &def.base, a, b, 4);
+    joint_base_from_at(L, &def.base, a, b, 4, 8);   /* axis occupies 6,7 */
     /* The slide axis is encoded as the local frames' rotation. */
     float ax = (float)luaL_optnumber(L, 6, 1.0);
     float ay = (float)luaL_optnumber(L, 7, 0.0);
@@ -699,7 +722,7 @@ static int l_joint_wheel(lua_State *L) {
     b2WorldId world = world_get(L, wh);
     int a, b; two_bodies(L, &a, &b);
     b2WheelJointDef def = b2DefaultWheelJointDef();
-    joint_base_from(L, &def.base, a, b, 4);
+    joint_base_from_at(L, &def.base, a, b, 4, 8);   /* axis occupies 6,7 */
     /* Same axis-as-rotation encoding as the prismatic joint above. */
     float ax = (float)luaL_optnumber(L, 6, 0.0);
     float ay = (float)luaL_optnumber(L, 7, 1.0);
@@ -734,7 +757,7 @@ static int l_joint_rope(lua_State *L) {
     b2WorldId world = world_get(L, wh);
     int a, b; two_bodies(L, &a, &b);
     b2DistanceJointDef def = b2DefaultDistanceJointDef();
-    joint_base_from(L, &def.base, a, b, 4);
+    joint_base_from_at(L, &def.base, a, b, 4, 7);   /* maxLength occupies 6 */
     def.base.localFrameB.p = (b2Vec2){ 0.0f, 0.0f };   /* see joint_distance */
     float maxLen = px2m(luaL_optnumber(L, 6, 64.0));
     if (maxLen < 0.005f) maxLen = 0.005f;
@@ -764,7 +787,7 @@ static int l_joint_friction(lua_State *L) {
     b2WorldId world = world_get(L, wh);
     int a, b; two_bodies(L, &a, &b);
     b2MotorJointDef def = b2DefaultMotorJointDef();
-    joint_base_from(L, &def.base, a, b, 4);
+    joint_base_from_at(L, &def.base, a, b, 4, 8);   /* force caps occupy 6,7 */
     def.linearVelocity = (b2Vec2){ 0.0f, 0.0f };
     def.angularVelocity = 0.0f;
     def.maxVelocityForce  = (float)luaL_optnumber(L, 6, 100.0);

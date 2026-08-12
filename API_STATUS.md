@@ -13,7 +13,7 @@ To regenerate:
 node tools/apistatus/gen-status.mjs api-dump.txt
 ```
 
-**215 of 320 LOVE functions implemented (67%).**
+**216 of 320 LOVE functions implemented (68%).**
 
 A caveat worth stating plainly: this table measures PRESENCE. A
 function can be exported and still be wrong. `test/apiconform/`
@@ -33,7 +33,7 @@ list, so this percentage and Lutro's are directly comparable.
 | `love.event` | 5 | 6 | 83% |
 | `love.filesystem` | 14 | 31 | 45% |
 | `love.font` | 1 | 5 | 20% |
-| `love.graphics` | 84 | 105 | 80% |
+| `love.graphics` | 85 | 105 | 81% |
 | `love.image` | 3 | 3 | 100% |
 | `love.joystick` | 2 | 6 | 33% |
 | `love.keyboard` | 9 | 9 | 100% |
@@ -162,7 +162,7 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_check_mark: | `love.font.newRasterizer` |
 | :white_medium_square: | `love.font.newTrueTypeRasterizer` |
 
-### `love.graphics` — 84/105
+### `love.graphics` — 85/105
 
 | | function |
 |---|---|
@@ -227,7 +227,7 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_check_mark: | `love.graphics.newImage` |
 | :white_medium_square: | `love.graphics.newImageFont` |
 | :white_check_mark: | `love.graphics.newMesh` |
-| :white_medium_square: | `love.graphics.newParticleSystem` |
+| :white_check_mark: | `love.graphics.newParticleSystem` |
 | :white_check_mark: | `love.graphics.newQuad` |
 | :white_check_mark: | `love.graphics.newShader` |
 | :white_check_mark: | `love.graphics.newSpriteBatch` |

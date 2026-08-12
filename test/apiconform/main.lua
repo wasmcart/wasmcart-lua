@@ -375,43 +375,50 @@ local function run()
     jw:destroy()
   end
 
-  -- PRISMATIC: constrains motion to one axis.
+  -- PRISMATIC: slides along its axis and NOT across it.
   --
-  -- KNOWN BROKEN, and asserted only as far as it actually works. Measured
-  -- with a pure +x force, zero gravity and fixed rotation, a slider built
-  -- with axis (1,0) moves (+0.16, -3.60) -- perpendicular to both the
-  -- force AND the requested axis. Sweeping the axis argument through
-  -- (1,0), (0,1), (-1,0), (0,-1) produces the SAME motion every time, so
-  -- the axis is being ignored entirely rather than merely rotated.
+  -- THE BODIES MUST NOT SHARE AN ORIGIN. Placing both at the same point
+  -- makes the joint's two local frames coincide, and the solver then has a
+  -- zero-length separation to work from: the body jitters a few pixels
+  -- sideways and goes nowhere. Half a pixel of offset is the entire
+  -- difference between that and a clean slide -- measured, at 0px the body
+  -- moved (+0.16, -3.63) and at 0.5px it moved (+7220.48, +0.00).
   --
-  -- The rotation encoding itself is provably right: compiled against this
-  -- Box2D, b2RotateVector(b2InvMulRot(identity, b2MakeRotFromUnitVector
-  -- (1,0)), (1,0)) returns exactly (1,0), and (0,1) returns (0,1). The
-  -- solver reads localFrameA.q the same way. So the fault is further in
-  -- and is NOT the axis maths.
-  --
-  -- Separately confirmed: joint_base_from consumes argument 6 as
-  -- collideConnected while l_joint_prismatic reads argument 6 as axisX,
-  -- so passing an axis silently turns collision on too.
-  --
-  -- The one thing that DOES work is the perpendicular constraint, so that
-  -- is what is asserted. The rest is left failing-by-omission rather than
-  -- asserted loosely enough to pass, because a green test here would say
-  -- the joint works.
-  --
-  -- No shipped cart uses a prismatic joint, so nothing is broken today.
+  -- This cost me a wrong bug report: I read the degenerate result as "the
+  -- axis argument is ignored" and shipped a commit message saying so. The
+  -- axis was always correct. The same footgun is already documented on
+  -- joint_distance in physics.c, which is where I should have looked.
   do
     local jw = jointWorld(0, 0)
     local base = ph.newBody(jw, 100, 100, "static")
-    ph.newFixture(base, ph.newRectangleShape(4, 4), 1)
-    local slider = dynBox(jw, 100, 100)
-    ph.newPrismaticJoint(base, slider, 100, 100, 1, 0)
-    for _ = 1, 120 do
-      slider:applyForce(0, 500)        -- push ACROSS the x axis
+    ph.newFixture(base, ph.newRectangleShape(8, 8), 1)
+    local slider = dynBox(jw, 108, 100)          -- offset, see above
+    ph.newPrismaticJoint(base, slider, 108, 100, 1, 0)   -- x axis only
+    for _ = 1, 90 do
+      slider:applyForce(400, 400)                -- push DIAGONALLY
       jw:update(1 / 60)
     end
-    local sx = select(1, slider:getPosition())
-    ok("prismatic holds its cross-axis", math.abs(sx - 100) < 3, sx)
+    local sx, sy = slider:getPosition()
+    ok("prismatic slides along its axis", sx > 150, sx)
+    ok("prismatic resists across its axis", math.abs(sy - 100) < 2, sy)
+    jw:destroy()
+  end
+
+  -- The axis argument must actually STEER the slide, not just permit one.
+  -- A y-axis joint under the same diagonal push must move in y, not x.
+  do
+    local jw = jointWorld(0, 0)
+    local base = ph.newBody(jw, 100, 100, "static")
+    ph.newFixture(base, ph.newRectangleShape(8, 8), 1)
+    local slider = dynBox(jw, 100, 108)
+    ph.newPrismaticJoint(base, slider, 100, 108, 0, 1)   -- y axis
+    for _ = 1, 90 do
+      slider:applyForce(400, 400)
+      jw:update(1 / 60)
+    end
+    local sx, sy = slider:getPosition()
+    ok("prismatic y-axis slides in y", sy > 150, sy)
+    ok("prismatic y-axis resists x", math.abs(sx - 100) < 2, sx)
     jw:destroy()
   end
 
@@ -490,6 +497,90 @@ local function run()
     ok("revolute motor drives rotation", math.abs(arm:getAngle() - a0) > 0.5,
        ("%.3f -> %.3f"):format(a0, arm:getAngle()))
     jw:destroy()
+  end
+
+  -- ── love.graphics.newParticleSystem ───────────────────────────────
+  --
+  -- The gap with a real user: Jewels hand-rolled a pooled emitter because
+  -- this was missing. A particle system that exists but never moves a
+  -- particle would pass any name-only check, so every assertion here is
+  -- on simulated state.
+  do
+    local canvas = g.newCanvas(4, 4)
+    local ps = g.newParticleSystem(canvas, 64)
+    ok("newParticleSystem returns one", ps:type() == "ParticleSystem", ps:type())
+    ok("buffer size round-trip", ps:getBufferSize() == 64, ps:getBufferSize())
+    ok("starts empty", ps:getCount() == 0, ps:getCount())
+    ok("starts stopped", ps:isStopped())
+
+    -- emit() must produce exactly what was asked for
+    ps:setParticleLifetime(1, 1)
+    ps:emit(10)
+    ok("emit(10) makes 10 particles", ps:getCount() == 10, ps:getCount())
+
+    -- and they must EXPIRE. A system that never reaps is the leak that
+    -- eventually eats the buffer.
+    for _ = 1, 70 do ps:update(1 / 60) end
+    ok("particles expire after their lifetime", ps:getCount() == 0, ps:getCount())
+
+    -- the buffer is a HARD cap, not a suggestion
+    ps:emit(500)
+    ok("buffer size is a hard cap", ps:getCount() == 64, ps:getCount())
+    ps:reset()
+    ok("reset clears every particle", ps:getCount() == 0, ps:getCount())
+
+    -- emission rate must produce roughly rate*time particles
+    ps:setEmissionRate(60)
+    ps:setParticleLifetime(10, 10)     -- long, so none expire during the test
+    ps:start()
+    for _ = 1, 30 do ps:update(1 / 60) end
+    local n = ps:getCount()
+    ok("emission rate is honoured", n >= 28 and n <= 32, n)
+    ps:stop()
+    ok("stop clears the system", ps:getCount() == 0, ps:getCount())
+
+    -- MOTION: a particle fired right with no acceleration must travel right
+    ps:reset()
+    ps:setEmissionRate(0)
+    ps:setParticleLifetime(10, 10)
+    ps:setDirection(0)                  -- +x
+    ps:setSpread(0)
+    ps:setSpeed(100, 100)
+    ps:setLinearAcceleration(0, 0, 0, 0)
+    ps:setPosition(0, 0)
+    ps:emit(1)
+    for _ = 1, 60 do ps:update(1 / 60) end
+    local p1 = ps.parts[1]
+    ok("particle travels along its direction", p1.x > 90 and p1.x < 110, p1.x)
+    ok("particle does not drift off-axis", math.abs(p1.y) < 1, p1.y)
+
+    -- gravity must bend it
+    ps:reset()
+    ps:setLinearAcceleration(0, 200, 0, 200)
+    ps:emit(1)
+    for _ = 1, 60 do ps:update(1 / 60) end
+    ok("linear acceleration pulls the particle", ps.parts[1].y > 50, ps.parts[1].y)
+
+    -- colour and size keyframe lists must round-trip
+    ps:setColors(1, 0, 0, 1, 0, 0, 1, 1)   -- red -> blue
+    ok("colour list round-trip", select(1, ps:getColors()) == 1)
+    ps:setSizes(1, 2, 3)
+    local s1, s2, s3 = ps:getSizes()
+    ok("size list round-trip", s1 == 1 and s2 == 2 and s3 == 3,
+       ("%s,%s,%s"):format(s1, s2, s3))
+
+    -- setColors must also accept LOVE's table form
+    ps:setColors({1, 1, 1, 1}, {0, 0, 0, 0})
+    ok("setColors accepts tables", select(5, ps:getColors()) == 0,
+       select(5, ps:getColors()))
+
+    -- setPosition moves where NEW particles appear
+    ps:reset()
+    ps:setPosition(500, 400)
+    ps:setSpeed(0, 0)
+    ps:emit(1)
+    ok("particles spawn at the emitter", ps.parts[1].x == 500 and ps.parts[1].y == 400,
+       ("%.1f,%.1f"):format(ps.parts[1].x, ps.parts[1].y))
   end
 
   -- The two joints Box2D 3.x removed must REFUSE, not silently no-op.
