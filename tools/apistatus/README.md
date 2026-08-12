@@ -23,3 +23,16 @@ known-answer maths, conserved areas, distributions — and it has been
 verified against a deliberately broken build (the 2.2 gamma approximation
 in place of the real sRGB curve), which it caught with 3 failures. A test
 that cannot fail proves nothing.
+
+## A limit worth knowing
+
+The table matches on NAMES, so it cannot tell "missing" from "spelled
+differently". `love.physics` scored 14% while this engine had full Box2D --
+we exposed only the windfield-style collider API, so every LOVE name missed.
+That was a real portability failure (a game written against LOVE could not
+find newBody/newFixture) but the number overstated it: the physics was
+there, the spelling was not.
+
+Fixed by implementing the official API over the same bindings. Worth
+remembering the next time a module scores low: check whether the capability
+is genuinely absent before treating the percentage as the finding.

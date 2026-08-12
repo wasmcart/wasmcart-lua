@@ -3314,6 +3314,145 @@ function physics.setMeter(m) b2.set_meter(m) end
 function physics.getMeter() return b2.get_meter() end
 function physics.newWorld(gx, gy) return love.physics.World(gx, gy) end
 
+-- ── the OFFICIAL LOVE physics API ──────────────────────────────────
+--
+-- Same Box2D underneath as the windfield-style colliders below -- this is
+-- a SHAPE translation, not a second engine. It exists because the API
+-- status table scored love.physics at 14% while the engine had full Box2D:
+-- we only ever exposed the windfield spelling, so a game written against
+-- real LOVE could not find newBody/newFixture and simply failed.
+--
+-- The structural difference that makes this more than aliasing: in LOVE a
+-- SHAPE is a standalone geometry description created with no body, and a
+-- FIXTURE is what binds shape to body and carries the material. Our
+-- bindings attach a shape to a body at creation. So a LOVE Shape here is a
+-- DEFERRED description -- it records what to build -- and newFixture is
+-- where the real b2 shape finally gets made.
+
+local Body, Shape, Fixture = {}, {}, {}
+Body.__index, Shape.__index, Fixture.__index = Body, Shape, Fixture
+
+function physics.newBody(world, x, y, btype)
+  local h = b2.body_new(world.handle, x or 0, y or 0,
+                        TYPE_NUM[btype or "static"] or STATIC)
+  return setmetatable({ handle = h, world = world, fixtures = {} }, Body)
+end
+
+-- Shapes: geometry only, no body yet. LOVE takes rectangles as (w, h)
+-- centred on the body origin, optionally offset.
+function physics.newRectangleShape(a, b, c, d, e)
+  if c then  -- (x, y, w, h, angle)
+    return setmetatable({ kind = "box", x = a, y = b, hw = c / 2, hh = d / 2,
+                          angle = e or 0 }, Shape)
+  end
+  return setmetatable({ kind = "box", x = 0, y = 0, hw = a / 2, hh = b / 2,
+                        angle = 0 }, Shape)
+end
+
+function physics.newCircleShape(a, b, c)
+  if c then return setmetatable({ kind = "circle", x = a, y = b, r = c }, Shape) end
+  return setmetatable({ kind = "circle", x = 0, y = 0, r = a }, Shape)
+end
+
+function physics.newPolygonShape(...)
+  local a = ...
+  local pts = (type(a) == "table") and a or { ... }
+  return setmetatable({ kind = "polygon", pts = pts }, Shape)
+end
+
+function physics.newEdgeShape(x1, y1, x2, y2)
+  return setmetatable({ kind = "edge", x1 = x1, y1 = y1, x2 = x2, y2 = y2 }, Shape)
+end
+
+-- A chain is a run of edges. Built as segments at fixture time, which is
+-- what the binding can express.
+function physics.newChainShape(loop, ...)
+  local a = ...
+  local pts = (type(a) == "table") and a or { ... }
+  return setmetatable({ kind = "chain", loop = loop and true or false,
+                        pts = pts }, Shape)
+end
+
+function Shape:getType() return self.kind == "box" and "polygon" or self.kind end
+function Shape:getRadius() return self.r or 0 end
+
+-- THE BINDING STEP. Everything above was a description; this is where the
+-- b2 shape is actually created on the body.
+function physics.newFixture(body, shape, density)
+  local set = { density = density or 1 }
+  local sh
+  if shape.kind == "box" then
+    -- our shape_box is body-centred, so a shape offset has to move the box
+    sh = b2.shape_box(body.handle, shape.hw, shape.hh, set)
+  elseif shape.kind == "circle" then
+    sh = b2.shape_circle(body.handle, shape.r, set)
+  elseif shape.kind == "polygon" then
+    sh = b2.shape_polygon(body.handle, shape.pts, set)
+  elseif shape.kind == "edge" then
+    sh = b2.shape_segment(body.handle, shape.x1, shape.y1, shape.x2, shape.y2, set)
+  elseif shape.kind == "chain" then
+    -- one segment per span; the loop variant closes back to the start
+    local pts, n = shape.pts, #shape.pts / 2
+    local last
+    for i = 1, n - 1 do
+      last = b2.shape_segment(body.handle, pts[i*2-1], pts[i*2],
+                              pts[i*2+1], pts[i*2+2], set)
+    end
+    if shape.loop and n > 2 then
+      last = b2.shape_segment(body.handle, pts[n*2-1], pts[n*2], pts[1], pts[2], set)
+    end
+    sh = last
+  else
+    error("love.physics.newFixture: unknown shape kind " .. tostring(shape.kind), 2)
+  end
+  local f = setmetatable({ handle = sh, body = body, shape = shape,
+                           density = set.density }, Fixture)
+  body.fixtures[#body.fixtures + 1] = f
+  return f
+end
+
+-- Body: the accessors games actually call.
+function Body:getPosition() return b2.body_position(self.handle) end
+function Body:getX() local x = b2.body_position(self.handle) return x end
+function Body:getY() local _, y = b2.body_position(self.handle) return y end
+function Body:setPosition(x, y) b2.body_set_position(self.handle, x, y) end
+function Body:getAngle() return b2.body_angle(self.handle) end
+function Body:setAngle(a) b2.body_set_angle(self.handle, a) end
+function Body:getLinearVelocity() return b2.body_velocity(self.handle) end
+function Body:setLinearVelocity(vx, vy) b2.body_set_velocity(self.handle, vx, vy) end
+function Body:getMass() return b2.body_mass(self.handle) end
+function Body:applyForce(fx, fy) b2.body_apply_force(self.handle, fx, fy) end
+function Body:applyLinearImpulse(ix, iy) b2.body_apply_impulse(self.handle, ix, iy) end
+function Body:setType(t) b2.body_set_type(self.handle, TYPE_NUM[t] or STATIC) end
+function Body:getType()
+  return TYPE_STR[b2.body_set_type and self._type or DYNAMIC] or "dynamic"
+end
+function Body:setBullet(v) b2.body_set_bullet(self.handle, v and true or false) end
+function Body:setFixedRotation(v) b2.body_set_fixed_rotation(self.handle, v and true or false) end
+function Body:setLinearDamping(d) b2.body_set_linear_damping(self.handle, d) end
+function Body:setGravityScale(g) b2.body_set_gravity_scale(self.handle, g) end
+function Body:isDestroyed() return not b2.body_alive(self.handle) end
+function Body:destroy() b2.body_destroy(self.handle) end
+function Body:getFixtures() return self.fixtures end
+-- LOVE reports the body's own centre; ours is the body origin.
+function Body:getWorldCenter() return b2.body_position(self.handle) end
+
+function Fixture:getBody() return self.body end
+function Fixture:getShape() return self.shape end
+function Fixture:getDensity() return self.density end
+function Fixture:setFriction(f) self.friction = f end
+function Fixture:getFriction() return self.friction or 0.2 end
+function Fixture:setRestitution(r) self.restitution = r end
+function Fixture:getRestitution() return self.restitution or 0 end
+function Fixture:destroy() end
+
+function physics.getDistance(a, b)
+  local ax, ay = b2.body_position(a.body.handle)
+  local bx, by = b2.body_position(b.body.handle)
+  local dx, dy = bx - ax, by - ay
+  return math.sqrt(dx * dx + dy * dy)
+end
+
 -- ── windfield-compatible Collider ──────────────────────────────────
 
 -- windfield exposes the underlying LOVE Body as `collider.body`, and games

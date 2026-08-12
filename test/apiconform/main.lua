@@ -222,6 +222,81 @@ local function run()
   -- and claiming it could would hang a game waiting for text
   ok("no screen keyboard", k.hasScreenKeyboard() == false, k.hasScreenKeyboard())
 
+  -- ── love.physics: the OFFICIAL API, on the same Box2D ─────────────
+  --
+  -- The status table scored physics at 14% while the engine had full
+  -- Box2D, because we only exposed the windfield spelling. These assert
+  -- the LOVE-shaped API really SIMULATES -- a body that does not move
+  -- under gravity would pass any name-only check.
+  local ph = love.physics
+  local w = ph.newWorld(0, 100)
+
+  local body = ph.newBody(w, 50, 10, "dynamic")
+  local shp = ph.newRectangleShape(4, 4)
+  local fix = ph.newFixture(body, shp, 1)
+
+  ok("newBody returns a body", type(body) == "table")
+  ok("body starts where placed", select(1, body:getPosition()) == 50,
+     select(1, body:getPosition()))
+  ok("fixture binds to its body", fix:getBody() == body)
+  ok("fixture keeps its shape", fix:getShape() == shp)
+  ok("shape reports its type", shp:getType() == "polygon", shp:getType())
+  ok("body has a mass", body:getMass() > 0, body:getMass())
+
+  -- IT MUST ACTUALLY FALL. Gravity is +100 on y, so after stepping the
+  -- body must be lower than it started, and its velocity positive.
+  local _, y0 = body:getPosition()
+  for _ = 1, 30 do w:update(1 / 60) end
+  local _, y1 = body:getPosition()
+  local _, vy = body:getLinearVelocity()
+  ok("body falls under gravity", y1 > y0 + 1, ("%.2f -> %.2f"):format(y0, y1))
+  ok("velocity accumulates downward", vy > 0, vy)
+
+  -- and a STATIC body must not move at all
+  local ground = ph.newBody(w, 50, 200, "static")
+  ph.newFixture(ground, ph.newRectangleShape(100, 4), 1)
+  local gx0, gy0 = ground:getPosition()
+  for _ = 1, 30 do w:update(1 / 60) end
+  local gx1, gy1 = ground:getPosition()
+  ok("static body does not move", gx0 == gx1 and gy0 == gy1,
+     ("%.2f,%.2f -> %.2f,%.2f"):format(gx0, gy0, gx1, gy1))
+
+  -- explicit setters must take effect
+  body:setPosition(7, 8)
+  local sx, sy = body:getPosition()
+  ok("setPosition round-trip", near(sx, 7) and near(sy, 8),
+     ("%.2f,%.2f"):format(sx, sy))
+
+  body:setLinearVelocity(3, -4)
+  local lvx, lvy = body:getLinearVelocity()
+  ok("setLinearVelocity round-trip", near(lvx, 3) and near(lvy, -4),
+     ("%.2f,%.2f"):format(lvx, lvy))
+
+  -- circle and polygon shapes must build fixtures too
+  local cb = ph.newBody(w, 0, 0, "dynamic")
+  local cs = ph.newCircleShape(5)
+  ph.newFixture(cb, cs, 1)
+  ok("circle shape type", cs:getType() == "circle", cs:getType())
+  ok("circle radius", cs:getRadius() == 5, cs:getRadius())
+  ok("circle body gains mass", cb:getMass() > 0, cb:getMass())
+
+  local pb = ph.newBody(w, 0, 0, "dynamic")
+  ph.newFixture(pb, ph.newPolygonShape({-5,-5, 5,-5, 5,5, -5,5}), 1)
+  ok("polygon body gains mass", pb:getMass() > 0, pb:getMass())
+
+  -- distance between two bodies, by construction
+  body:setPosition(0, 0)
+  cb:setPosition(3, 4)
+  ok("getDistance is euclidean", near(ph.getDistance(fix, cb.fixtures[1]), 5, 0.01),
+     ph.getDistance(fix, cb.fixtures[1]))
+
+  ok("destroy marks the body", (function()
+    local d = ph.newBody(w, 0, 0, "dynamic")
+    ph.newFixture(d, ph.newCircleShape(1), 1)
+    d:destroy()
+    return d:isDestroyed()
+  end)())
+
   print(("APICONFORM %d passed, %d failed"):format(pass, fail))
   print(fail == 0 and "APICONFORM OK" or "APICONFORM FAILED")
 end

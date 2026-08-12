@@ -13,7 +13,7 @@ To regenerate:
 node tools/apistatus/gen-status.mjs api-dump.txt
 ```
 
-**186 of 320 LOVE functions implemented (58%).**
+**194 of 320 LOVE functions implemented (61%).**
 
 A caveat worth stating plainly: this table measures PRESENCE. A
 function can be exported and still be wrong. `test/apiconform/`
@@ -39,7 +39,7 @@ list, so this percentage and Lutro's are directly comparable.
 | `love.keyboard` | 9 | 9 | 100% |
 | `love.math` | 11 | 16 | 69% |
 | `love.mouse` | 8 | 18 | 44% |
-| `love.physics` | 3 | 22 | 14% |
+| `love.physics` | 11 | 22 | 50% |
 | `love.sound` | 2 | 2 | 100% |
 | `love.system` | 7 | 8 | 88% |
 | `love.thread` | 3 | 3 | 100% |
@@ -349,26 +349,26 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_medium_square: | `love.mouse.setX` |
 | :white_medium_square: | `love.mouse.setY` |
 
-### `love.physics` — 3/22
+### `love.physics` — 11/22
 
 | | function |
 |---|---|
-| :white_medium_square: | `love.physics.getDistance` |
+| :white_check_mark: | `love.physics.getDistance` |
 | :white_check_mark: | `love.physics.getMeter` |
-| :white_medium_square: | `love.physics.newBody` |
-| :white_medium_square: | `love.physics.newChainShape` |
-| :white_medium_square: | `love.physics.newCircleShape` |
+| :white_check_mark: | `love.physics.newBody` |
+| :white_check_mark: | `love.physics.newChainShape` |
+| :white_check_mark: | `love.physics.newCircleShape` |
 | :white_medium_square: | `love.physics.newDistanceJoint` |
-| :white_medium_square: | `love.physics.newEdgeShape` |
-| :white_medium_square: | `love.physics.newFixture` |
+| :white_check_mark: | `love.physics.newEdgeShape` |
+| :white_check_mark: | `love.physics.newFixture` |
 | :white_medium_square: | `love.physics.newFrictionJoint` |
 | :white_medium_square: | `love.physics.newGearJoint` |
 | :white_medium_square: | `love.physics.newMotorJoint` |
 | :white_medium_square: | `love.physics.newMouseJoint` |
-| :white_medium_square: | `love.physics.newPolygonShape` |
+| :white_check_mark: | `love.physics.newPolygonShape` |
 | :white_medium_square: | `love.physics.newPrismaticJoint` |
 | :white_medium_square: | `love.physics.newPulleyJoint` |
-| :white_medium_square: | `love.physics.newRectangleShape` |
+| :white_check_mark: | `love.physics.newRectangleShape` |
 | :white_medium_square: | `love.physics.newRevoluteJoint` |
 | :white_medium_square: | `love.physics.newRopeJoint` |
 | :white_medium_square: | `love.physics.newWeldJoint` |
