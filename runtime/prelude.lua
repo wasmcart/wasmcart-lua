@@ -3625,6 +3625,208 @@ function physics.getDistance(a, b)
   return math.sqrt(dx * dx + dy * dy)
 end
 
+-- ── joints ─────────────────────────────────────────────────────────
+--
+-- LOVE's joint API was designed against Box2D 2.x, which had eleven joint
+-- types. This engine runs Box2D 3.2, whose rewrite consolidated them into
+-- seven. So the mapping is not one-to-one, and where it is not, this says
+-- so rather than papering over it:
+--
+--   revolute, prismatic, distance, weld, motor, wheel
+--       direct -- a real b2 joint of that type
+--   rope
+--       a distance joint with its limit enabled and its spring slack.
+--       2.x's rope joint was FOLDED INTO the distance joint in v3; this is
+--       upstream's own replacement, not an approximation.
+--   friction
+--       a motor joint with zero target velocity and a capped force, so all
+--       it can do is brake. Same construction v3 recommends.
+--   mouse
+--       a motor joint with a linear spring, anchored to a body the caller
+--       moves. Box2D 3.2's OWN SAMPLES implement mouse dragging exactly
+--       this way (samples/sample.cpp, Sample::MouseDown), spring constants
+--       included, so this is the sanctioned substitute.
+--   gear, pulley
+--       NOT IMPLEMENTED. v3 removed both and offers no primitive to build
+--       them on. They could be faked in Lua by reading one joint each step
+--       and driving the other, but a constraint solved outside the solver
+--       drifts under load and fights the very bodies it constrains -- it
+--       would be wrong precisely when a game leans on it. A joint that is
+--       subtly wrong is worse than one that is honestly missing, so these
+--       raise a clear error naming the reason.
+
+local Joint = {}
+Joint.__index = Joint
+
+local function wrapJoint(h, kind)
+  return setmetatable({ handle = h, kind = kind }, Joint)
+end
+
+local function jointBodies(a, b)
+  -- LOVE takes Body objects; our C layer takes integer handles.
+  return a.handle, b.handle
+end
+
+function physics.newRevoluteJoint(a, b, x, y, collide)
+  local ha, hb = jointBodies(a, b)
+  return wrapJoint(b2.joint_revolute(a.world.handle, ha, hb, x, y, collide), "revolute")
+end
+
+function physics.newDistanceJoint(a, b, x1, y1, x2, y2, collide)
+  local ha, hb = jointBodies(a, b)
+  -- LOVE names both anchors; the rest length is the distance between them.
+  local dx, dy = (x2 or x1) - x1, (y2 or y1) - y1
+  local len = math.sqrt(dx * dx + dy * dy)
+  return wrapJoint(b2.joint_distance(a.world.handle, ha, hb, x1, y1, len, collide),
+                   "distance")
+end
+
+function physics.newPrismaticJoint(a, b, x, y, ax, ay, collide)
+  local ha, hb = jointBodies(a, b)
+  return wrapJoint(b2.joint_prismatic(a.world.handle, ha, hb, x, y, ax, ay, collide),
+                   "prismatic")
+end
+
+function physics.newWeldJoint(a, b, x, y, collide)
+  local ha, hb = jointBodies(a, b)
+  return wrapJoint(b2.joint_weld(a.world.handle, ha, hb, x, y, collide), "weld")
+end
+
+function physics.newMotorJoint(a, b, correction, collide)
+  local ha, hb = jointBodies(a, b)
+  return wrapJoint(b2.joint_motor(a.world.handle, ha, hb, collide), "motor")
+end
+
+function physics.newWheelJoint(a, b, x, y, ax, ay, collide)
+  local ha, hb = jointBodies(a, b)
+  return wrapJoint(b2.joint_wheel(a.world.handle, ha, hb, x, y, ax, ay, collide),
+                   "wheel")
+end
+
+function physics.newRopeJoint(a, b, x1, y1, x2, y2, maxLength, collide)
+  local ha, hb = jointBodies(a, b)
+  return wrapJoint(b2.joint_rope(a.world.handle, ha, hb, x1, y1, maxLength, collide),
+                   "rope")
+end
+
+function physics.newFrictionJoint(a, b, x, y, collide)
+  local ha, hb = jointBodies(a, b)
+  return wrapJoint(b2.joint_friction(a.world.handle, ha, hb, x, y, 100, 100, collide),
+                   "friction")
+end
+
+-- LOVE's signature is newMouseJoint(body, x, y) -- ONE body, dragged toward
+-- a world point. The anchor body the motor joint needs is created here and
+-- kept alive on the joint, so a cart never sees the difference.
+function physics.newMouseJoint(body, x, y)
+  local world = body.world
+  local anchor = b2.body_new(world.handle, x, y, KINEMATIC)
+  local h = b2.joint_mouse(world.handle, anchor, body.handle, x, y, 1000)
+  local j = wrapJoint(h, "mouse")
+  j.anchor = anchor
+  return j
+end
+
+function physics.newGearJoint()
+  error("love.physics.newGearJoint is not available: Box2D 3.x removed the " ..
+        "gear joint and offers no primitive to build one on. Drive the two " ..
+        "joints from your own update instead -- see API_STATUS.md.", 2)
+end
+
+function physics.newPulleyJoint()
+  error("love.physics.newPulleyJoint is not available: Box2D 3.x removed the " ..
+        "pulley joint and offers no primitive to build one on. Two rope " ..
+        "joints with a shared length budget are the usual stand-in -- see " ..
+        "API_STATUS.md.", 2)
+end
+
+-- ── Joint methods ──────────────────────────────────────────────────
+
+function Joint:getType() return self.kind end
+function Joint:type() return "Joint" end
+
+function Joint:destroy()
+  if self.handle then
+    b2.joint_destroy(self.handle)
+    -- a mouse joint owns its anchor body; leaking one per drag would fill
+    -- the body table over a long session
+    if self.anchor then b2.body_destroy(self.anchor); self.anchor = nil end
+    self.handle = nil
+  end
+end
+Joint.release = Joint.destroy
+
+function Joint:isDestroyed() return self.handle == nil end
+
+function Joint:getReactionForce()  return b2.joint_force(self.handle) end
+function Joint:getReactionTorque() return b2.joint_torque(self.handle) end
+
+-- Motor. LOVE spells these per joint type; they all land on the same C call.
+function Joint:enableMotor(on) b2.joint_set_motor(self.handle, on, self._speed or 0,
+                                                  self._maxMotor or 1000) end
+function Joint:isMotorEnabled() return self._motorOn or false end
+function Joint:setMotorSpeed(v)
+  self._speed = v
+  b2.joint_set_motor(self.handle, true, v, self._maxMotor or 1000)
+  self._motorOn = true
+end
+function Joint:getMotorSpeed() return self._speed or 0 end
+function Joint:setMaxMotorForce(v)
+  self._maxMotor = v
+  b2.joint_set_motor(self.handle, self._motorOn or false, self._speed or 0, v)
+end
+Joint.setMaxMotorTorque = Joint.setMaxMotorForce
+function Joint:getMaxMotorForce() return self._maxMotor or 1000 end
+Joint.getMaxMotorTorque = Joint.getMaxMotorForce
+
+-- Limits.
+function Joint:enableLimit(on)
+  self._limitOn = on and true or false
+  b2.joint_set_limits(self.handle, self._limitOn, self._lower or 0, self._upper or 0)
+end
+function Joint:isLimitEnabled() return self._limitOn or false end
+function Joint:setLimits(lo, hi)
+  self._lower, self._upper = lo, hi
+  b2.joint_set_limits(self.handle, true, lo, hi)
+  self._limitOn = true
+end
+function Joint:getLimits() return self._lower or 0, self._upper or 0 end
+function Joint:setLowerLimit(v) self:setLimits(v, self._upper or 0) end
+function Joint:setUpperLimit(v) self:setLimits(self._lower or 0, v) end
+function Joint:getLowerLimit() return self._lower or 0 end
+function Joint:getUpperLimit() return self._upper or 0 end
+
+-- Spring (LOVE calls it stiffness/damping on several joint types).
+function Joint:setSpringFrequency(hz)
+  self._hz = hz
+  b2.joint_set_spring(self.handle, hz > 0, hz, self._damp or 0.7)
+end
+function Joint:getSpringFrequency() return self._hz or 0 end
+function Joint:setSpringDampingRatio(d)
+  self._damp = d
+  b2.joint_set_spring(self.handle, (self._hz or 0) > 0, self._hz or 4, d)
+end
+function Joint:getSpringDampingRatio() return self._damp or 0.7 end
+
+-- Distance/rope length.
+function Joint:getLength() return b2.joint_length(self.handle) end
+function Joint:setLength(v) b2.joint_set_length(self.handle, v) end
+function Joint:setMaxLength(v)
+  self._upper = v
+  b2.joint_set_limits(self.handle, true, 0, v)
+end
+function Joint:getMaxLength() return self._upper or 0 end
+
+function Joint:getJointAngle()       return b2.joint_angle(self.handle) end
+function Joint:getJointTranslation() return b2.joint_translation(self.handle) end
+
+-- Mouse joint target.
+function Joint:setTarget(x, y) b2.joint_set_target(self.handle, x, y) end
+function Joint:getTarget()
+  if not self.anchor then return 0, 0 end
+  return b2.body_position(self.anchor)
+end
+
 -- ── windfield-compatible Collider ──────────────────────────────────
 
 -- windfield exposes the underlying LOVE Body as `collider.body`, and games
@@ -3918,9 +4120,21 @@ function World:queryPolygonArea(verts, class_names)
   return filterByClass(self, b2.query_box(self.handle, minx, miny, maxx - minx, maxy - miny), class_names)
 end
 
+-- Release the world AND its C slot.
+--
+-- This used to clear the collider table and stop, leaking the underlying
+-- b2 world every time. The engine allows 4 -- deliberately, since a cart
+-- needing five simultaneous physics worlds has a design problem -- so a
+-- game that builds a fresh world per level died on the fifth with
+-- "too many worlds (max 4)" and no clue why, having dutifully called
+-- destroy() each time.
 function World:destroy()
   for _, c in pairs(self.colliders) do c:destroy() end
   self.colliders = {}
+  if self.handle then
+    b2.world_destroy(self.handle)
+    self.handle = nil
+  end
 end
 
 -- debug draw: outline every live collider. Games gate this behind a key,

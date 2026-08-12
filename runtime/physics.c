@@ -49,6 +49,12 @@ static b2WorldId    worlds[MAX_WORLDS];
 static int          world_alive[MAX_WORLDS];
 static body_slot_t  bodies[MAX_BODIES];
 static shape_slot_t shapes[MAX_SHAPES];
+/* Joints live up here with the other slot tables rather than beside the
+ * joint code, because l_world_destroy has to clear a destroyed world's
+ * joint slots and is defined long before it. */
+#define MAX_JOINTS 2048
+typedef struct { b2JointId id; int active; int world; } joint_slot_t;
+static joint_slot_t joints[MAX_JOINTS];
 static float        pixels_per_meter = 32.0f;
 
 static b2WorldId world_get(lua_State *L, int h) {
@@ -127,6 +133,11 @@ static int l_world_destroy(lua_State *L) {
     for (int i = 0; i < MAX_SHAPES; i++)
         if (shapes[i].active && shapes[i].body >= 1 &&
             !bodies[shapes[i].body - 1].active) shapes[i].active = 0;
+    /* Joints too. b2DestroyWorld frees the joints themselves, but the slot
+     * table is ours -- leaving entries marked active would hand a later
+     * caller a handle into a destroyed world. */
+    for (int i = 0; i < MAX_JOINTS; i++)
+        if (joints[i].active && joints[i].world == h) joints[i].active = 0;
     b2DestroyWorld(worlds[h - 1]);
     world_alive[h - 1] = 0;
     return 0;
@@ -548,10 +559,6 @@ static int l_stats(lua_State *L) {
  * anchor points, so the anchors a cart passes in world pixels are
  * converted to each body's local space here. A cart should not have to
  * know that detail to hang a door on a hinge. */
-#define MAX_JOINTS 2048
-typedef struct { b2JointId id; int active; int world; } joint_slot_t;
-static joint_slot_t joints[MAX_JOINTS];
-
 static int joint_alloc(b2JointId id, int world) {
     for (int i = 0; i < MAX_JOINTS; i++) {
         if (!joints[i].active) {
@@ -681,6 +688,307 @@ static int l_joint_motor(lua_State *L) {
     int h = joint_alloc(b2CreateMotorJoint(world, &def), wh);
     if (!h) return luaL_error(L, "physics: too many joints (max %d)", MAX_JOINTS);
     lua_pushinteger(L, h);
+    return 1;
+}
+
+/* b2.joint_wheel(world, bodyA, bodyB, ax, ay, axisX, axisY [, collide])
+ * A suspension strut: body B slides along an axis relative to A and spins
+ * freely about the anchor. The car-wheel joint, hence the name. */
+static int l_joint_wheel(lua_State *L) {
+    int wh = (int)luaL_checkinteger(L, 1);
+    b2WorldId world = world_get(L, wh);
+    int a, b; two_bodies(L, &a, &b);
+    b2WheelJointDef def = b2DefaultWheelJointDef();
+    joint_base_from(L, &def.base, a, b, 4);
+    /* Same axis-as-rotation encoding as the prismatic joint above. */
+    float ax = (float)luaL_optnumber(L, 6, 0.0);
+    float ay = (float)luaL_optnumber(L, 7, 1.0);
+    float len = sqrtf(ax * ax + ay * ay);
+    if (len < 1e-6f) { ax = 0.0f; ay = 1.0f; len = 1.0f; }
+    b2Vec2 unit = { ax / len, ay / len };
+    b2Rot r = b2MakeRotFromUnitVector(unit);
+    def.base.localFrameA.q = b2InvMulRot(b2Body_GetRotation(bodies[a - 1].id), r);
+    def.base.localFrameB.q = b2InvMulRot(b2Body_GetRotation(bodies[b - 1].id), r);
+    /* Suspension on by default: a wheel joint with no spring is just a
+     * prismatic that also spins, which is never what someone asking for a
+     * wheel wants. */
+    def.enableSpring = true;
+    def.hertz = 4.0f;
+    def.dampingRatio = 0.7f;
+    int h = joint_alloc(b2CreateWheelJoint(world, &def), wh);
+    if (!h) return luaL_error(L, "physics: too many joints (max %d)", MAX_JOINTS);
+    lua_pushinteger(L, h);
+    return 1;
+}
+
+/* b2.joint_rope(world, bodyA, bodyB, ax, ay, maxLength [, collide])
+ *
+ * A rope: the bodies may come as close as they like but can never separate
+ * further than maxLength. Box2D v3 has no dedicated rope joint -- 2.x's was
+ * folded into the distance joint -- so this is a distance joint with its
+ * lower limit at zero, its upper at maxLength, and the rigid rest-length
+ * constraint switched OFF so only the limit acts. That is the same
+ * construction upstream recommends, not an approximation. */
+static int l_joint_rope(lua_State *L) {
+    int wh = (int)luaL_checkinteger(L, 1);
+    b2WorldId world = world_get(L, wh);
+    int a, b; two_bodies(L, &a, &b);
+    b2DistanceJointDef def = b2DefaultDistanceJointDef();
+    joint_base_from(L, &def.base, a, b, 4);
+    def.base.localFrameB.p = (b2Vec2){ 0.0f, 0.0f };   /* see joint_distance */
+    float maxLen = px2m(luaL_optnumber(L, 6, 64.0));
+    if (maxLen < 0.005f) maxLen = 0.005f;
+    def.length = maxLen;
+    def.minLength = 0.0f;
+    def.maxLength = maxLen;
+    def.enableLimit = true;
+    def.enableSpring = true;   /* springy along the free range... */
+    def.hertz = 0.0f;          /* ...with zero stiffness, so it is slack */
+    def.dampingRatio = 0.0f;
+    int h = joint_alloc(b2CreateDistanceJoint(world, &def), wh);
+    if (!h) return luaL_error(L, "physics: too many joints (max %d)", MAX_JOINTS);
+    lua_pushinteger(L, h);
+    return 1;
+}
+
+/* b2.joint_friction(world, bodyA, bodyB, ax, ay, maxForce, maxTorque
+ *                   [, collide])
+ *
+ * Top-down friction: resists relative motion without preventing it, which
+ * is how you fake ground drag in a game with no gravity. v3 dropped the
+ * dedicated friction joint; it is a motor joint whose target velocity is
+ * zero, so all it ever does is brake. Capping the force is what makes it
+ * friction rather than glue. */
+static int l_joint_friction(lua_State *L) {
+    int wh = (int)luaL_checkinteger(L, 1);
+    b2WorldId world = world_get(L, wh);
+    int a, b; two_bodies(L, &a, &b);
+    b2MotorJointDef def = b2DefaultMotorJointDef();
+    joint_base_from(L, &def.base, a, b, 4);
+    def.linearVelocity = (b2Vec2){ 0.0f, 0.0f };
+    def.angularVelocity = 0.0f;
+    def.maxVelocityForce  = (float)luaL_optnumber(L, 6, 100.0);
+    def.maxVelocityTorque = (float)luaL_optnumber(L, 7, 100.0);
+    /* No positional spring: friction resists MOTION, it does not pull the
+     * body back toward where it started. */
+    def.linearHertz = 0.0f;
+    def.angularHertz = 0.0f;
+    def.maxSpringForce = 0.0f;
+    int h = joint_alloc(b2CreateMotorJoint(world, &def), wh);
+    if (!h) return luaL_error(L, "physics: too many joints (max %d)", MAX_JOINTS);
+    lua_pushinteger(L, h);
+    return 1;
+}
+
+/* b2.joint_mouse(world, bodyGround, bodyTarget, tx, ty, maxForce
+ *                [, collide]) -> handle
+ *
+ * Drag a body toward a moving point. v3 has no mouse joint, and this is
+ * NOT an invention to paper over that: Box2D 3.2's own samples implement
+ * mouse dragging with exactly this construction (samples/sample.cpp,
+ * Sample::MouseDown) -- a motor joint with a linear spring, anchored on a
+ * body the caller moves. So the substitute is the upstream one.
+ *
+ * The target is set afterwards with joint_set_target. */
+static int l_joint_mouse(lua_State *L) {
+    int wh = (int)luaL_checkinteger(L, 1);
+    b2WorldId world = world_get(L, wh);
+    int a, b; two_bodies(L, &a, &b);
+    b2MotorJointDef def = b2DefaultMotorJointDef();
+    def.base.bodyIdA = bodies[a - 1].id;
+    def.base.bodyIdB = bodies[b - 1].id;
+    /* Grab the target body at the point the caller named, so it swings
+     * from where it was actually grabbed rather than from its centre. */
+    b2Vec2 grab;
+    grab.x = px2m(luaL_optnumber(L, 4, 0));
+    grab.y = px2m(luaL_optnumber(L, 5, 0));
+    def.base.localFrameA.p = b2Body_GetLocalPoint(bodies[a - 1].id, grab);
+    def.base.localFrameA.q = b2Rot_identity;
+    def.base.localFrameB.p = b2Body_GetLocalPoint(bodies[b - 1].id, grab);
+    def.base.localFrameB.q = b2Rot_identity;
+    def.base.collideConnected = lua_toboolean(L, 7);
+    /* Spring values from the upstream sample. */
+    def.linearHertz = 7.5f;
+    def.linearDampingRatio = 1.0f;
+    def.maxSpringForce = (float)luaL_optnumber(L, 6, 1000.0);
+    /* Angular friction proportional to the body's lever arm, so a dragged
+     * body does not spin wildly. Straight from the sample. */
+    b2MassData md = b2Body_GetMassData(bodies[b - 1].id);
+    if (md.mass > 0.0f) {
+        float g = b2Length(b2World_GetGravity(world));
+        float mg = md.mass * (g > 0.0f ? g : 9.8f);
+        float lever = sqrtf(md.rotationalInertia / md.mass);
+        def.maxVelocityTorque = 0.25f * lever * mg;
+    }
+    int h = joint_alloc(b2CreateMotorJoint(world, &def), wh);
+    if (!h) return luaL_error(L, "physics: too many joints (max %d)", MAX_JOINTS);
+    lua_pushinteger(L, h);
+    return 1;
+}
+
+/* b2.joint_set_target(joint, x, y) -- move a mouse joint's grab point.
+ * Implemented by moving the anchor body, which is what the sample does. */
+static int l_joint_set_target(lua_State *L) {
+    b2JointId j = joint_get(L, 1);
+    b2BodyId anchor = b2Joint_GetBodyA(j);
+    b2Vec2 p;
+    p.x = px2m(luaL_checknumber(L, 2));
+    p.y = px2m(luaL_checknumber(L, 3));
+    b2Body_SetTransform(anchor, p, b2Body_GetRotation(anchor));
+    b2Body_SetAwake(b2Joint_GetBodyB(j), true);
+    return 0;
+}
+
+/* ── joint tuning ──────────────────────────────────────────────────────
+ * LOVE's joint objects expose motors and limits, which is most of what
+ * makes a joint useful: a hinge with no motor cannot drive anything, and
+ * a slider with no limit slides forever. */
+
+static int l_joint_set_motor(lua_State *L) {
+    b2JointId j = joint_get(L, 1);
+    int on = lua_toboolean(L, 2);
+    float speed = (float)luaL_optnumber(L, 3, 0.0);
+    float maxv  = (float)luaL_optnumber(L, 4, 1000.0);
+    switch (b2Joint_GetType(j)) {
+        case b2_revoluteJoint:
+            b2RevoluteJoint_EnableMotor(j, on);
+            b2RevoluteJoint_SetMotorSpeed(j, speed);
+            b2RevoluteJoint_SetMaxMotorTorque(j, maxv);
+            break;
+        case b2_prismaticJoint:
+            b2PrismaticJoint_EnableMotor(j, on);
+            b2PrismaticJoint_SetMotorSpeed(j, speed);
+            b2PrismaticJoint_SetMaxMotorForce(j, px2m(maxv));
+            break;
+        case b2_wheelJoint:
+            b2WheelJoint_EnableMotor(j, on);
+            b2WheelJoint_SetMotorSpeed(j, speed);
+            b2WheelJoint_SetMaxMotorTorque(j, maxv);
+            break;
+        default:
+            return luaL_error(L, "physics: this joint has no motor");
+    }
+    return 0;
+}
+
+static int l_joint_set_limits(lua_State *L) {
+    b2JointId j = joint_get(L, 1);
+    int on = lua_toboolean(L, 2);
+    switch (b2Joint_GetType(j)) {
+        case b2_revoluteJoint:
+            /* radians, not pixels */
+            b2RevoluteJoint_EnableLimit(j, on);
+            b2RevoluteJoint_SetLimits(j, (float)luaL_optnumber(L, 3, 0.0),
+                                         (float)luaL_optnumber(L, 4, 0.0));
+            break;
+        case b2_prismaticJoint:
+            b2PrismaticJoint_EnableLimit(j, on);
+            b2PrismaticJoint_SetLimits(j, px2m(luaL_optnumber(L, 3, 0.0)),
+                                          px2m(luaL_optnumber(L, 4, 0.0)));
+            break;
+        case b2_wheelJoint:
+            b2WheelJoint_EnableLimit(j, on);
+            b2WheelJoint_SetLimits(j, px2m(luaL_optnumber(L, 3, 0.0)),
+                                     px2m(luaL_optnumber(L, 4, 0.0)));
+            break;
+        case b2_distanceJoint:
+            b2DistanceJoint_EnableLimit(j, on);
+            b2DistanceJoint_SetLengthRange(j, px2m(luaL_optnumber(L, 3, 0.0)),
+                                              px2m(luaL_optnumber(L, 4, 0.0)));
+            break;
+        default:
+            return luaL_error(L, "physics: this joint has no limits");
+    }
+    return 0;
+}
+
+/* Spring stiffness, for the joints that have one. */
+static int l_joint_set_spring(lua_State *L) {
+    b2JointId j = joint_get(L, 1);
+    int on = lua_toboolean(L, 2);
+    float hz   = (float)luaL_optnumber(L, 3, 4.0);
+    float damp = (float)luaL_optnumber(L, 4, 0.7);
+    switch (b2Joint_GetType(j)) {
+        case b2_wheelJoint:
+            b2WheelJoint_EnableSpring(j, on);
+            b2WheelJoint_SetSpringHertz(j, hz);
+            b2WheelJoint_SetSpringDampingRatio(j, damp);
+            break;
+        case b2_distanceJoint:
+            b2DistanceJoint_EnableSpring(j, on);
+            b2DistanceJoint_SetSpringHertz(j, hz);
+            b2DistanceJoint_SetSpringDampingRatio(j, damp);
+            break;
+        case b2_prismaticJoint:
+            b2PrismaticJoint_EnableSpring(j, on);
+            b2PrismaticJoint_SetSpringHertz(j, hz);
+            b2PrismaticJoint_SetSpringDampingRatio(j, damp);
+            break;
+        case b2_revoluteJoint:
+            b2RevoluteJoint_EnableSpring(j, on);
+            b2RevoluteJoint_SetSpringHertz(j, hz);
+            b2RevoluteJoint_SetSpringDampingRatio(j, damp);
+            break;
+        default:
+            return luaL_error(L, "physics: this joint has no spring");
+    }
+    return 0;
+}
+
+/* Current joint state, for carts that steer off it. */
+static int l_joint_length(lua_State *L) {
+    b2JointId j = joint_get(L, 1);
+    if (b2Joint_GetType(j) != b2_distanceJoint)
+        return luaL_error(L, "physics: joint_length is distance/rope only");
+    lua_pushnumber(L, m2px(b2DistanceJoint_GetLength(j)));
+    return 1;
+}
+
+static int l_joint_set_length(lua_State *L) {
+    b2JointId j = joint_get(L, 1);
+    if (b2Joint_GetType(j) != b2_distanceJoint)
+        return luaL_error(L, "physics: joint_set_length is distance/rope only");
+    b2DistanceJoint_SetLength(j, px2m(luaL_checknumber(L, 2)));
+    return 0;
+}
+
+/* Angle (revolute) or translation (prismatic).
+ *
+ * The WHEEL joint is deliberately absent from both. Box2D 3.2 exposes no
+ * b2WheelJoint_GetAngle or _GetTranslation -- only motor/spring/limit
+ * controls -- so there is nothing to report. Refusing loudly is the right
+ * answer: a cart steering off a silently-zero suspension travel would be
+ * far worse than one that gets told the reading does not exist. */
+static int l_joint_angle(lua_State *L) {
+    b2JointId j = joint_get(L, 1);
+    switch (b2Joint_GetType(j)) {
+        case b2_revoluteJoint: lua_pushnumber(L, b2RevoluteJoint_GetAngle(j)); break;
+        default: return luaL_error(L, "physics: this joint has no angle reading");
+    }
+    return 1;
+}
+
+static int l_joint_translation(lua_State *L) {
+    b2JointId j = joint_get(L, 1);
+    switch (b2Joint_GetType(j)) {
+        case b2_prismaticJoint:
+            lua_pushnumber(L, m2px(b2PrismaticJoint_GetTranslation(j))); break;
+        default: return luaL_error(L, "physics: this joint has no translation reading");
+    }
+    return 1;
+}
+
+/* Which kind is this? Lets the Lua layer give a joint the right methods. */
+static int l_joint_type(lua_State *L) {
+    switch (b2Joint_GetType(joint_get(L, 1))) {
+        case b2_revoluteJoint:  lua_pushstring(L, "revolute"); break;
+        case b2_prismaticJoint: lua_pushstring(L, "prismatic"); break;
+        case b2_distanceJoint:  lua_pushstring(L, "distance"); break;
+        case b2_weldJoint:      lua_pushstring(L, "weld"); break;
+        case b2_motorJoint:     lua_pushstring(L, "motor"); break;
+        case b2_wheelJoint:     lua_pushstring(L, "wheel"); break;
+        default:                lua_pushstring(L, "unknown"); break;
+    }
     return 1;
 }
 
@@ -822,6 +1130,19 @@ static const luaL_Reg b2_lib[] = {
     { "joint_prismatic",  l_joint_prismatic },
     { "joint_weld",       l_joint_weld },
     { "joint_motor",      l_joint_motor },
+    { "joint_wheel",      l_joint_wheel },
+    { "joint_rope",       l_joint_rope },
+    { "joint_friction",   l_joint_friction },
+    { "joint_mouse",      l_joint_mouse },
+    { "joint_set_target", l_joint_set_target },
+    { "joint_set_motor",  l_joint_set_motor },
+    { "joint_set_limits", l_joint_set_limits },
+    { "joint_set_spring", l_joint_set_spring },
+    { "joint_length",     l_joint_length },
+    { "joint_set_length", l_joint_set_length },
+    { "joint_angle",      l_joint_angle },
+    { "joint_translation", l_joint_translation },
+    { "joint_type",       l_joint_type },
     { "joint_destroy",    l_joint_destroy },
     { "joint_force",      l_joint_force },
     { "joint_torque",     l_joint_torque },

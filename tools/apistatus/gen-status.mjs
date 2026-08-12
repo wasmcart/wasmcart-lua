@@ -42,6 +42,25 @@ const ours = new Set(
     .filter((l) => l.startsWith("love.")),
 );
 
+// Functions that EXIST only to refuse.
+//
+// The enumerator walks the love table and cannot tell a working function
+// from one whose whole body is error("not available"). Counting those as
+// implemented is precisely the lie this generated table exists to prevent:
+// it would have taken love.physics to a triumphant 22/22 while two of the
+// entries raise the moment a cart calls them.
+//
+// They are still WORTH HAVING as stubs -- a named error that says why and
+// what to do instead beats a nil-index crash inside somebody's library --
+// but they are listed separately and excluded from the count.
+const REFUSED = {
+  "love.physics.newGearJoint":
+    "Box2D 3.x removed the gear joint; no primitive to build one on",
+  "love.physics.newPulleyJoint":
+    "Box2D 3.x removed the pulley joint; no primitive to build one on",
+};
+for (const name of Object.keys(REFUSED)) ours.delete(name);
+
 // The LOVE surface we measure against. Taken from libretro's lutro-status
 // list so our percentage and theirs mean the same thing -- comparing to a
 // denominator we picked ourselves would be marking our own homework.
@@ -119,6 +138,20 @@ for (const m of [...byModule.keys()].sort()) {
   for (const fn of fns) {
     lines.push(`| ${ours.has(fn) ? ":white_check_mark:" : ":white_medium_square:"} | \`${fn}\` |`);
   }
+  lines.push("");
+}
+
+const refusedList = Object.entries(REFUSED);
+if (refusedList.length) {
+  lines.push("## Present but refusing");
+  lines.push("");
+  lines.push("These exist so that calling them raises a clear, named error");
+  lines.push("instead of crashing somewhere unhelpful. They are **not**");
+  lines.push("implemented and are excluded from the count above.");
+  lines.push("");
+  lines.push("| function | why |");
+  lines.push("|---|---|");
+  for (const [fn, why] of refusedList) lines.push(`| \`${fn}\` | ${why} |`);
   lines.push("");
 }
 

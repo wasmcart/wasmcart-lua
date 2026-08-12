@@ -13,7 +13,7 @@ To regenerate:
 node tools/apistatus/gen-status.mjs api-dump.txt
 ```
 
-**206 of 320 LOVE functions implemented (64%).**
+**215 of 320 LOVE functions implemented (67%).**
 
 A caveat worth stating plainly: this table measures PRESENCE. A
 function can be exported and still be wrong. `test/apiconform/`
@@ -39,7 +39,7 @@ list, so this percentage and Lutro's are directly comparable.
 | `love.keyboard` | 9 | 9 | 100% |
 | `love.math` | 13 | 16 | 81% |
 | `love.mouse` | 8 | 18 | 44% |
-| `love.physics` | 11 | 22 | 50% |
+| `love.physics` | 20 | 22 | 91% |
 | `love.sound` | 2 | 2 | 100% |
 | `love.system` | 7 | 8 | 88% |
 | `love.thread` | 3 | 3 | 100% |
@@ -349,7 +349,7 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_medium_square: | `love.mouse.setX` |
 | :white_medium_square: | `love.mouse.setY` |
 
-### `love.physics` — 11/22
+### `love.physics` — 20/22
 
 | | function |
 |---|---|
@@ -358,21 +358,21 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_check_mark: | `love.physics.newBody` |
 | :white_check_mark: | `love.physics.newChainShape` |
 | :white_check_mark: | `love.physics.newCircleShape` |
-| :white_medium_square: | `love.physics.newDistanceJoint` |
+| :white_check_mark: | `love.physics.newDistanceJoint` |
 | :white_check_mark: | `love.physics.newEdgeShape` |
 | :white_check_mark: | `love.physics.newFixture` |
-| :white_medium_square: | `love.physics.newFrictionJoint` |
+| :white_check_mark: | `love.physics.newFrictionJoint` |
 | :white_medium_square: | `love.physics.newGearJoint` |
-| :white_medium_square: | `love.physics.newMotorJoint` |
-| :white_medium_square: | `love.physics.newMouseJoint` |
+| :white_check_mark: | `love.physics.newMotorJoint` |
+| :white_check_mark: | `love.physics.newMouseJoint` |
 | :white_check_mark: | `love.physics.newPolygonShape` |
-| :white_medium_square: | `love.physics.newPrismaticJoint` |
+| :white_check_mark: | `love.physics.newPrismaticJoint` |
 | :white_medium_square: | `love.physics.newPulleyJoint` |
 | :white_check_mark: | `love.physics.newRectangleShape` |
-| :white_medium_square: | `love.physics.newRevoluteJoint` |
-| :white_medium_square: | `love.physics.newRopeJoint` |
-| :white_medium_square: | `love.physics.newWeldJoint` |
-| :white_medium_square: | `love.physics.newWheelJoint` |
+| :white_check_mark: | `love.physics.newRevoluteJoint` |
+| :white_check_mark: | `love.physics.newRopeJoint` |
+| :white_check_mark: | `love.physics.newWeldJoint` |
+| :white_check_mark: | `love.physics.newWheelJoint` |
 | :white_check_mark: | `love.physics.newWorld` |
 | :white_check_mark: | `love.physics.setMeter` |
 
@@ -469,6 +469,17 @@ list, so this percentage and Lutro's are directly comparable.
 | :white_medium_square: | `love.window.showMessageBox` |
 | :white_check_mark: | `love.window.toPixels` |
 | :white_check_mark: | `love.window.updateMode` |
+
+## Present but refusing
+
+These exist so that calling them raises a clear, named error
+instead of crashing somewhere unhelpful. They are **not**
+implemented and are excluded from the count above.
+
+| function | why |
+|---|---|
+| `love.physics.newGearJoint` | Box2D 3.x removed the gear joint; no primitive to build one on |
+| `love.physics.newPulleyJoint` | Box2D 3.x removed the pulley joint; no primitive to build one on |
 
 ## Beyond LOVE
 

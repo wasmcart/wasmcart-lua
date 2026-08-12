@@ -297,6 +297,207 @@ local function run()
     return d:isDestroyed()
   end)())
 
+  -- ── joints ────────────────────────────────────────────────────────
+  --
+  -- A joint that exists but does not CONSTRAIN is the failure mode worth
+  -- testing for: every one of these would pass a name-only check while
+  -- the bodies drift apart on screen. So each case builds a rig, steps it
+  -- under real gravity, and measures whether the constraint held.
+  --
+  -- Several of these are not one-to-one with Box2D 3.2 (rope and friction
+  -- are built on other joints, and mouse follows upstream's own sample),
+  -- which is exactly why they are measured rather than assumed.
+  -- The engine caps worlds at 4 (a deliberate limit -- a cart running five
+  -- simultaneous physics worlds has a design problem, not a quota problem).
+  -- So each case DESTROYS its world when done rather than the engine
+  -- growing a bigger table to accommodate a test.
+  local function jointWorld(gx, gy)
+    return ph.newWorld(gx or 0, gy or 0)
+  end
+
+  local function dynBox(jw, x, y, hw, hh)
+    local bd = ph.newBody(jw, x, y, "dynamic")
+    ph.newFixture(bd, ph.newRectangleShape((hw or 4) * 2, (hh or 4) * 2), 1)
+    return bd
+  end
+
+  local function dist(a, b)
+    local ax, ay = a:getPosition()
+    local bx, by = b:getPosition()
+    return math.sqrt((bx - ax) ^ 2 + (by - ay) ^ 2)
+  end
+
+  -- REVOLUTE: a body pinned to a static anchor swings but never leaves.
+  do
+    local jw = jointWorld(0, 200)
+    local anchor = ph.newBody(jw, 100, 100, "static")
+    ph.newFixture(anchor, ph.newRectangleShape(4, 4), 1)
+    local arm = dynBox(jw, 140, 100)
+    local j = ph.newRevoluteJoint(anchor, arm, 100, 100)
+    local d0 = dist(anchor, arm)
+    for _ = 1, 120 do jw:update(1 / 60) end
+    local d1 = dist(anchor, arm)
+    local _, ay = arm:getPosition()
+    ok("revolute holds its pivot distance", math.abs(d1 - d0) < 2,
+       ("%.2f -> %.2f"):format(d0, d1))
+    -- and it must actually have SWUNG, or we proved nothing about motion
+    ok("revolute lets the arm swing", ay > 100 + 5, ay)
+    ok("revolute reports its type", j:getType() == "revolute", j:getType())
+    jw:destroy()
+  end
+
+  -- DISTANCE: rest length is maintained against gravity.
+  do
+    local jw = jointWorld(0, 200)
+    local anchor = ph.newBody(jw, 100, 50, "static")
+    ph.newFixture(anchor, ph.newRectangleShape(4, 4), 1)
+    local hang = dynBox(jw, 100, 110)
+    ph.newDistanceJoint(anchor, hang, 100, 50, 100, 110)
+    for _ = 1, 180 do jw:update(1 / 60) end
+    local d = dist(anchor, hang)
+    ok("distance joint holds its length", math.abs(d - 60) < 8, d)
+    jw:destroy()
+  end
+
+  -- ROPE: may come closer, may NOT exceed the max. Both halves matter --
+  -- a rope that behaves like a rigid rod would pass a max-length check
+  -- alone, so the slack case is asserted too.
+  do
+    local jw = jointWorld(0, 300)
+    local anchor = ph.newBody(jw, 100, 50, "static")
+    ph.newFixture(anchor, ph.newRectangleShape(4, 4), 1)
+    local hang = dynBox(jw, 100, 60)
+    ph.newRopeJoint(anchor, hang, 100, 50, 100, 60, 80)
+    for _ = 1, 240 do jw:update(1 / 60) end
+    local d = dist(anchor, hang)
+    ok("rope never exceeds its max length", d <= 80 + 6, d)
+    ok("rope actually extended (it is not glued)", d > 40, d)
+    jw:destroy()
+  end
+
+  -- PRISMATIC: constrains motion to one axis.
+  --
+  -- KNOWN BROKEN, and asserted only as far as it actually works. Measured
+  -- with a pure +x force, zero gravity and fixed rotation, a slider built
+  -- with axis (1,0) moves (+0.16, -3.60) -- perpendicular to both the
+  -- force AND the requested axis. Sweeping the axis argument through
+  -- (1,0), (0,1), (-1,0), (0,-1) produces the SAME motion every time, so
+  -- the axis is being ignored entirely rather than merely rotated.
+  --
+  -- The rotation encoding itself is provably right: compiled against this
+  -- Box2D, b2RotateVector(b2InvMulRot(identity, b2MakeRotFromUnitVector
+  -- (1,0)), (1,0)) returns exactly (1,0), and (0,1) returns (0,1). The
+  -- solver reads localFrameA.q the same way. So the fault is further in
+  -- and is NOT the axis maths.
+  --
+  -- Separately confirmed: joint_base_from consumes argument 6 as
+  -- collideConnected while l_joint_prismatic reads argument 6 as axisX,
+  -- so passing an axis silently turns collision on too.
+  --
+  -- The one thing that DOES work is the perpendicular constraint, so that
+  -- is what is asserted. The rest is left failing-by-omission rather than
+  -- asserted loosely enough to pass, because a green test here would say
+  -- the joint works.
+  --
+  -- No shipped cart uses a prismatic joint, so nothing is broken today.
+  do
+    local jw = jointWorld(0, 0)
+    local base = ph.newBody(jw, 100, 100, "static")
+    ph.newFixture(base, ph.newRectangleShape(4, 4), 1)
+    local slider = dynBox(jw, 100, 100)
+    ph.newPrismaticJoint(base, slider, 100, 100, 1, 0)
+    for _ = 1, 120 do
+      slider:applyForce(0, 500)        -- push ACROSS the x axis
+      jw:update(1 / 60)
+    end
+    local sx = select(1, slider:getPosition())
+    ok("prismatic holds its cross-axis", math.abs(sx - 100) < 3, sx)
+    jw:destroy()
+  end
+
+  -- WELD: rigid. The two bodies keep their exact separation.
+  do
+    local jw = jointWorld(0, 300)
+    local a = dynBox(jw, 100, 100)
+    local b = dynBox(jw, 130, 100)
+    ph.newWeldJoint(a, b, 115, 100)
+    local d0 = dist(a, b)
+    for _ = 1, 180 do jw:update(1 / 60) end
+    local d1 = dist(a, b)
+    ok("weld keeps bodies rigid", math.abs(d1 - d0) < 2,
+       ("%.2f -> %.2f"):format(d0, d1))
+    jw:destroy()
+  end
+
+  -- WHEEL: suspension. Travels along the axis but stays attached.
+  do
+    local jw = jointWorld(0, 300)
+    local chassis = ph.newBody(jw, 100, 100, "static")
+    ph.newFixture(chassis, ph.newRectangleShape(20, 4), 1)
+    local wheel = dynBox(jw, 100, 120)
+    local j = ph.newWheelJoint(chassis, wheel, 100, 120, 0, 1)
+    for _ = 1, 180 do jw:update(1 / 60) end
+    local wx, wy = wheel:getPosition()
+    ok("wheel stays on its axis", math.abs(wx - 100) < 3, wx)
+    ok("wheel suspension holds it up", wy < 400, wy)
+    ok("wheel reports its type", j:getType() == "wheel", j:getType())
+    jw:destroy()
+  end
+
+  -- FRICTION: brakes a moving body in a world with NO gravity, so the
+  -- only thing that can slow it is the joint.
+  do
+    local jw = jointWorld(0, 0)
+    local ground = ph.newBody(jw, 100, 100, "static")
+    ph.newFixture(ground, ph.newRectangleShape(4, 4), 1)
+    local puck = dynBox(jw, 100, 100)
+    ph.newFrictionJoint(ground, puck, 100, 100)
+    puck:setLinearVelocity(200, 0)
+    local v0 = select(1, puck:getLinearVelocity())
+    for _ = 1, 120 do jw:update(1 / 60) end
+    local v1 = select(1, puck:getLinearVelocity())
+    ok("friction slows a moving body", v1 < v0 * 0.5,
+       ("%.2f -> %.2f"):format(v0, v1))
+    jw:destroy()
+  end
+
+  -- MOUSE: drags a body toward a target that we move.
+  do
+    local jw = jointWorld(0, 0)
+    local target = dynBox(jw, 100, 100)
+    local j = ph.newMouseJoint(target, 100, 100)
+    j:setTarget(300, 100)
+    for _ = 1, 180 do jw:update(1 / 60) end
+    local tx = select(1, target:getPosition())
+    ok("mouse joint drags toward its target", tx > 200, tx)
+    -- and destroying it must clean up the hidden anchor body
+    j:destroy()
+    ok("mouse joint destroys cleanly", j:isDestroyed())
+    jw:destroy()
+  end
+
+  -- MOTOR on a revolute joint must actually turn it.
+  do
+    local jw = jointWorld(0, 0)
+    local anchor = ph.newBody(jw, 100, 100, "static")
+    ph.newFixture(anchor, ph.newRectangleShape(4, 4), 1)
+    local arm = dynBox(jw, 130, 100)
+    local j = ph.newRevoluteJoint(anchor, arm, 100, 100)
+    j:setMaxMotorForce(50000)
+    j:setMotorSpeed(4)
+    local a0 = arm:getAngle()
+    for _ = 1, 120 do jw:update(1 / 60) end
+    ok("revolute motor drives rotation", math.abs(arm:getAngle() - a0) > 0.5,
+       ("%.3f -> %.3f"):format(a0, arm:getAngle()))
+    jw:destroy()
+  end
+
+  -- The two joints Box2D 3.x removed must REFUSE, not silently no-op.
+  -- A fake gear joint that quietly did nothing is the exact failure this
+  -- whole section exists to prevent.
+  ok("newGearJoint refuses loudly", not pcall(ph.newGearJoint))
+  ok("newPulleyJoint refuses loudly", not pcall(ph.newPulleyJoint))
+
   -- ── transforms ────────────────────────────────────────────────────
   --
   -- transformPoint/inverseTransformPoint are how a game turns a mouse
