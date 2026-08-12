@@ -1005,11 +1005,63 @@ function graphics.setLineWidth(w) line_width = w or 1 end
 function graphics.getLineWidth() return line_width end
 function graphics.setLineStyle() end
 function graphics.getLineStyle() return "rough" end
-function graphics.setLineJoin() end
 
-function graphics.setBlendMode(mode)
+-- Paired getters for state a cart can set.
+--
+-- A getter whose setter exists is not decoration: LOVE code reads state to
+-- restore it (set, draw, set back), and a missing getter turns that idiom
+-- into a nil arithmetic error deep in someone's library. These store what
+-- was asked for and report it back truthfully, including where the
+-- rasterizer cannot honour it -- an honest round-trip beats a hard failure.
+local line_join = "miter"
+function graphics.setLineJoin(j) line_join = j or "miter" end
+function graphics.getLineJoin() return line_join end
+
+local point_size = 1
+function graphics.setPointSize(sz) point_size = sz or 1 end
+function graphics.getPointSize() return point_size end
+
+local default_min, default_mag, default_aniso = "linear", "linear", 1
+function graphics.setDefaultFilter(mi, ma, an)
+  default_min = mi or "linear"
+  default_mag = ma or default_min
+  default_aniso = an or 1
+end
+function graphics.getDefaultFilter()
+  return default_min, default_mag, default_aniso
+end
+
+local blend_mode, blend_alpha = "alpha", "alphamultiply"
+function graphics.setBlendMode(mode, alphamode)
+  blend_mode = mode or "alpha"
+  blend_alpha = alphamode or "alphamultiply"
   wc.set_blend(mode == "add" and 1 or 0)
 end
+function graphics.getBlendMode() return blend_mode, blend_alpha end
+
+-- Pixel vs logical size. A cart's framebuffer IS its pixel buffer -- there
+-- is no OS DPI scaling between them -- so these agree with the logical size
+-- and the scale is 1. Reported rather than omitted because libraries branch
+-- on them to decide whether to draw at 2x.
+function graphics.getDPIScale() return 1 end
+function graphics.getPixelWidth() return graphics.getWidth() end
+function graphics.getPixelHeight() return graphics.getHeight() end
+function graphics.getPixelDimensions()
+  return graphics.getWidth(), graphics.getHeight()
+end
+
+-- Renderer identity. Real LOVE returns the GL strings; a cart cannot see
+-- the GL context (that is the whole point of the boundary), so this names
+-- the engine truthfully instead of pretending to be desktop OpenGL.
+function graphics.getRendererInfo()
+  return "wasmcart-lua", "1.0", "wasmcart", "GLES3/WebGL2"
+end
+
+function graphics.getStackDepth() return tdepth end
+
+-- Stencil is not implemented. Report it OFF rather than erroring, so the
+-- common "read it, set it, restore it" idiom round-trips.
+function graphics.getStencilTest() return "always", 0 end
 
 -- ── shaders ────────────────────────────────────────────────────────
 --
@@ -2082,6 +2134,28 @@ function keyboard.isDown(...)
   return false
 end
 
+-- Scancodes. There is no physical keyboard here -- keys are pad buttons
+-- wearing key names -- so a scancode and a key are the same thing and the
+-- two conversions are identity. Reported rather than omitted because
+-- LOVE games routinely call isScancodeDown for layout independence, and a
+-- missing function there means the game simply never sees input.
+function keyboard.isScancodeDown(...) return keyboard.isDown(...) end
+function keyboard.getScancodeFromKey(key) return key end
+function keyboard.getKeyFromScancode(sc) return sc end
+
+-- Key repeat and text input are host concerns a cart cannot influence.
+-- Store what was asked so the getter round-trips, and report the honest
+-- answer for the capability queries.
+local key_repeat, text_input = false, false
+function keyboard.setKeyRepeat(enable) key_repeat = enable and true or false end
+function keyboard.hasKeyRepeat() return key_repeat end
+function keyboard.setTextInput(enable) text_input = enable and true or false end
+function keyboard.hasTextInput() return text_input end
+
+-- No on-screen keyboard: a cart cannot summon one, and claiming otherwise
+-- would have a game wait forever for text that never arrives.
+function keyboard.hasScreenKeyboard() return false end
+
 local joystick = {}
 love.joystick = joystick
 
@@ -2402,6 +2476,45 @@ local function update_vcursor()
   vcursor_y = math.max(0, math.min(H, vcursor_y))
 end
 
+-- ── love.touch ─────────────────────────────────────────────────────
+--
+-- The pointer ABI already carries TEN slots -- slot 0 is the mouse, 1-9 are
+-- fingers -- and love.mouse only ever reads slot 0. So multi-touch was
+-- always there; what was missing was the standard API for reaching it, and
+-- without that a LOVE game written for a phone has no way to ask.
+--
+-- Touch IDs are the slot numbers. LOVE only promises they are opaque and
+-- stable while a finger is down, which slots are.
+local touch = {}
+love.touch = touch
+
+function touch.getTouches()
+  local out = {}
+  for slot = 1, 9 do
+    local _, _, buttons, active = wc.pointer(slot)
+    if active and buttons ~= 0 then out[#out + 1] = slot end
+  end
+  return out
+end
+
+function touch.getPosition(id)
+  local x, y, buttons, active = wc.pointer(id)
+  if not (active and buttons ~= 0) then
+    error("love.touch.getPosition: no touch with id " .. tostring(id), 2)
+  end
+  return x, y
+end
+
+-- No pressure sensor in the ABI. LOVE returns 1 for a plain touch, which is
+-- what a device without pressure reports anyway.
+function touch.getPressure(id)
+  local _, _, buttons, active = wc.pointer(id)
+  if not (active and buttons ~= 0) then
+    error("love.touch.getPressure: no touch with id " .. tostring(id), 2)
+  end
+  return 1
+end
+
 -- ── love.math ──────────────────────────────────────────────────────
 local lmath = {}
 love.math = lmath
@@ -2415,6 +2528,132 @@ function lmath.random(a, b)
 end
 
 function lmath.setRandomSeed() end -- host owns the seed; no-op by design
+
+-- Colour helpers. Pure arithmetic, and the reason they matter is that
+-- LOVE 11 changed colours from 0-255 to 0-1: every port of an older game
+-- reaches for these, and without them the game draws in the wrong colours
+-- rather than erroring.
+function lmath.colorFromBytes(r, g, b, a)
+  if a ~= nil then a = a / 255 end
+  return r / 255, g / 255, b / 255, a
+end
+
+function lmath.colorToBytes(r, g, b, a)
+  local function q(v) return math.floor(math.min(1, math.max(0, v)) * 255 + 0.5) end
+  if a ~= nil then a = q(a) end
+  return q(r), q(g), q(b), a
+end
+
+-- sRGB <-> linear. The standard piecewise transfer function, not the 2.2
+-- approximation: a shader doing correct lighting needs the real curve.
+local function _g2l(c)
+  if c <= 0.04045 then return c / 12.92 end
+  return ((c + 0.055) / 1.055) ^ 2.4
+end
+local function _l2g(c)
+  if c <= 0.0031308 then return c * 12.92 end
+  return 1.055 * (c ^ (1 / 2.4)) - 0.055
+end
+function lmath.gammaToLinear(r, g, b, a)
+  if g == nil then return _g2l(r) end
+  return _g2l(r), _g2l(g), _g2l(b), a
+end
+function lmath.linearToGamma(r, g, b, a)
+  if g == nil then return _l2g(r) end
+  return _l2g(r), _l2g(g), _l2g(b), a
+end
+
+-- Normally-distributed random, via Box-Muller on the host RNG so it stays
+-- deterministic with everything else.
+function lmath.randomNormal(stddev, mean)
+  stddev = stddev or 1; mean = mean or 0
+  local u1 = math.max(1e-12, wc.rand())
+  local u2 = wc.rand()
+  return math.sqrt(-2 * math.log(u1)) * math.cos(2 * math.pi * u2) * stddev + mean
+end
+
+-- Is this polygon convex? Sign of the cross product must not change as the
+-- winding walks the vertices.
+function lmath.isConvex(...)
+  local a = ...
+  local v = (type(a) == "table") and a or { ... }
+  local n = #v / 2
+  if n < 3 then return false end
+  local sign = 0
+  for i = 0, n - 1 do
+    local x1, y1 = v[i * 2 + 1], v[i * 2 + 2]
+    local x2, y2 = v[((i + 1) % n) * 2 + 1], v[((i + 1) % n) * 2 + 2]
+    local x3, y3 = v[((i + 2) % n) * 2 + 1], v[((i + 2) % n) * 2 + 2]
+    local cross = (x2 - x1) * (y3 - y2) - (y2 - y1) * (x3 - x2)
+    if cross ~= 0 then
+      local sgn = cross > 0 and 1 or -1
+      if sign == 0 then sign = sgn elseif sgn ~= sign then return false end
+    end
+  end
+  return true
+end
+
+-- Ear-clipping triangulation. love.graphics.polygon only fans convex
+-- shapes, so a cart with a concave polygon needs this to draw it at all.
+function lmath.triangulate(...)
+  local a = ...
+  local v = (type(a) == "table") and a or { ... }
+  local n = #v / 2
+  if n < 3 then error("love.math.triangulate: need at least 3 vertices", 2) end
+  local idx = {}
+  for i = 1, n do idx[i] = i end
+  -- ensure counter-clockwise winding
+  local area = 0
+  for i = 1, n do
+    local j = i % n + 1
+    area = area + (v[i*2-1] * v[j*2] - v[j*2-1] * v[i*2])
+  end
+  if area < 0 then
+    local r = {}
+    for i = n, 1, -1 do r[#r + 1] = idx[i] end
+    idx = r
+  end
+  local function pt(k) return v[idx[k]*2-1], v[idx[k]*2] end
+  local tris, guard = {}, 0
+  while #idx > 3 and guard < 10000 do
+    guard = guard + 1
+    local clipped = false
+    for i = 1, #idx do
+      local i0 = (i - 2) % #idx + 1
+      local i1 = i
+      local i2 = i % #idx + 1
+      local ax, ay = pt(i0); local bx, by = pt(i1); local cx, cy = pt(i2)
+      local cross = (bx - ax) * (cy - by) - (by - ay) * (cx - bx)
+      if cross > 0 then                        -- convex corner
+        local ok = true
+        for k = 1, #idx do
+          if k ~= i0 and k ~= i1 and k ~= i2 then
+            local px, py = pt(k)
+            -- point-in-triangle by barycentric sign
+            local d1 = (px-bx)*(ay-by) - (ax-bx)*(py-by)
+            local d2 = (px-cx)*(by-cy) - (bx-cx)*(py-cy)
+            local d3 = (px-ax)*(cy-ay) - (cx-ax)*(py-ay)
+            local neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
+            local pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
+            if not (neg and pos) then ok = false; break end
+          end
+        end
+        if ok then
+          tris[#tris + 1] = { ax, ay, bx, by, cx, cy }
+          table.remove(idx, i1)
+          clipped = true
+          break
+        end
+      end
+    end
+    if not clipped then break end             -- degenerate; stop rather than spin
+  end
+  if #idx == 3 then
+    local ax, ay = pt(1); local bx, by = pt(2); local cx, cy = pt(3)
+    tris[#tris + 1] = { ax, ay, bx, by, cx, cy }
+  end
+  return tris
+end
 
 -- An independent generator object. Seeded deterministically (xorshift32)
 -- so two carts given the same seed produce the same stream, which the
