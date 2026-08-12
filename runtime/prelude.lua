@@ -921,18 +921,41 @@ end
 -- The state is captured on EVERY push, not only push("all"): a renderer
 -- that pushes plain and pops expecting its canvas back is relying on
 -- LOVE's actual behaviour, and the cost is one small table.
+-- The transform stack REUSES its frames.
+--
+-- push() used to build a fresh mixed table (5 array slots + 7 hash keys) on
+-- every call, and a mixed table is the most expensive shape Lua allocates.
+-- Both carts and the 3D renderer push/pop many times a frame, so this was
+-- pure per-frame garbage for a structure whose shape never changes. The
+-- frames are private to this stack and never escape -- pop() copies the
+-- values straight back into locals -- so keeping them around is safe.
+-- tdepth is the live depth; frames above it are stale but harmless.
+local tdepth = 0
+
 function graphics.push(stacktype)
-  tstack[#tstack + 1] = {
-    tx, ty, tsx, tsy, trot,
-    canvas = cur_canvas,
-    shader = cur_shader,
-    r = cr, g = cg, b = cb, a = ca,
-    all = stacktype == "all",
-  }
+  local d = tdepth + 1
+  tdepth = d
+  local t = tstack[d]
+  if not t then
+    t = { 0, 0, 0, 0, 0, canvas = false, shader = false,
+          r = 0, g = 0, b = 0, a = 0, all = false }
+    tstack[d] = t
+  end
+  t[1], t[2], t[3], t[4], t[5] = tx, ty, tsx, tsy, trot
+  t.canvas = cur_canvas
+  t.shader = cur_shader
+  t.r, t.g, t.b, t.a = cr, cg, cb, ca
+  t.all = stacktype == "all"
 end
 
+-- Internal: drop the stack to empty without discarding the pooled frames.
+function graphics.__resetStack() tdepth = 0 end
+
 function graphics.pop()
-  local t = table.remove(tstack)
+  local d = tdepth
+  if d < 1 then return end
+  tdepth = d - 1
+  local t = tstack[d]
   if not t then return end
   tx, ty, tsx, tsy, trot = t[1], t[2], t[3], t[4], t[5]
   -- Restore the render target only when it actually changed, so a pop does
@@ -3684,7 +3707,9 @@ function __wasmcart_frame(b1, lx1, ly1, rx1, ry1,
 
   -- reset per-frame graphics state, then clear to the background color
   tx, ty, tsx, tsy, trot = 0, 0, 1, 1, 0
-  for i = #tstack, 1, -1 do tstack[i] = nil end
+  -- Reset the DEPTH, not the storage: the frames are pooled and reused next
+  -- frame. Clearing the array would throw away exactly what push() recycles.
+  graphics.__resetStack()
   graphics.clear()
   wc.set_color(cr, cg, cb, ca)
 
