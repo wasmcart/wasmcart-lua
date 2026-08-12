@@ -297,6 +297,93 @@ local function run()
     return d:isDestroyed()
   end)())
 
+  -- ── fixture material must reach the SOLVER ────────────────────────
+  --
+  -- setFriction/setRestitution used to only cache the number in Lua, so
+  -- the getter round-tripped and every name check passed while Box2D
+  -- never heard about it. A cart setting restitution got the default
+  -- bounce with no way to tell. Found by a minigolf hole whose rails
+  -- would not bounce.
+  --
+  -- Asserted on SIMULATED BEHAVIOUR: a bouncy ball must rebound higher
+  -- than a dead one. Round-tripping the value is precisely what the
+  -- broken version already did, so a round-trip proves nothing here.
+  do
+    local function reboundHeight(rest)
+      -- NOTE the gravity sign: this engine's y grows DOWNWARD (screen
+      -- coordinates), so a falling ball's y INCREASES and the floor sits
+      -- at a larger y than the ball. Getting this backwards makes both
+      -- cases return the start position and look identical -- which is
+      -- exactly how this test failed the first time I wrote it.
+      local w2 = ph.newWorld(0, 400)
+      local floor = ph.newBody(w2, 200, 400, "static")
+      local ff = ph.newFixture(floor, ph.newRectangleShape(400, 20), 1)
+      ff:setRestitution(rest)
+      ff:setFriction(0.2)
+      local ball = ph.newBody(w2, 200, 100, "dynamic")
+      local bf = ph.newFixture(ball, ph.newCircleShape(8), 1)
+      bf:setRestitution(rest)
+      local landed, highest = false, 400
+      for _ = 1, 300 do
+        w2:update(1 / 60)
+        local _, y = ball:getPosition()
+        if not landed and y > 370 then landed = true end
+        -- after the first touchdown, the SMALLEST y is the peak of the
+        -- rebound (y grows downward)
+        if landed and y < highest then highest = y end
+      end
+      w2:destroy()
+      return highest
+    end
+    local bouncy = reboundHeight(0.9)
+    local dead   = reboundHeight(0.0)
+    ok("restitution reaches the solver (bouncy rebounds higher)",
+       bouncy < dead - 10, ("bouncy %.1f vs dead %.1f"):format(bouncy, dead))
+
+    local w3 = ph.newWorld(0, 0)
+    local b3b = ph.newBody(w3, 0, 0, "dynamic")
+    local f3 = ph.newFixture(b3b, ph.newCircleShape(4), 1)
+    f3:setFriction(0.75)
+    ok("friction round-trips through the solver",
+       math.abs(f3:getFriction() - 0.75) < 0.01, f3:getFriction())
+    f3:setRestitution(0.5)
+    ok("restitution round-trips through the solver",
+       math.abs(f3:getRestitution() - 0.5) < 0.01, f3:getRestitution())
+    ok("a plain fixture is not a sensor", f3:isSensor() == false)
+
+    -- SENSORS report contact without blocking. Box2D 3.x fixes this at
+    -- CREATION -- there is no b2Shape_SetSensor -- so it comes from the
+    -- settings table, and setSensor on a live shape must REFUSE rather
+    -- than leave a cart with a solid wall it believes is passable.
+    local w4 = ph.newWorld(0, 0)
+    local wall = ph.newBody(w4, 200, 100, "static")
+    local wf = ph.newFixture(wall, ph.newRectangleShape(20, 200), 1,
+                             { sensor = true })
+    ok("a fixture created as a sensor reports it", wf:isSensor() == true)
+    ok("setSensor refuses to flip a live shape",
+       not pcall(function() wf:setSensor(false) end))
+
+    local mover = ph.newBody(w4, 100, 100, "dynamic")
+    ph.newFixture(mover, ph.newCircleShape(6), 1)
+    mover:setLinearVelocity(300, 0)
+    for _ = 1, 120 do w4:update(1 / 60) end
+    local mx = select(1, mover:getPosition())
+    ok("a sensor does not block", mx > 250, mx)
+
+    -- and the control: the SAME wall as a solid must stop it
+    local w5 = ph.newWorld(0, 0)
+    local solid = ph.newBody(w5, 200, 100, "static")
+    ph.newFixture(solid, ph.newRectangleShape(20, 200), 1)
+    local m2 = ph.newBody(w5, 100, 100, "dynamic")
+    ph.newFixture(m2, ph.newCircleShape(6), 1)
+    m2:setLinearVelocity(300, 0)
+    for _ = 1, 120 do w5:update(1 / 60) end
+    local m2x = select(1, m2:getPosition())
+    ok("a solid wall DOES block (control)", m2x < 200, m2x)
+
+    w3:destroy(); w4:destroy(); w5:destroy()
+  end
+
   -- ── joints ────────────────────────────────────────────────────────
   --
   -- A joint that exists but does not CONSTRAIN is the failure mode worth

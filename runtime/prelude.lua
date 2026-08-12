@@ -4334,8 +4334,20 @@ function Shape:getRadius() return self.r or 0 end
 
 -- THE BINDING STEP. Everything above was a description; this is where the
 -- b2 shape is actually created on the body.
-function physics.newFixture(body, shape, density)
+-- newFixture(body, shape, density [, settings])
+--
+-- `settings` is our own extension for the things Box2D 3.x can only set at
+-- CREATION time -- currently `sensor` -- because there is no setter for
+-- them afterwards. LOVE has no equivalent argument, so a cart using it is
+-- not portable back; the alternative was a setSensor that silently did
+-- nothing.
+function physics.newFixture(body, shape, density, settings)
   local set = { density = density or 1 }
+  if type(settings) == "table" then
+    if settings.sensor then set.sensor = true end
+    if settings.friction then set.friction = settings.friction end
+    if settings.restitution then set.restitution = settings.restitution end
+  end
   local sh
   if shape.kind == "box" then
     -- our shape_box is body-centred, so a shape offset has to move the box
@@ -4362,7 +4374,8 @@ function physics.newFixture(body, shape, density)
     error("love.physics.newFixture: unknown shape kind " .. tostring(shape.kind), 2)
   end
   local f = setmetatable({ handle = sh, body = body, shape = shape,
-                           density = set.density }, Fixture)
+                           density = set.density,
+                           sensor = set.sensor or false }, Fixture)
   body.fixtures[#body.fixtures + 1] = f
   return f
 end
@@ -4386,6 +4399,22 @@ end
 function Body:setBullet(v) b2.body_set_bullet(self.handle, v and true or false) end
 function Body:setFixedRotation(v) b2.body_set_fixed_rotation(self.handle, v and true or false) end
 function Body:setLinearDamping(d) b2.body_set_linear_damping(self.handle, d) end
+
+-- ANGULAR MOTION AND SLEEP.
+--
+-- Every one of these had a working C binding and no Lua wrapper, so a
+-- cart calling the documented LOVE name got "attempt to call a nil value"
+-- -- found by a golf ball that needed angular damping to stop spinning
+-- after it had stopped rolling.
+function Body:setAngularDamping(d) b2.body_set_angular_damping(self.handle, d) end
+function Body:getAngularVelocity() return b2.body_angular_velocity(self.handle) end
+function Body:setAngularVelocity(w) b2.body_set_angular_velocity(self.handle, w) end
+function Body:applyTorque(tq) b2.body_apply_torque(self.handle, tq) end
+function Body:applyAngularImpulse(i) b2.body_apply_torque(self.handle, i) end
+function Body:isAwake() return b2.body_is_awake(self.handle) end
+function Body:setAwake(v) b2.body_set_awake(self.handle, v ~= false) end
+function Body:setSleepingAllowed(v) b2.body_enable_sleep(self.handle, v ~= false) end
+function Body:isSleepingAllowed() return true end
 function Body:setGravityScale(g) b2.body_set_gravity_scale(self.handle, g) end
 function Body:isDestroyed() return not b2.body_alive(self.handle) end
 function Body:destroy() b2.body_destroy(self.handle) end
@@ -4396,10 +4425,63 @@ function Body:getWorldCenter() return b2.body_position(self.handle) end
 function Fixture:getBody() return self.body end
 function Fixture:getShape() return self.shape end
 function Fixture:getDensity() return self.density end
-function Fixture:setFriction(f) self.friction = f end
-function Fixture:getFriction() return self.friction or 0.2 end
-function Fixture:setRestitution(r) self.restitution = r end
-function Fixture:getRestitution() return self.restitution or 0 end
+
+-- THESE MUST REACH BOX2D, not just cache a number in Lua.
+--
+-- They used to do only `self.friction = f`, so the getter round-tripped
+-- and every name-based check passed while the SOLVER never heard about
+-- it: a cart setting restitution got the default bounce and had no way to
+-- tell. Caught by a minigolf hole whose rails would not bounce.
+--
+-- The C setters existed the whole time and were simply never called.
+function Fixture:setFriction(f)
+  self.friction = f
+  if self.handle then b2.shape_set_friction(self.handle, f) end
+end
+function Fixture:getFriction()
+  if self.handle then return b2.shape_get_friction(self.handle) end
+  return self.friction or 0.2
+end
+function Fixture:setRestitution(r)
+  self.restitution = r
+  if self.handle then b2.shape_set_restitution(self.handle, r) end
+end
+function Fixture:getRestitution()
+  if self.handle then return b2.shape_get_restitution(self.handle) end
+  return self.restitution or 0
+end
+function Fixture:setDensity(d)
+  self.density = d
+  if self.handle then b2.shape_set_density(self.handle, d) end
+end
+
+-- A SENSOR reports contact without blocking -- how a golf hole's water,
+-- sand and conveyor pads work: the ball rolls THROUGH them and is
+-- affected, rather than bouncing off their edge.
+--
+-- BOX2D 3.x FIXES SENSOR-NESS AT CREATION. There is no b2Shape_SetSensor;
+-- only b2Shape_IsSensor to read it back. So this cannot flip an existing
+-- shape, and pretending otherwise would leave a cart with a solid wall it
+-- believes is a sensor -- the ball bounces off water and nobody can see
+-- why.
+--
+-- Pass `sensor = true` in newFixture's settings instead. Calling this
+-- BEFORE any shape exists still works (it records the intent); calling it
+-- on a live shape raises rather than lying.
+function Fixture:setSensor(v)
+  v = v and true or false
+  if self.handle and v ~= self:isSensor() then
+    error("Fixture:setSensor: Box2D 3.x fixes sensor-ness when the shape " ..
+          "is created and offers no setter. Pass { sensor = true } to " ..
+          "love.physics.newFixture instead.", 2)
+  end
+  self.sensor = v
+end
+function Fixture:isSensor()
+  if self.handle then return b2.shape_is_sensor(self.handle) end
+  return self.sensor or false
+end
+
 function Fixture:destroy() end
 
 function physics.getDistance(a, b)
