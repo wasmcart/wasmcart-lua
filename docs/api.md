@@ -43,8 +43,12 @@ function love.gamepadreleased(joy, button) end
 | `clear([r,g,b])` | no args = background color |
 | `setBlendMode("alpha"\|"add")` | reset to alpha each frame |
 | `setScissor(x,y,w,h)` / `setScissor()` | no args disables |
-| `setFont(f)` / `getFont()` | |
+| `intersectScissor(x,y,w,h)` | clips to the INTERSECTION with the current scissor, so a nested clip can never widen an outer one. Disjoint rects give an empty clip, not a negative size |
+| `setFont(f)` / `getFont()` / `setNewFont(...)` | `setNewFont` sets and returns |
 | `getWidth()` `getHeight()` `getDimensions()` | |
+| `getSupported()` `getTextureTypes()` `getImageFormats()` | capability probes; answered honestly, so a library picks its real fallback |
+| `isGammaCorrect()` `isWireframe()` | both false here |
+| `discard()` `flushBatch()` | genuine no-ops: nothing is buffered across calls |
 
 ### Drawing
 
@@ -54,7 +58,9 @@ function love.gamepadreleased(joy, button) end
 | `circle(mode,x,y,r)` | |
 | `line(x1,y1,x2,y2,...)` | varargs or a single table |
 | `points(x1,y1,...)` | |
-| `polygon(mode, pts)` | table of `x1,y1,x2,y2,...`; max 64 points |
+| `polygon(mode, pts)` | table of `x1,y1,x2,y2,...`; max 256 points |
+| `ellipse(mode,x,y,rx,ry)` | |
+| `arc(mode,[arctype],x,y,r,a1,a2)` | arctype `"pie"`, `"open"`, `"closed"` |
 | `print(text,x,y)` | |
 | `printf(text,x,y,limit,align)` | align: `"left"`, `"center"`, `"right"` |
 | `draw(image,[quad],x,y,r,sx,sy,ox,oy)` | tinted by the current color |
@@ -81,6 +87,91 @@ f1:getHeight()  f1:getWidth("some text")
 The built-in bitfont covers `A-Z a-z 0-9` and
 `space - . ! : > + = / ( ) , ? % * < # _ ' " ; [ ]`. Unmapped characters
 render as a space.
+
+**Image fonts** — glyphs side by side in one image, separated by whatever
+colour the top-left pixel is:
+
+```lua
+local f = love.graphics.newImageFont(img, "ABCDEFG...")
+```
+
+Glyph widths come from scanning for that separator, so a *proportional*
+image font measures correctly rather than assuming a fixed cell — the
+difference between a menu that lines up and one that drifts.
+
+**Text objects** hold a pre-wrapped string:
+
+```lua
+local t = love.graphics.newText(font, "hello")
+t:set("replaced")            -- no wrap
+t:setf("wrapped text", 400, "center")
+t:getWidth() t:getHeight()   -- getWidth reports the wrap LIMIT when set
+love.graphics.draw(t, x, y)
+```
+
+The wrap is computed once at `set`/`setf` time rather than every frame,
+and shares `printf`'s exact algorithm — two different wrap rules in one
+engine means text measured with one and drawn with the other disagree.
+
+**Canvas extras:**
+
+```lua
+cv:renderTo(function() ... end)   -- restores the PREVIOUS target, so
+                                  -- nesting works; the callback is pcalled
+                                  -- so a throw cannot leave it bound
+cv:newImageData()                 -- CPU path only: on GPU a canvas is a
+                                  -- texture with no CPU-side pixels, and
+                                  -- this refuses rather than handing back
+                                  -- a blank that looks like a readback
+cv:generateMipmaps()              -- no-op; every draw here samples at 1:1
+```
+
+### Particles
+
+```lua
+local ps = love.graphics.newParticleSystem(image, buffer)
+ps:setParticleLifetime(0.5, 1.5)  ps:setEmissionRate(200)
+ps:setDirection(-math.pi/2)       ps:setSpread(math.pi/3)
+ps:setSpeed(100, 250)             ps:setLinearAcceleration(0, 300, 0, 300)
+ps:setSizes(1.4, 0.9, 0.1)        ps:setSizeVariation(0.5)
+ps:setColors(1,0.85,0.3,1,  1,0.3,0.1,0.85,  0.3,0.05,0.05,0)
+ps:setRadialAcceleration(a, b)    ps:setTangentialAcceleration(a, b)
+ps:setLinearDamping(a, b)         ps:setEmissionArea(dist, dx, dy)
+ps:setPosition(x, y) ps:start() ps:stop() ps:emit(n) ps:getCount()
+love.graphics.draw(ps, x, y)
+```
+
+The buffer is a **hard cap**, as in LOVE: emitting past it recycles the
+oldest particle rather than growing, so a system tuned against a buffer
+size behaves the same here. Size and colour lists are keyframes
+interpolated across each particle's life.
+
+### Stencil
+
+Masking to a **non-rectangular** region — the one thing scissor cannot do.
+
+```lua
+love.graphics.stencil(function()
+  love.graphics.circle("fill", 200, 200, 120)   -- the mask shape
+end, "replace", 1)
+love.graphics.setStencilTest("equal", 1)         -- keep only inside it
+love.graphics.rectangle("fill", 0, 0, 400, 400)
+love.graphics.setStencilTest()                   -- off
+```
+
+Actions: `replace`, `increment`, `decrement`, `invert`, `incrementwrap`,
+`decrementwrap`. Compare modes: `equal`, `notequal`, `less`, `lequal`,
+`greater`, `gequal`, `always`. Use `notequal` for the inverse mask.
+
+**GL only.** The software rasterizer has no stencil buffer, and giving it
+one would put a per-pixel test in the innermost blend loop — a cost every
+cart pays to serve the few that mask. Calling `stencil()` on the CPU path
+raises a named error rather than drawing an unmasked frame that looks
+almost right.
+
+**It costs nothing when unused.** The stencil renderbuffer is allocated on
+a canvas's *first* stencil call, `GL_STENCIL_TEST` is only enabled while a
+test is live, and no branch was added to the batched draw path.
 
 ### Shaders
 
@@ -734,10 +825,58 @@ Up to 4 independent worlds. Contacts are polled per step (`:enter` after
 `world:update`), not delivered by callback. Ray casts and
 preSolve/postSolve are not implemented and error clearly.
 
-### Joints and post-creation material (raw `b2`)
+### Joints
 
-Joints are reachable from the raw `b2` table (the `wf` collider wrapper
-does not expose them). Anchors are world-space pixels.
+Available two ways: the LOVE-shaped `love.physics.new*Joint`, and the raw
+`b2` table underneath. Anchors are world-space pixels in both.
+
+```lua
+local j = love.physics.newRevoluteJoint(bodyA, bodyB, x, y [, collide])
+local j = love.physics.newDistanceJoint(bodyA, bodyB, x1, y1, x2, y2 [, collide])
+local j = love.physics.newPrismaticJoint(bodyA, bodyB, x, y, ax, ay [, collide])
+local j = love.physics.newWeldJoint(bodyA, bodyB, x, y [, collide])
+local j = love.physics.newMotorJoint(bodyA, bodyB [, correction, collide])
+local j = love.physics.newWheelJoint(bodyA, bodyB, x, y, ax, ay [, collide])
+local j = love.physics.newRopeJoint(bodyA, bodyB, x1, y1, x2, y2, maxLength)
+local j = love.physics.newFrictionJoint(bodyA, bodyB, x, y [, collide])
+local j = love.physics.newMouseJoint(body, x, y)
+
+j:setMotorSpeed(v)  j:setMaxMotorForce(f)  j:enableMotor(b)
+j:setLimits(lo, hi) j:enableLimit(b)       j:getLimits()
+j:setSpringFrequency(hz)  j:setSpringDampingRatio(d)
+j:getLength() j:setLength(v)               -- distance/rope
+j:getJointAngle()                          -- revolute
+j:getJointTranslation()                    -- prismatic
+j:setTarget(x, y)                          -- mouse
+j:getReactionForce() j:getReactionTorque()
+j:destroy()
+```
+
+**Box2D 3.x has seven joint types where LOVE's API assumes 2.x's eleven**,
+so three of these are built on others. That is stated here because the
+behaviour is subtly different from desktop LOVE and you should know which:
+
+| LOVE joint | here |
+|---|---|
+| revolute, prismatic, distance, weld, motor, wheel | a real b2 joint of that type |
+| **rope** | a distance joint with its limit enabled and its spring slack. 2.x's rope joint was *folded into* the distance joint in v3; this is upstream's own replacement |
+| **friction** | a motor joint with zero target velocity and a capped force, so all it can do is brake |
+| **mouse** | a motor joint with a linear spring on a kinematic anchor. Box2D 3.2's own samples implement mouse dragging exactly this way, spring constants included |
+| **gear**, **pulley** | **not available.** v3 removed both and offers no primitive to build them on. They raise a named error rather than silently doing nothing |
+
+Gear and pulley could be faked in Lua by reading one joint each step and
+driving the other, but a constraint solved outside the solver drifts under
+load and fights the bodies it constrains — wrong precisely when a game
+leans on it. A joint that is subtly wrong is worse than one that is
+honestly missing.
+
+**Do not place both bodies at the same origin.** Their local frames then
+coincide, the solver has a zero-length separation to work from, and the
+joint jitters instead of acting — which looks exactly like an ignored
+axis argument. Measured: co-located bodies under a pure +x force moved
+`(+0.16, -3.63)`; the same rig half a pixel apart moved `(+7220, +0.00)`.
+
+The raw table, if you need it:
 
 ```lua
 local j = b2.joint_revolute(world, bodyA, bodyB, ax, ay [, collide])
@@ -745,6 +884,14 @@ local j = b2.joint_distance(world, bodyA, bodyB, ax, ay, length [, collide])
 local j = b2.joint_prismatic(world, bodyA, bodyB, ax, ay, axisX, axisY [, collide])
 local j = b2.joint_weld(world, bodyA, bodyB, ax, ay [, collide])
 local j = b2.joint_motor(world, bodyA, bodyB [, collide])
+local j = b2.joint_wheel(world, bodyA, bodyB, ax, ay, axisX, axisY [, collide])
+local j = b2.joint_rope(world, bodyA, bodyB, ax, ay, maxLength [, collide])
+local j = b2.joint_friction(world, bodyA, bodyB, ax, ay, maxF, maxT [, collide])
+local j = b2.joint_mouse(world, anchorBody, target, x, y, maxForce [, collide])
+b2.joint_set_motor(j, on, speed, maxForce)
+b2.joint_set_limits(j, on, lower, upper)
+b2.joint_set_spring(j, on, hertz, damping)
+b2.joint_type(j)     -- "revolute" | "prismatic" | ...
 b2.joint_destroy(j)
 b2.joint_force(j)    -- -> fx, fy   (how hard the constraint is working)
 b2.joint_torque(j)

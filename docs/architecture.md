@@ -227,7 +227,7 @@ Because a golden only proves a frame is *stable*, not *correct*,
 the output can actually be looked at. Three real bugs in this engine were
 found that way while the suite was fully green.
 
-Then it runs `test/unit/` — a cart of 278 in-engine assertions covering real
+Then it runs `test/unit/` — a cart of 284 in-engine assertions covering real
 Lua semantics (closures, coroutines, metatables, varargs, pcall, goto),
 `require`, determinism, the API surface, font coverage, and transforms.
 
