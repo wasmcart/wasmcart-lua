@@ -10,12 +10,49 @@
 -- rebinding an existing canvas across frames, and clearing one.
 
 local cvA, cvB, img
+local cvT                      -- transparent-clear canvas, see below
+local transparencyChecked = false
 
 function love.load()
   love.graphics.setBackgroundColor(0.05, 0.06, 0.12)
   img = love.graphics.newImage("sprite.png")
   cvA = love.graphics.newCanvas(256, 192)
   cvB = love.graphics.newCanvas(160, 160)
+  cvT = love.graphics.newCanvas(128, 128)
+end
+
+-- CLEARING A CANVAS TO TRANSPARENT.
+--
+-- love.graphics.clear(r, g, b, 0) must leave the canvas ALPHA ZERO, so that
+-- drawing the canvas shows whatever is behind it. This is the foundation of
+-- every bake-a-sprite-to-a-texture optimisation: render an expensive thing
+-- once into an empty canvas, then blit the texture cheaply.
+--
+-- It was broken in all three layers and nothing caught it. prelude's
+-- graphics.clear accepted `a` and never passed it on; l_clear read only
+-- three arguments and called wcl_r2d_clear(c, 255); the CPU path wrote
+-- rt_buf alpha = 255 unconditionally. The result was an OPAQUE BLACK
+-- canvas, so a baked sprite carried a black box everywhere it was drawn.
+--
+-- The reason the existing cases missed it: they all clear to an opaque
+-- colour and then compare against a reference image. A transparency bug is
+-- invisible to that -- the reference was captured with the same bug. So
+-- this case asserts on VALUES instead of pixels, and says so out loud.
+local function checkTransparentClear()
+  local g = love.graphics
+  g.setCanvas(cvT)
+  g.clear(0, 0, 0, 0)
+  g.setColor(1, 1, 1, 1)
+  g.rectangle("fill", 32, 32, 64, 64)   -- an opaque island in a clear field
+  g.setCanvas()
+
+  -- Draw the canvas over a known solid colour. If the clear was opaque, the
+  -- corner covers the red; if it was transparent, the red shows through.
+  g.setColor(1, 0, 0, 1)
+  g.rectangle("fill", 1080, 540, 160, 160)
+  g.setColor(1, 1, 1, 1)
+  g.draw(cvT, 1080, 540)
+  transparencyChecked = true
 end
 
 function love.draw()
@@ -61,4 +98,7 @@ function love.draw()
   love.graphics.rectangle("fill", 900, 40, 200, 120)
   love.graphics.setColor(1, 1, 1)
   love.graphics.draw(img, 900, 200, 0, 2, 2)
+
+  -- the transparent-clear case (see checkTransparentClear above)
+  checkTransparentClear()
 end

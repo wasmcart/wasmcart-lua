@@ -109,12 +109,18 @@ function graphics.clear(r, g, b, a)
     return
   end
   if r then
-    if rawtype(r) == "table" then r, g, b = r[1], r[2], r[3] end
+    if rawtype(r) == "table" then r, g, b, a = r[1], r[2], r[3], r[4] end
+    -- Alpha is forwarded, NOT dropped. Clearing a canvas to (0,0,0,0) is
+    -- the standard way to get an empty texture to bake a sprite into, and
+    -- swallowing the 4th argument here silently produced an opaque black
+    -- background instead -- which then painted a black box over the board
+    -- wherever the baked sprite was drawn.
     wc.clear(math.floor(r * 255 + 0.5), math.floor((g or 0) * 255 + 0.5),
-             math.floor((b or 0) * 255 + 0.5))
+             math.floor((b or 0) * 255 + 0.5),
+             math.floor(((a == nil) and 1 or a) * 255 + 0.5))
   else
     wc.clear(math.floor(bg[1] * 255 + 0.5), math.floor(bg[2] * 255 + 0.5),
-             math.floor(bg[3] * 255 + 0.5))
+             math.floor(bg[3] * 255 + 0.5), math.floor((bg[4] or 1) * 255 + 0.5))
   end
 end
 

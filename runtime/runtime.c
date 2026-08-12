@@ -1054,8 +1054,23 @@ static int l_set_color(lua_State *S) {
 
 static uint32_t frame_clear_color;   /* last clear, for the GL path's glClear */
 
+/* clear(r, g, b [, a]) -- alpha defaults to opaque.
+ *
+ * ALPHA IS LOAD-BEARING and used to be dropped on the floor here. Clearing
+ * a CANVAS to a transparent colour is how every cache-a-sprite-to-a-texture
+ * technique works: draw once into an empty canvas, then blit it. With alpha
+ * forced to 255 the canvas came back with an opaque black background, so a
+ * baked sprite painted a black box over whatever it was drawn on.
+ *
+ * The screen framebuffer has no meaningful alpha (there is nothing behind
+ * it), so a is only consulted for render targets -- but it is threaded
+ * through unconditionally rather than special-cased, because "sometimes
+ * honoured" is the behaviour that cost a day to track down.
+ */
 static int l_clear(lua_State *S) {
     int r = ARGI(1), g = ARGI(2), b = ARGI(3);
+    int a = (lua_gettop(S) >= 4 && !lua_isnil(S, 4)) ? ARGI(4) : 255;
+    if (a < 0) a = 0; else if (a > 255) a = 255;
     uint32_t c = (((uint32_t)r & 0xFF) << 16) | (((uint32_t)g & 0xFF) << 8) | ((uint32_t)b & 0xFF);
     if (!rt_buf) {
         frame_clear_color = c;
@@ -1063,14 +1078,15 @@ static int l_clear(lua_State *S) {
          * colour; writing the framebuffer too would just be wasted work. */
         if (wcl_r2d_active()) return 0;
     } else if (wcl_r2d_active()) {
-        /* clearing a canvas clears its FBO */
-        wcl_r2d_clear(c, 255);
+        /* clearing a canvas clears its FBO -- honouring alpha, so a cart
+         * can get a genuinely transparent target */
+        wcl_r2d_clear(c, (uint8_t)a);
         return 0;
     }
     if (rt_buf) {
         for (int i = 0; i < rt_w * rt_h; i++) {
             rt_buf[i * 4 + 0] = (uint8_t)r; rt_buf[i * 4 + 1] = (uint8_t)g;
-            rt_buf[i * 4 + 2] = (uint8_t)b; rt_buf[i * 4 + 3] = 255;
+            rt_buf[i * 4 + 2] = (uint8_t)b; rt_buf[i * 4 + 3] = (uint8_t)a;
         }
     } else {
         for (int i = 0; i < scr_w * scr_h; i++) wc_framebuffer[i] = c;
