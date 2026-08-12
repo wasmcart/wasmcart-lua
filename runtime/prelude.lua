@@ -155,6 +155,11 @@ end
 function graphics.ellipse(mode, x, y, rx, ry, segments)
   ry = ry or rx
   local n = segments or math.max(8, math.floor(math.max(rx, ry) / 2) + 8)
+  -- Capped at the shared polygon limit (WCL_MAX_POLY_PTS, 256). Not a
+  -- cosmetic clamp: a polygon the GL path refuses drops the WHOLE FRAME --
+  -- 3D included -- to the software rasterizer for the rest of the run, with
+  -- no error and nothing visibly different except the frame time tripling.
+  -- The cap used to be 64 in the C layer, which a 120px ellipse exceeded.
   if n > 256 then n = 256 end
   local pts = {}
   for i = 0, n - 1 do

@@ -130,6 +130,7 @@ static int32_t  dbg_aux;
 static uint32_t dbg_lua_ok = 1;
 static uint32_t dbg_gc_kb;
 static uint32_t dbg_draw_calls;
+static uint32_t dbg_gpu2d = 1;
 
 WC_DEBUG_FIELDS(
     WC_DBG("tick_count", dbg_tick,       WC_DBG_U32),
@@ -137,7 +138,13 @@ WC_DEBUG_FIELDS(
     WC_DBG("aux",        dbg_aux,        WC_DBG_I32),
     WC_DBG("lua_ok",     dbg_lua_ok,     WC_DBG_U32),
     WC_DBG("gc_kb",      dbg_gc_kb,      WC_DBG_U32),
-    WC_DBG("draw_calls", dbg_draw_calls, WC_DBG_U32)
+    WC_DBG("draw_calls", dbg_draw_calls, WC_DBG_U32),
+    /* 1 while the GPU 2D path is live, 0 once anything has dropped the
+     * frame to the software rasterizer. A DROP IS A FAILURE, not a
+     * fallback: it is whole-frame, sticky for the rest of the run, and
+     * invisible except that everything gets slower. Exposed so a test can
+     * assert on it rather than a human noticing the frame rate. */
+    WC_DBG("gpu2d", dbg_gpu2d, WC_DBG_U32)
 )
 
 #define MARK_BOOT 1
@@ -445,7 +452,9 @@ static void raster_circle(int cx, int cy, int r, uint32_t c, int a, int filled) 
 }
 
 /* convex/concave polygon scanline fill (even-odd) */
-#define MAX_POLY_PTS 64
+/* One shared cap (render2d_gl.h). It was 64 here and 64 there, separately,
+ * which is exactly how the two silently disagree. */
+#define MAX_POLY_PTS WCL_MAX_POLY_PTS
 static void raster_polygon(const double *xs, const double *ys, int n,
                            uint32_t c, int a, int filled) {
     if (n < 3) return;
@@ -1313,6 +1322,17 @@ static int l_log(lua_State *S) {
 }
 
 static int l_mark(lua_State *S) { wc_debug_mark((uint32_t)ARGI(1)); return 0; }
+
+/* wc.gpu2d() -> true while the GPU 2D path is live.
+ *
+ * A cart normally has no business asking, and the boundary exists so it
+ * cannot. This is here for CONFORMANCE TESTS: a drop to the software
+ * rasterizer is whole-frame, sticky, and otherwise invisible, so a test
+ * that draws every primitive needs a way to assert none of them caused one. */
+static int l_gpu2d(lua_State *S) {
+    lua_pushboolean(S, wcl_r2d_active());
+    return 1;
+}
 
 static int l_debug_set(lua_State *S) {
     int slot = ARGI(1), v = ARGI(2);
@@ -2594,6 +2614,7 @@ static const luaL_Reg wc_lib[] = {
     {"beep",        l_beep},
     {"log",         l_log},
     {"mark",        l_mark},
+    {"gpu2d",       l_gpu2d},
     {"debug_set",   l_debug_set},
     {"rand",        l_rand},
     {"save_write",  l_save_write},
@@ -2924,6 +2945,10 @@ WC_EXPORT_RENDER void wc_render(void) {
 #ifdef WCL_ENABLE_GL2D
     /* Flushes the batches on the GL path, or blits the CPU framebuffer when
      * this frame fell back. Either way the frame is on screen after this. */
+    /* Latch the GPU state for the frame that just ended. Read by the host
+     * and by test/gpuonly -- a 0 here means something refused a primitive
+     * and every subsequent frame is on the CPU. */
+    dbg_gpu2d = wcl_r2d_active() ? 1u : 0u;
     wcl_r2d_end(wc_framebuffer);
 #elif defined(WCL_USE_GL)
     gl_present();

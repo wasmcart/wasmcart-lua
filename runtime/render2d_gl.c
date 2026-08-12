@@ -2074,12 +2074,18 @@ static int pt_in_tri(double px, double py,
 /* Ear clipping. Writes 3*(n-2) indices into `out`; returns the triangle
  * count, or 0 if the polygon could not be triangulated. */
 static int poly_triangulate(const double *xs, const double *ys, int n, int *out) {
-    int idx[64];
+    /* Sized from the shared cap, not a bare 64. With the cap raised this
+     * array would otherwise be written past its end -- a silent stack smash
+     * rather than a refusal. */
+    int idx[WCL_MAX_POLY_PTS];
     const int ccw = poly_area2(xs, ys, n) > 0;
     for (int i = 0; i < n; i++) idx[i] = ccw ? i : (n - 1 - i);
 
     int m = n, tris = 0, guard = 0;
-    while (m > 3 && guard++ < 64 * 64) {
+    /* Runaway guard scales with the cap: an ear clipper needs at most n-2
+     * successful clips, and the bound is generous enough that a legitimately
+     * awkward polygon is never cut short. */
+    while (m > 3 && guard++ < WCL_MAX_POLY_PTS * WCL_MAX_POLY_PTS) {
         int clipped = 0;
         for (int i = 0; i < m; i++) {
             const int ia = idx[(i + m - 1) % m], ib = idx[i], ic = idx[(i + 1) % m];
@@ -2163,12 +2169,30 @@ int wcl_r2d_circle(int cx, int cy, int r, uint32_t color, int alpha) {
  * against a hash of them. Convex polygons skip all of this -- their fan is
  * derived directly.
  */
+/* Cache slots are sized for SMALL polygons; see the note below. */
+#define TRICACHE_MAX_PTS 64
+
 typedef struct {
     uint32_t hash;
     int n, ntri;
-    int tri[3 * 64];
+    /* Cache entries stay SMALL on purpose. This memoises the ear-clipping
+     * of repeated shapes; sizing each slot for the largest legal polygon
+     * made the table 48 KB of static memory for a benefit that only
+     * applies to little ones. Large polygons skip the cache and are
+     * clipped fresh -- still on the GPU, which is the part that matters. */
+    int tri[3 * TRICACHE_MAX_PTS];
     int used;
 } tricache_t;
+/* Largest filled polygon the GL path will accept.
+ *
+ * This used to be a bare 64 in three places, and it was NOT a GPU limit --
+ * just the size of a stack array. Anything larger was REFUSED, and a
+ * refusal drops the whole frame (3D included) to the software rasterizer
+ * for the rest of the run. So a big enough ellipse or arc silently cost
+ * every later frame its GPU path.
+ *
+ * Matches MAX_POLY_PTS on the Lua side so the two layers agree: a polygon
+ * that the prelude is willing to emit is one the GL path will take. */
 #define MAX_TRICACHE 16
 static tricache_t tricache[MAX_TRICACHE];
 static int tricache_next;
@@ -2188,7 +2212,7 @@ static uint32_t poly_hash(const double *xs, const double *ys, int n) {
 
 int wcl_r2d_poly(const double *xs, const double *ys, int n,
                  uint32_t color, int alpha) {
-    if (!wcl_r2d_active() || n < 3 || n > 64) return 0;
+    if (!wcl_r2d_active() || n < 3 || n > WCL_MAX_POLY_PTS) return 0;
 
     /* Simplicity is checked FIRST, before convexity.
      *
@@ -2196,11 +2220,11 @@ int wcl_r2d_poly(const double *xs, const double *ys, int n,
      * calls it convex and it would take the fan path -- skipping the
      * self-intersection guard entirely and filling a centre that even-odd
      * leaves hollow. That was latent while only convex fills were on GL;
-     * adding ear clipping is what surfaced it. Cheap enough at n <= 64 to
+     * adding ear clipping is what surfaced it. Cheap enough at this n to
      * run unconditionally, and it is the correctness gate for both paths. */
     if (!poly_is_simple(xs, ys, n)) return 0;
 
-    int tri[3 * 64];
+    int tri[3 * WCL_MAX_POLY_PTS];
     int ntri = 0;
     if (poly_is_convex(xs, ys, n)) {
         /* a fan needs no clipping and no cache */
@@ -2211,7 +2235,11 @@ int wcl_r2d_poly(const double *xs, const double *ys, int n,
     } else {
         const uint32_t h = poly_hash(xs, ys, n);
         tricache_t *hit = NULL;
-        for (int i = 0; i < MAX_TRICACHE; i++)
+        /* Large polygons skip the CACHE, not the GPU. Sizing every cache
+         * slot for the biggest legal polygon would cost 48 KB of static
+         * memory to memoise shapes that are rare anyway. */
+        const int cacheable = (n <= TRICACHE_MAX_PTS);
+        for (int i = 0; cacheable && i < MAX_TRICACHE; i++)
             if (tricache[i].used && tricache[i].hash == h && tricache[i].n == n) {
                 hit = &tricache[i]; break;
             }
@@ -2221,16 +2249,22 @@ int wcl_r2d_poly(const double *xs, const double *ys, int n,
         } else {
             ntri = poly_triangulate(xs, ys, n, tri);
             if (ntri <= 0) return 0;
-            tricache_t *slot = &tricache[tricache_next];
-            tricache_next = (tricache_next + 1) % MAX_TRICACHE;
-            slot->hash = h; slot->n = n; slot->ntri = ntri; slot->used = 1;
-            for (int i = 0; i < ntri * 3; i++) slot->tri[i] = tri[i];
+            if (cacheable) {
+                tricache_t *slot = &tricache[tricache_next];
+                tricache_next = (tricache_next + 1) % MAX_TRICACHE;
+                slot->hash = h; slot->n = n; slot->ntri = ntri; slot->used = 1;
+                for (int i = 0; i < ntri * 3; i++) slot->tri[i] = tri[i];
+            }
         }
     }
     if (ntri <= 0) return 0;
     flush_batches();
 
-    vertex_t v[3 * 64];
+    /* THIS was the fourth hardcoded 64, and the one that actually crashed:
+     * a triangulated 256-gon emits 254 triangles = 762 vertices, which
+     * overran this array by 3x. The others were merely refusals; this was
+     * a stack smash. Sized from the shared cap like the rest. */
+    vertex_t v[3 * WCL_MAX_POLY_PTS];
     float r = (float)((color >> 16) & 255) / 255.0f;
     float g = (float)((color >> 8) & 255) / 255.0f;
     float b = (float)(color & 255) / 255.0f;

@@ -1,6 +1,17 @@
 #ifndef WCL_RENDER2D_GL_H
 #define WCL_RENDER2D_GL_H
 
+/* Largest filled polygon either layer will handle.
+ *
+ * Shared so the Lua prelude, the software rasterizer and the GL path all
+ * agree. If they disagree the failure is silent and expensive: a polygon
+ * the prelude emits but the GL path refuses drops the ENTIRE FRAME -- 3D
+ * included -- to the software rasterizer for the rest of the run.
+ *
+ * 256 covers a full-screen circle at ~1.4 degrees per segment, which is
+ * smoother than any 1080p display resolves. */
+#define WCL_MAX_POLY_PTS 256
+
 #include <stdint.h>
 
 /* Per-frame GL diagnostics, latched at wcl_r2d_end so a host reading the
