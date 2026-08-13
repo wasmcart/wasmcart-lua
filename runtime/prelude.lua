@@ -1904,11 +1904,39 @@ function graphics.getDefaultFilter()
   return default_min, default_mag, default_aniso
 end
 
+-- LOVE's blend modes, mapped to the renderer's enum. These were once
+-- collapsed to a single add/not-add flag, which is invisible in a 2D cart
+-- and fatal to a deferred 3D renderer: 3DreamEngine's post chain composites
+-- with "replace" and multiplies AO and bloom into the colour buffer with
+-- "multiply", so with both silently behaving as "alpha" the geometry pass
+-- rendered perfectly and the final composite came out black -- no GL error,
+-- correct draw-call count, and nothing on screen.
+local BLEND_MODES = {
+  alpha = 0, add = 1, subtract = 2, multiply = 3,
+  lighten = 4, darken = 5, screen = 6, replace = 7,
+}
+
 local blend_mode, blend_alpha = "alpha", "alphamultiply"
 function graphics.setBlendMode(mode, alphamode)
-  blend_mode = mode or "alpha"
-  blend_alpha = alphamode or "alphamultiply"
-  wc.set_blend(mode == "add" and 1 or 0)
+  mode = mode or "alpha"
+  alphamode = alphamode or "alphamultiply"
+  local e = BLEND_MODES[mode]
+  if not e then
+    error("love.graphics.setBlendMode: unknown mode '" .. tostring(mode) ..
+          "'. Valid: alpha, add, subtract, multiply, lighten, darken, " ..
+          "screen, replace.", 2)
+  end
+  if alphamode ~= "alphamultiply" and alphamode ~= "premultiplied" then
+    error("love.graphics.setBlendMode: unknown alpha mode '" ..
+          tostring(alphamode) .. "'. Valid: alphamultiply, premultiplied.", 2)
+  end
+  -- LOVE itself rejects this pair: "multiply" requires a premultiplied
+  -- source, so alphamultiply would double-apply the alpha.
+  if mode == "multiply" and alphamode ~= "premultiplied" then
+    alphamode = "premultiplied"
+  end
+  blend_mode, blend_alpha = mode, alphamode
+  wc.set_blend(e, alphamode == "premultiplied")
 end
 function graphics.getBlendMode() return blend_mode, blend_alpha end
 
@@ -5256,6 +5284,11 @@ end
 
 -- ── debug helpers for the harness ──────────────────────────────────
 love.debugValue = function(slot, v) wc.debug_set(slot, math.floor(v)) end
+-- Read a debug slot back. The HOST can write these (romdev's
+-- wasm({op:'write'})), which makes this the channel a test harness uses to
+-- drive the cart into a specific state -- jump to a level, force a
+-- condition -- without the cart shipping debug keys for it.
+love.debugRead = function(slot) return wc.debug_get(slot or 0) end
 -- Version identity. Libraries branch on this to pick an API shape, and a
 -- missing getVersion means they guess -- usually at the oldest one.
 -- Reported as LOVE 11.4, which is the API generation this engine follows

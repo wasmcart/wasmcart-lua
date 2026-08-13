@@ -1278,9 +1278,17 @@ static int l_set_scissor(lua_State *S) {
     return 0;
 }
 
+/* wc.set_blend(mode, premultiplied). `mode` is a WCL_BLEND_* value; the
+ * prelude maps LOVE's mode NAMES onto it so the name->enum table sits next
+ * to the error that lists the valid names.
+ *
+ * blend_add stays in sync because the software path and the batchers still
+ * ask only "is this additive". */
 static int l_set_blend(lua_State *S) {
-    blend_add = ARGI(1);
-    wcl_r2d_blend_add(blend_add);
+    int mode = ARGI(1);
+    int premultiplied = lua_toboolean(S, 2);
+    blend_add = (mode == WCL_BLEND_ADD);
+    wcl_r2d_blend_mode(mode, premultiplied);
     return 0;
 }
 
@@ -1378,6 +1386,16 @@ static int l_debug_set(lua_State *S) {
     if (slot == 0) dbg_score = v;
     else if (slot == 1) dbg_aux = v;
     return 0;
+}
+
+/* Read a debug slot back. The HOST can write these fields (romdev's
+ * wasm({op:'write'})), so this is the channel a test harness uses to drive
+ * a cart into a specific state -- jump to a level, force a condition --
+ * without the cart shipping cheat keys it would otherwise never have. */
+static int l_debug_get(lua_State *S) {
+    int slot = ARGI(1);
+    lua_pushinteger(S, slot == 0 ? dbg_score : dbg_aux);
+    return 1;
 }
 
 static int l_rand(lua_State *S) {
@@ -2658,6 +2676,7 @@ static const luaL_Reg wc_lib[] = {
     {"mark",        l_mark},
     {"gpu2d",       l_gpu2d},
     {"debug_set",   l_debug_set},
+    {"debug_get",   l_debug_get},
     {"rand",        l_rand},
     {"save_write",  l_save_write},
     {"save_read",   l_save_read},

@@ -143,6 +143,10 @@ static uint16_t indices[BATCH_MAX * 6];
 
 static int scissor_on;
 static int blend_add_on;
+/* The full LOVE blend mode, not just add/not-add. Kept alongside
+ * blend_add_on because the batchers still branch on "is this additive". */
+static int blend_mode_cur = WCL_BLEND_ALPHA;
+static int blend_premult_cur = 0;
 static void flush_batches(void);
 /* Custom shaders (defined further down). Declared here because set_textured
  * and bind_texture, which sit above them, must consult the bound program. */
@@ -1568,23 +1572,85 @@ static void set_blend(int enabled) {
     blend_enabled = enabled;
 }
 
-/* love.graphics.setBlendMode("add"). The software path does
- * dst = min(255, dst + src*a/255), which is GL_SRC_ALPHA / GL_ONE.
- * Destination alpha is left alone: the framebuffer and every canvas stay
- * opaque, exactly as blend_px leaves them. */
-void wcl_r2d_blend_add(int on) {
-    if (!ready || blend_add_on == on) return;
+/* love.graphics.setBlendMode(mode, alphamode).
+ *
+ * This used to be a single add/alpha toggle, which silently mapped EVERY
+ * other mode onto plain alpha. That is invisible in 2D carts -- alpha is
+ * what they wanted anyway -- and fatal to a deferred 3D renderer, whose
+ * post chain composites with "replace" and multiplies AO and bloom into
+ * the colour buffer with "multiply". With both collapsed to alpha the
+ * geometry pass renders perfectly and the composite comes out black, with
+ * no GL error and a correct draw-call count.
+ *
+ * Modes are LOVE's. "alphamultiply" premultiplies the source by its alpha
+ * in the blend equation; "premultiplied" means the source already is. */
+void wcl_r2d_blend_mode(int mode, int premultiplied) {
+    if (!ready) return;
+    if (blend_mode_cur == mode && blend_premult_cur == premultiplied) return;
     flush_batches();
-    blend_add_on = on;
-    if (on) {
-        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
+    blend_mode_cur = mode;
+    blend_premult_cur = premultiplied;
+    blend_add_on = (mode == WCL_BLEND_ADD);
+
+    /* The source factor for the colour channels: a premultiplied source must
+     * NOT be scaled by its alpha a second time. */
+    GLenum src_c = premultiplied ? GL_ONE : GL_SRC_ALPHA;
+
+    switch (mode) {
+    case WCL_BLEND_NONE:            /* "replace": write the source through */
+        glBlendFuncSeparate(GL_ONE, GL_ZERO, GL_ONE, GL_ZERO);
+        glBlendEquation(GL_FUNC_ADD);
+        break;
+    case WCL_BLEND_ADD:
+        glBlendFuncSeparate(src_c, GL_ONE, GL_ZERO, GL_ONE);
+        glBlendEquation(GL_FUNC_ADD);
+        break;
+    case WCL_BLEND_SUBTRACT:
+        glBlendFuncSeparate(src_c, GL_ONE, GL_ZERO, GL_ONE);
+        glBlendEquation(GL_FUNC_REVERSE_SUBTRACT);
+        break;
+    case WCL_BLEND_MULTIPLY:
+        /* dst * src. LOVE documents this one as premultiplied-only. */
+        glBlendFuncSeparate(GL_DST_COLOR, GL_ZERO, GL_DST_ALPHA, GL_ZERO);
+        glBlendEquation(GL_FUNC_ADD);
+        break;
+    case WCL_BLEND_LIGHTEN:
+        glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ONE);
+        glBlendEquation(GL_MAX);
+        break;
+    case WCL_BLEND_DARKEN:
+        glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ONE);
+        glBlendEquation(GL_MIN);
+        break;
+    case WCL_BLEND_SCREEN:
+        glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_COLOR,
+                            GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        glBlendEquation(GL_FUNC_ADD);
+        break;
+    case WCL_BLEND_ALPHA:
+    default:
+        glBlendFuncSeparate(src_c, GL_ONE_MINUS_SRC_ALPHA,
+                            GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        glBlendEquation(GL_FUNC_ADD);
+        break;
+    }
+
+    /* "replace" is the one mode that must run with blending DISABLED to be
+     * exact: with it on, a source alpha of 0 would still write through the
+     * ONE/ZERO factors, but the equation cost is pointless and some drivers
+     * differ on dual-source edge cases. Everything else needs it on. */
+    if (mode == WCL_BLEND_NONE) {
+        glDisable(GL_BLEND);
+        blend_enabled = 0;
+    } else {
         glEnable(GL_BLEND);
         blend_enabled = 1;
-    } else {
-        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
-                            GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-        blend_enabled = -1;   /* force the next set_blend to re-apply */
     }
+}
+
+/* Back-compat shim for the old binary toggle. */
+void wcl_r2d_blend_add(int on) {
+    wcl_r2d_blend_mode(on ? WCL_BLEND_ADD : WCL_BLEND_ALPHA, 0);
 }
 
 /* u_textured is per-DRAW state, and its location differs per program (a cart
@@ -2687,7 +2753,7 @@ void wcl_r2d_clear(uint32_t color, int alpha) {
                  (float)alpha / 255.0f);
     /* the cached screen-clear colour no longer reflects GL state */
     current_clear_color = 0xFFFFFFFFu;
-    /* DEPTH TOO, whenever a depth mode is live.
+    /* DEPTH TOO, ALWAYS -- not only when a depth mode is currently live.
      *
      * A freshly bound render target's depth attachment holds undefined
      * values. With the depth test on -- which a 3D pass turns on before it
@@ -2695,19 +2761,27 @@ void wcl_r2d_clear(uint32_t color, int alpha) {
      * and, at lequal, discarded. The pass then runs perfectly and writes
      * nothing: geometry submitted, no GL error, black canvas.
      *
-     * LOVE's clear() clears depth as well, so this also matches what a
-     * renderer written against LOVE expects when it calls clear() right
-     * after setCanvas(). glClear honours the depth write MASK, so the mask
-     * is forced on for the clear and put back after. */
-    GLbitfield bits = GL_COLOR_BUFFER_BIT;
+     * This used to be guarded on "a depth mode is live", which looks
+     * equivalent and is not. A deferred renderer binds its g-buffer with the
+     * depth test OFF, clears, and only THEN enables depth for the geometry
+     * pass -- 3DreamEngine does exactly this:
+     *
+     *     love.graphics.setDepthMode()             -- depth off
+     *     love.graphics.clear(false, false, true)  -- guard skipped depth here
+     *     ...
+     *     love.graphics.setDepthMode("less", true) -- now test vs garbage
+     *
+     * so the one clear that had to reach the depth buffer was the one the
+     * guard skipped, and the whole scene failed the test in silence.
+     *
+     * LOVE's clear() clears depth unconditionally, so matching it is also
+     * simply correct. glClear honours the depth write MASK, so the mask is
+     * forced on for the clear and restored after. */
     uint32_t dcmp = 0; int dwrite = 0;
     wcl_r3d_get_depth_mode(&dcmp, &dwrite);
-    if (dcmp) {
-        bits |= GL_DEPTH_BUFFER_BIT;
-        glDepthMask(1);
-    }
-    glClear(bits);
-    if (dcmp && !dwrite) glDepthMask(0);
+    glDepthMask(1);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    if (!dwrite) glDepthMask(0);
 }
 
 void wcl_r2d_forget(const void *key) {

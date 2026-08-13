@@ -26,6 +26,23 @@ typedef struct {
 } wcl_r2d_stats_t;
 extern wcl_r2d_stats_t wcl_r2d_stats;
 
+/* love.graphics.setBlendMode's modes. Defined for BOTH backends -- the
+ * Lua binding maps mode names onto these before it knows which renderer is
+ * compiled in, so they cannot live behind the GL guard.
+ *
+ * A deferred 3D renderer needs these to be real: its post chain composites
+ * with "replace" and multiplies AO and bloom into the colour buffer, so
+ * collapsing them onto alpha silently destroys the composite while every
+ * draw call still reports success. */
+#define WCL_BLEND_ALPHA     0
+#define WCL_BLEND_ADD       1
+#define WCL_BLEND_SUBTRACT  2
+#define WCL_BLEND_MULTIPLY  3
+#define WCL_BLEND_LIGHTEN   4
+#define WCL_BLEND_DARKEN    5
+#define WCL_BLEND_SCREEN    6
+#define WCL_BLEND_NONE      7   /* "replace" */
+
 #ifdef WCL_ENABLE_GL2D
 
 int  wcl_r2d_init(int width, int height);
@@ -91,8 +108,12 @@ int  wcl_r2d_poly(const double *xs, const double *ys, int n,
  * rounding detail. */
 int  wcl_r2d_circle(int cx, int cy, int r, uint32_t color, int alpha);
 
-/* Additive blending on/off. Batches are flushed on a change because the
- * blend mode is pipeline state, not per-vertex. */
+/* Batches are flushed on a change because blending is pipeline state, not
+ * per-vertex. `premultiplied` is LOVE's alphamode: 1 when the source colour
+ * already carries its alpha. */
+void wcl_r2d_blend_mode(int mode, int premultiplied);
+
+/* Additive on/off. Retained for callers that only ever needed the toggle. */
 void wcl_r2d_blend_add(int on);
 
 /* Render targets. A canvas is both a destination and, later, a source, so it
@@ -220,6 +241,9 @@ static inline void wcl_r2d_stencil_test(int compare, int value) {
     (void)compare; (void)value;
 }
 static inline void wcl_r2d_blend_add(int on) { (void)on; }
+static inline void wcl_r2d_blend_mode(int mode, int premultiplied) {
+    (void)mode; (void)premultiplied;
+}
 static inline int wcl_r2d_circle(int cx, int cy, int r, uint32_t color, int alpha) {
     (void)cx; (void)cy; (void)r; (void)color; (void)alpha; return 0;
 }
