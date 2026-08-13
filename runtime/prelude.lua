@@ -5307,6 +5307,262 @@ local deprecation_output = true
 function love.setDeprecationOutput(v) deprecation_output = v and true or false end
 function love.hasDeprecationOutput() return deprecation_output end
 
+-- ── the Box3D DEFAULT RENDERER ─────────────────────────────────────
+--
+-- Box2D ships a debug renderer that draws every body, and it is the thing
+-- you check a game against before trusting a single pixel of the real
+-- graphics: when a mesh and the body it represents disagree, you see it
+-- immediately. A 3D game built without one has to INFER every rendering
+-- bug from a screenshot, and inference is wrong a lot -- a mesh offset
+-- twice ends up off the map, a collider wider than its art is an invisible
+-- wall, a left-handed camera basis mirrors the entire scene. Each is
+-- obvious the instant the bodies are drawn, and none is obvious from
+-- pixels.
+--
+-- THE SHAPE IS THE SOURCE OF TRUTH, following the threejs-box3d-demo
+-- pattern: a mesh is built FROM the shape's dimensions at the moment the
+-- shape is created, and only its TRANSFORM is synced thereafter. Nothing
+-- describes the geometry twice, so nothing can drift.
+--
+--   local dbg = love.physics3d.debug
+--   dbg.init(dream, 120)               -- the 3D lib, and px per world unit
+--   dbg.box(body, hx, hy, hz)          -- makes the shape AND its mesh
+--   dbg.sphere(body, r)
+--   dbg.plane(body, hx, hz)            -- a floor, drawn as a ruled grid
+--   ...
+--   dbg.toggle()                       -- bind it to a key
+--   dbg.draw()                         -- inside the 3D pass
+--
+-- It lives here rather than in each game because every Box3D cart wants
+-- the same thing, and a per-game copy is a per-game chance to get it wrong.
+love.physics3d = love.physics3d or {}
+love.physics3d.debug = (function()
+  local D = { }
+  local dream, U = nil, 120
+  local tracked, shared = {}, {}
+  local on = false
+  local matStatic, matDynamic
+
+  function D.init(dreamLib, pxPerUnit)
+    dream = dreamLib
+    U = pxPerUnit or 120
+    -- Fullbright, and drawn on both sides: the debug view must not depend
+    -- on the lighting or culling paths being correct, since those are
+    -- among the things it exists to check.
+    matStatic = dream:newMaterial("b3dbg_static")
+    matStatic:setColor(0.2, 1.0, 0.35, 1)
+    matStatic:setEmission(0.2, 1.0, 0.35)
+    matStatic:setCullMode("none")
+    matDynamic = dream:newMaterial("b3dbg_dynamic")
+    matDynamic:setColor(1.0, 0.2, 0.9, 1)
+    matDynamic:setEmission(1.0, 0.2, 0.9)
+    matDynamic:setCullMode("none")
+  end
+
+  function D.setEnabled(v) on = v and true or false end
+  function D.toggle() on = not on end
+  function D.isEnabled() return on end
+  function D.count() return #tracked end
+
+  -- Drop every tracked body. Call when the world is destroyed, or the next
+  -- frame draws meshes for bodies that no longer exist.
+  function D.reset()
+    for _, t in ipairs(tracked) do
+      local m = t.mesh
+      if m and m.mesh and m.mesh.release then m.mesh:release(); m.mesh = nil end
+    end
+    tracked, shared = {}, {}
+  end
+
+  local function buildBox(mat, hx, hy, hz)
+    local m = dream:newMesh(mat)
+    local mv, mn = m:getOrCreateBuffer("vertices"), m:getOrCreateBuffer("normals")
+    local mt, mf = m:getOrCreateBuffer("texCoords"), m:getOrCreateBuffer("faces")
+    local ax, ay, az = hx / U, hy / U, hz / U
+    local faces = {
+      { { 0, 1, 0}, {-ax, ay, az}, {-ax, ay,-az}, { ax, ay,-az}, { ax, ay, az} },
+      { { 0,-1, 0}, {-ax,-ay,-az}, {-ax,-ay, az}, { ax,-ay, az}, { ax,-ay,-az} },
+      { { 0, 0, 1}, {-ax,-ay, az}, {-ax, ay, az}, { ax, ay, az}, { ax,-ay, az} },
+      { { 0, 0,-1}, {-ax, ay,-az}, {-ax,-ay,-az}, { ax,-ay,-az}, { ax, ay,-az} },
+      { { 1, 0, 0}, { ax,-ay,-az}, { ax,-ay, az}, { ax, ay, az}, { ax, ay,-az} },
+      { {-1, 0, 0}, {-ax,-ay, az}, {-ax,-ay,-az}, {-ax, ay,-az}, {-ax, ay, az} },
+    }
+    local base = 0
+    for _, f in ipairs(faces) do
+      local n = f[1]
+      for i = 2, 5 do
+        mv:append({ f[i][1], f[i][2], f[i][3] })
+        mn:append({ n[1], n[2], n[3] })
+        mt:append({ (i == 2 or i == 5) and 0 or 1, (i <= 3) and 0 or 1 })
+      end
+      mf:append({ base + 1, base + 2, base + 3 })
+      mf:append({ base + 1, base + 3, base + 4 })
+      base = base + 4
+    end
+    m:create()
+    return m
+  end
+
+  local function buildSphere(mat, r, seg)
+    seg = seg or 12
+    local m = dream:newMesh(mat)
+    local mv, mn = m:getOrCreateBuffer("vertices"), m:getOrCreateBuffer("normals")
+    local mt, mf = m:getOrCreateBuffer("texCoords"), m:getOrCreateBuffer("faces")
+    local rr = r / U
+    for i = 0, seg do
+      local phi = math.pi * i / seg
+      for j = 0, seg do
+        local th = 2 * math.pi * j / seg
+        local x, y, z = math.sin(phi) * math.cos(th), math.cos(phi), math.sin(phi) * math.sin(th)
+        mv:append({ x * rr, y * rr, z * rr })
+        mn:append({ x, y, z })
+        mt:append({ j / seg, i / seg })
+      end
+    end
+    for i = 0, seg - 1 do
+      for j = 0, seg - 1 do
+        local a = i * (seg + 1) + j + 1
+        local b = a + seg + 1
+        mf:append({ a, b, a + 1 })
+        mf:append({ a + 1, b, b + 1 })
+      end
+    end
+    m:create()
+    return m
+  end
+
+  -- A PLANE, drawn as a quad with a grid ruled on it.
+  --
+  -- A floor is conceptually a plane, and even when it is modelled as a
+  -- thin BOX the box drawing is useless for it: at a half-height near zero
+  -- the side faces collapse, top and bottom coincide, and the result is an
+  -- ambiguous sliver that shows neither where the surface is nor which way
+  -- it faces. The grid also gives the eye something to judge scale and
+  -- perspective against, which a bare quad does not.
+  local function buildPlane(mat, hx, hz)
+    local m = dream:newMesh(mat)
+    local mv, mn = m:getOrCreateBuffer("vertices"), m:getOrCreateBuffer("normals")
+    local mt, mf = m:getOrCreateBuffer("texCoords"), m:getOrCreateBuffer("faces")
+    local ax, az = hx / U, hz / U
+    local quad = { {-ax, 0,-az}, {-ax, 0, az}, { ax, 0, az}, { ax, 0,-az} }
+    for i, p in ipairs(quad) do
+      mv:append({ p[1], p[2], p[3] })
+      mn:append({ 0, 1, 0 })
+      mt:append({ (i == 1 or i == 2) and 0 or 1, (i <= 2) and 0 or 1 })
+    end
+    mf:append({ 1, 2, 3 }); mf:append({ 1, 3, 4 })
+    local base = 4
+    local LINES = 8
+    local W = math.max(ax, az) * 0.006
+    for i = 0, LINES do
+      local t = -1 + 2 * i / LINES
+      for axis = 1, 2 do
+        local x1, z1, x2, z2
+        if axis == 1 then x1, z1, x2, z2 = t * ax - W, -az, t * ax + W, az
+        else x1, z1, x2, z2 = -ax, t * az - W, ax, t * az + W end
+        for _, p in ipairs({ {x1,z1}, {x1,z2}, {x2,z2}, {x2,z1} }) do
+          mv:append({ p[1], 0.002, p[2] })
+          mn:append({ 0, 1, 0 })
+          mt:append({ 0, 0 })
+        end
+        mf:append({ base + 1, base + 2, base + 3 })
+        mf:append({ base + 1, base + 3, base + 4 })
+        base = base + 4
+      end
+    end
+    m:create()
+    return m
+  end
+
+  -- Meshes are SHARED by size: forty identical bumpers build one sphere,
+  -- not forty. The renderer has a hard mesh-slot budget, and a debug view
+  -- that exhausts it is a debug view nobody can turn on.
+  local function meshFor(sig, build)
+    if not shared[sig] then shared[sig] = build() end
+    return shared[sig]
+  end
+
+  local function isDynamic(body)
+    local ok, t = pcall(b3.body_get_type, body)
+    return ok and t == 2
+  end
+
+  -- How flat a box has to be before it draws as a plane. A floor is often
+  -- a very thin box rather than a true plane.
+  local PLANE_RATIO = 0.06
+
+  function D.box(body, hx, hy, hz, density)
+    local s = b3.shape_box(body, hx, hy, hz, density)
+    if dream then
+      local dyn = isDynamic(body)
+      local mat = dyn and matDynamic or matStatic
+      local flat = hy < math.max(hx, hz) * PLANE_RATIO
+      local sig = (flat and "p|" or "b|") .. (dyn and "d|" or "s|") ..
+                  string.format("%.2f|%.2f|%.2f", hx, hy, hz)
+      tracked[#tracked + 1] = { body = body, mesh = meshFor(sig, function()
+        if flat then return buildPlane(mat, hx, hz) end
+        return buildBox(mat, hx, hy, hz)
+      end) }
+    end
+    return s
+  end
+
+  function D.sphere(body, r, density)
+    local s = b3.shape_sphere(body, r, density)
+    if dream then
+      local dyn = isDynamic(body)
+      local mat = dyn and matDynamic or matStatic
+      local sig = "s|" .. (dyn and "d|" or "s|") .. string.format("%.2f", r)
+      tracked[#tracked + 1] = { body = body, mesh = meshFor(sig, function()
+        return buildSphere(mat, r)
+      end) }
+    end
+    return s
+  end
+
+  -- An explicit plane, for a world whose floor is a true plane. hx/hz are
+  -- how much of it to DRAW: a plane is infinite and a mesh is not, so the
+  -- extent is a rendering choice rather than a physical one.
+  function D.plane(body, hx, hz, thickness, density)
+    local s = b3.shape_box(body, hx, thickness or 1, hz, density)
+    if dream then
+      local dyn = isDynamic(body)
+      local mat = dyn and matDynamic or matStatic
+      local sig = "p|" .. (dyn and "d|" or "s|") .. string.format("%.2f|%.2f", hx, hz)
+      tracked[#tracked + 1] = { body = body, mesh = meshFor(sig, function()
+        return buildPlane(mat, hx, hz)
+      end) }
+    end
+    return s
+  end
+
+  -- A body's world matrix, straight from the solver: position and
+  -- quaternion, every frame. This is the whole point -- a body that moved
+  -- is drawn where it moved to, and nowhere else.
+  local function bodyMatrix(body)
+    local px, py, pz = b3.body_position(body)
+    local qx, qy, qz, qw = b3.body_rotation(body)
+    local xx, yy, zz = qx * qx, qy * qy, qz * qz
+    local xy, xz, yz = qx * qy, qx * qz, qy * qz
+    local wx, wy, wz = qw * qx, qw * qy, qw * qz
+    return dream.mat4({
+      1 - 2 * (yy + zz), 2 * (xy - wz),     2 * (xz + wy),     px / U,
+      2 * (xy + wz),     1 - 2 * (xx + zz), 2 * (yz - wx),     py / U,
+      2 * (xz - wy),     2 * (yz + wx),     1 - 2 * (xx + yy), pz / U,
+      0,                 0,                 0,                 1,
+    })
+  end
+
+  function D.draw()
+    if not on or not dream then return end
+    for _, t in ipairs(tracked) do
+      if t.mesh and t.body then dream:draw(t.mesh, bodyMatrix(t.body)) end
+    end
+  end
+
+  return D
+end)()
+
 love.mark = function(id) wc.mark(id) end
 love.log = function(...)
   local parts = {}

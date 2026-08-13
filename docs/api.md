@@ -980,6 +980,36 @@ b3.body_set_gravity_scale(body, s) b3.body_get_gravity_scale(body)
 -- read them once per step. `speed` is the approach speed in px/s, which is
 -- what a collision sound's volume should scale with.
 b3.shape_enable_hit_events(shape, bool)
+
+-- ── the DEFAULT RENDERER (love.physics3d.debug) ─────────────────────
+--
+-- Box2D ships a debug renderer that draws every body; this is the Box3D
+-- equivalent, built on whatever 3D library the cart is using. It is the
+-- baseline you check a game against before trusting a pixel of the real
+-- graphics: when a mesh and the body it represents disagree, you see it
+-- immediately instead of inferring it from a screenshot.
+--
+-- THE SHAPE IS THE SOURCE OF TRUTH. Create shapes through these wrappers
+-- and the mesh is built from the shape's own dimensions, then only its
+-- TRANSFORM is synced. Nothing describes the geometry twice, so the debug
+-- view cannot drift from the simulation.
+local dbg = love.physics3d.debug
+dbg.init(dream, 120)          -- the 3D lib, and pixels per world unit
+dbg.box(body, hx, hy, hz [, density])      -- shape + mesh; thin ones draw
+                                           -- as PLANES, since a floor is
+                                           -- usually a flattened box and a
+                                           -- box outline describes it worst
+dbg.sphere(body, r [, density])
+dbg.plane(body, hx, hz [, thickness])      -- an explicit floor, ruled grid
+dbg.toggle()                  dbg.setEnabled(bool)   dbg.isEnabled()
+dbg.reset()                   -- on world teardown, or it draws dead bodies
+dbg.draw()                    -- inside the 3D pass
+dbg.count()
+
+-- Static bodies draw green, dynamic magenta, both fullbright and two-sided
+-- so the view never depends on the lighting or culling paths being right --
+-- those are among the things it exists to check. Meshes are shared by size,
+-- so forty identical bumpers cost one sphere.
 b3.shape_enable_contact_events(shape, bool)
 b3.world_set_hit_threshold(world, pxPerSec)  -- below this, no hit event
 b3.world_set_gravity(world, gx, gy, gz)
