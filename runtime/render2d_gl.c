@@ -2853,6 +2853,38 @@ void wcl_r2d_scissor(int x, int y, int w, int h) {
         return;
     }
     if (!scissor_on) { glEnable(GL_SCISSOR_TEST); scissor_on = 1; }
+
+    /* SCISSOR IS IN WINDOW PIXELS, not cart pixels.
+     *
+     * Everything else the cart draws goes through the projection, so cart
+     * coordinates land wherever the viewport puts them. glScissor does not:
+     * it clips in the window's own pixels. Passing the cart rect straight
+     * through works only when the viewport happens to be the cart's size
+     * and sits at the origin.
+     *
+     * On a letterboxed host it silently clips the wrong region. Measured on
+     * a 2244x1008 phone running a 1920x1080 cart: the board's cart rect
+     * x 60..1260 clipped at WINDOW x 60..1260, while the board actually
+     * drew at window x 282..1402 -- so the right ~140px was cut and the
+     * last column of a match-three board had no jewels in it, with the cell
+     * backgrounds (drawn outside the scissor) still visible. It rendered
+     * perfectly on desktop, where viewport == cart size.
+     *
+     * A canvas target is its own surface at its own size, so cart
+     * coordinates are already right there and only the screen needs the
+     * mapping. */
+    if (!current_target && host_vp_w > 0 && host_vp_h > 0) {
+        float sx = (float)host_vp_w / (float)width;
+        float sy = (float)host_vp_h / (float)height;
+        int gx = host_vp_x + (int)(x * sx + 0.5f);
+        int gw = (int)(w * sx + 0.5f);
+        int gh = (int)(h * sy + 0.5f);
+        /* GL's origin is bottom-left; the cart's is top-left. Flip within
+         * the WINDOW, not within the cart. */
+        int gy = host_vp_y + (int)((height - (y + h)) * sy + 0.5f);
+        glScissor(gx, gy, gw, gh);
+        return;
+    }
     glScissor(x, height - (y + h), w, h);
 }
 
