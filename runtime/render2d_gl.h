@@ -124,6 +124,15 @@ void wcl_r2d_blend_add(int on);
  * wcl_r2d_target(NULL, 0, 0) restores the screen. Returns 0 if the target
  * could not be set up, in which case the caller must use the software path. */
 int  wcl_r2d_target(const void *key, int w, int h);
+
+/* THE HOST'S VIEWPORT RECT. A host that letterboxes -- a phone whose screen
+ * is not the cart's aspect -- calls this once, and the engine restores this
+ * rect whenever it returns to the screen instead of resetting to the cart's
+ * own size. Without it the first setCanvas() of a frame silently destroys
+ * the letterbox: on a 2244x1008 device running a 1920x1080 cart that cut a
+ * whole row off a match-three board and broke touch mapping with it.
+ * Zero width means "not set". */
+void wcl_r2d_set_host_viewport(int x, int y, int w, int h);
 /* Clear the current target (screen or canvas) to an RGBA colour. */
 void wcl_r2d_clear(uint32_t color, int alpha);
 /* Forget a canvas's GPU texture, e.g. when the image slot is reused. */
@@ -243,6 +252,9 @@ static inline void wcl_r2d_stencil_test(int compare, int value) {
 static inline void wcl_r2d_blend_add(int on) { (void)on; }
 static inline void wcl_r2d_blend_mode(int mode, int premultiplied) {
     (void)mode; (void)premultiplied;
+}
+static inline void wcl_r2d_set_host_viewport(int x, int y, int w, int h) {
+    (void)x; (void)y; (void)w; (void)h;
 }
 static inline int wcl_r2d_circle(int cx, int cy, int r, uint32_t color, int alpha) {
     (void)cx; (void)cy; (void)r; (void)color; (void)alpha; return 0;

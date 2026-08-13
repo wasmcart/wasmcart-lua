@@ -146,6 +146,9 @@ static int blend_add_on;
 /* The full LOVE blend mode, not just add/not-add. Kept alongside
  * blend_add_on because the batchers still branch on "is this additive". */
 static int blend_mode_cur = WCL_BLEND_ALPHA;
+/* Defined with the host-viewport block further down; declared here because
+ * wcl_r2d__screen_viewport sits above it and must restore the same rect. */
+static void restore_screen_viewport(void);
 static int blend_premult_cur = 0;
 static void flush_batches(void);
 /* Custom shaders (defined further down). Declared here because set_textured
@@ -1937,7 +1940,7 @@ void wcl_r2d__screen_viewport(void) {
         ndc_scale_y = 2.0f / (float)current_target->h;
         return;
     }
-    glViewport(0, 0, width, height);
+    restore_screen_viewport();
     ndc_scale_x = 2.0f / (float)width;
     ndc_scale_y = 2.0f / (float)height;
 }
@@ -2409,7 +2412,16 @@ static texture_t *get_texture(const void *pixels, int w, int h) {
             atlas_y += atlas_row_h;
             atlas_row_h = 0;
         }
-        if (atlas_y + h > ATLAS_SIZE) return NULL;   /* atlas full */
+        if (atlas_y + h > ATLAS_SIZE) {
+            /* SAY SO. This returned NULL silently and every caller "fell
+             * back", which on a phone meant a whole column of a match-three
+             * board simply had no jewels in it -- with no error anywhere,
+             * on a build that rendered perfectly on desktop. A silent
+             * capacity failure is the worst kind: it looks like a layout
+             * bug and sends you hunting the viewport. */
+            WC_LOG("atlas full: no room for another texture");
+            return NULL;
+        }
         t->pixels = pixels; t->w = w; t->h = h;
         t->atlas_x = atlas_x; t->atlas_y = atlas_y; t->used = 1;
         /* An upload has to land in the atlas, not whatever a batch left
@@ -2690,13 +2702,38 @@ static target_t *target_find(const void *key) {
     return NULL;
 }
 
+/* THE HOST'S VIEWPORT RECT, when it is not simply (0,0,cart_w,cart_h).
+ *
+ * A host that letterboxes -- an Android device whose screen is not the
+ * cart's aspect -- sets a viewport once and expects it to stay. It did not:
+ * restoring the screen here reset the viewport to the CART's size, so the
+ * first setCanvas() in a frame silently destroyed the letterbox and every
+ * later draw was scaled to fill the window. On a 2244x1008 phone running a
+ * 1920x1080 cart that cut 127px off the top and bottom -- a whole row of a
+ * match-three board, plus a clipped column -- and it also broke touch,
+ * because the host maps taps through the rect it believes is current.
+ *
+ * Zero width means "not set", and the old behaviour applies. */
+static int host_vp_x, host_vp_y, host_vp_w, host_vp_h;
+
+void wcl_r2d_set_host_viewport(int x, int y, int w, int h) {
+    host_vp_x = x; host_vp_y = y; host_vp_w = w; host_vp_h = h;
+}
+
+static void restore_screen_viewport(void) {
+    if (host_vp_w > 0 && host_vp_h > 0)
+        glViewport(host_vp_x, host_vp_y, host_vp_w, host_vp_h);
+    else
+        glViewport(0, 0, width, height);
+}
+
 int wcl_r2d_target(const void *key, int w, int h) {
     if (!ready) return 0;
     flush_batches();
 
     if (!key) {                       /* back to the screen */
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glViewport(0, 0, width, height);
+        restore_screen_viewport();
         current_target = NULL;
         ndc_scale_x = 2.0f / (float)width;
         ndc_scale_y = 2.0f / (float)height;
