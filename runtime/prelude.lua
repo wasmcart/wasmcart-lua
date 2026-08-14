@@ -5356,11 +5356,95 @@ love.physics3d.debug = (function()
   local COL_STATIC  = { 0.20, 1.00, 0.35 }
   local COL_DYNAMIC = { 1.00, 0.20, 0.90 }
   local lighting = true
+
+  -- SKINS: the same geometry, wearing a real surface.
+  --
+  -- The debug view's two colours answer "is this body where I think it is".
+  -- They cannot answer "does this look like a bowling alley", and a game
+  -- built ON the default renderer -- as bowling is, deliberately, so the
+  -- picture cannot disagree with the simulation -- would otherwise have to
+  -- abandon it to get textures, re-authoring every mesh by hand and taking
+  -- back exactly the class of bug this renderer exists to prevent.
+  --
+  -- So a shape may name a SKIN instead. The mesh is still built from the
+  -- shape's own dimensions at creation time, from the same builders; only
+  -- the material and vertex colour change. Nothing describes the geometry
+  -- twice, which is the whole invariant.
+  --
+  --   dbg.defineSkin("lane", { texture = img, color = {1,1,1}, uvScale = 1/256 })
+  --   dbg.box(body, hx, hy, hz, density, "lane")
+  --
+  -- The baked shading still multiplies the texture, so a face pointing at
+  -- the key light stays brighter than one turned away -- this engine's 3D
+  -- path has no runtime lighting, and a flat-lit texture reads as a decal
+  -- rather than as a surface.
+  local skins = {}
+
+  -- Textures ride on EMISSION, not albedo. With no runtime lights on this
+  -- path, an albedo-only surface renders black; emission is what actually
+  -- reaches the screen. The vertex colour carries the shading and the
+  -- texture carries the detail, and the shader multiplies them.
+  function D.defineSkin(name, opts)
+    opts = opts or {}
+    local s = {
+      color   = opts.color or { 1, 1, 1 },
+      uvScale = opts.uvScale,          -- texture repeats per pixel; nil = fit
+      texture = opts.texture,
+    }
+    if dream and opts.texture then
+      local m = dream:newMaterial("b3dbg_skin_" .. name)
+      -- "textured" is the shader that samples an image AND honours the
+      -- per-vertex colour; "simple" (what the plain debug view uses) has no
+      -- sampler at all, so a texture set on it is silently ignored.
+      m:setColor(1, 1, 1, 1)
+      m:setEmissionTexture(opts.texture)
+      m:setEmission(0, 0, 0)           -- else it is ADDED to every texel
+      m:setEmissionFactor(1, 1, 1)
+      m:setAlbedoTexture(opts.texture)
+      m:setRoughness(opts.roughness or 0.9)
+      m:setMetallic(opts.metallic or 0)
+      m:setCullMode(opts.cullMode or "none")
+      s.material = m
+    end
+    skins[name] = s
+    return s
+  end
+
+  function D.getSkin(name) return skins[name] end
   local KEY   = { -0.45, 0.80, 0.40 }   -- normalized below
   local FILL  = {  0.65, 0.25, -0.55 }
   local KEY_C  = { 1.00, 0.97, 0.90 }
   local FILL_C = { 0.55, 0.65, 0.85 }
   local AMBIENT = 0.42
+  local KEY_I, FILL_I = 0.75, 0.55
+
+  -- ART-DIRECT THE RIG.
+  --
+  -- The defaults are chosen to make a COLLIDER readable -- high ambient so
+  -- nothing is ever lost in shadow, a cool fill so a turned face still
+  -- shows its shape. Those are the right defaults for a debug view and the
+  -- wrong ones for a finished scene: high ambient is exactly what makes a
+  -- picture look flat, because it shrinks the difference between a face in
+  -- the light and a face out of it.
+  --
+  -- A game that has decided how it wants to look can say so. Call before
+  -- building geometry -- the shading is baked at mesh-build time, so this
+  -- throws the cache away and anything already built is rebuilt.
+  --
+  --   dbg.setLightRig{ ambient = 0.22, key = {-0.3, 0.9, 0.2},
+  --                    keyColor = {1, 0.96, 0.86}, keyIntensity = 0.95 }
+  function D.setLightRig(o)
+    o = o or {}
+    if o.key then KEY = o.key end
+    if o.fill then FILL = o.fill end
+    if o.keyColor then KEY_C = o.keyColor end
+    if o.fillColor then FILL_C = o.fillColor end
+    if o.ambient then AMBIENT = o.ambient end
+    if o.keyIntensity then KEY_I = o.keyIntensity end
+    if o.fillIntensity then FILL_I = o.fillIntensity end
+    -- Rebuild anything already baked, for the same reason setLighting does.
+    D.rebake()
+  end
 
   local function norm3(v)
     local l = math.sqrt(v[1] * v[1] + v[2] * v[2] + v[3] * v[3])
@@ -5377,9 +5461,9 @@ love.physics3d.debug = (function()
     if f < 0 then f = 0 end
     -- Half-lambert on the fill so faces turned away go dim, never black.
     f = f * 0.5 + 0.15
-    local r = AMBIENT + k * KEY_C[1] * 0.75 + f * FILL_C[1] * 0.55
-    local g = AMBIENT + k * KEY_C[2] * 0.75 + f * FILL_C[2] * 0.55
-    local b = AMBIENT + k * KEY_C[3] * 0.75 + f * FILL_C[3] * 0.55
+    local r = AMBIENT + k * KEY_C[1] * KEY_I + f * FILL_C[1] * FILL_I
+    local g = AMBIENT + k * KEY_C[2] * KEY_I + f * FILL_C[2] * FILL_I
+    local b = AMBIENT + k * KEY_C[3] * KEY_I + f * FILL_C[3] * FILL_I
     -- CLAMP. Ambient + key + fill sums past 1.0 on a face that catches both
     -- lights (measured peak 1.215), and the simple mesh format packs colour
     -- into a BYTE -- so an unclamped highlight is not a blown highlight, it
@@ -5400,7 +5484,10 @@ love.physics3d.debug = (function()
   -- carry a hue. The material stays white-emissive and this supplies both
   -- the body's colour and its shading.
   -- Which palette a mesh belongs to, from the material it was built with.
-  local function baseFor(mat)
+  local function baseFor(mat, skin)
+    -- A skin's own colour wins: it tints its texture, and the debug palette
+    -- would otherwise stain every textured surface green or magenta.
+    if skin then return skin.color end
     if mat == matDynamic then return COL_DYNAMIC end
     return COL_STATIC
   end
@@ -5429,17 +5516,79 @@ love.physics3d.debug = (function()
     end
   end
 
+  -- Finish a mesh: bake the shading, create it, and put the texture on the
+  -- MESH as well as the material.
+  --
+  -- Both halves are required. 3DreamEngine assigns textures through the
+  -- material, but this engine's 3D meshes carry their own texture and the
+  -- material's sampler is never read -- so a mesh that skips this draws
+  -- flat, with no error anywhere: the shader compiles and the uniform sends.
+  local function finishMesh(m, mat, skin)
+    bakeShading(m, baseFor(mat, skin))
+    m:create()
+    if skin and skin.texture and m.mesh and m.mesh.setTexture then
+      m.mesh:setTexture(skin.texture)
+    end
+    return m
+  end
+
+  -- Which material a shape draws with: its skin's, or the debug palette's.
+  local function matFor(dyn, skin)
+    if skin and skin.material then return skin.material end
+    return dyn and matDynamic or matStatic
+  end
+
+  -- A skin named but never defined is a TYPO, and the failure is otherwise
+  -- silent: the shape draws in debug green, which looks like a deliberate
+  -- choice rather than a mistake. Say so once per bad name.
+  local warned = {}
+  local function skinFor(name)
+    if name == nil then return nil end
+    local s = skins[name]
+    if not s and not warned[name] then
+      warned[name] = true
+      if love and love.log then
+        love.log(("physics3d.debug: no skin named %q -- drawing untextured")
+                 :format(name))
+      end
+    end
+    return s
+  end
+
+  -- Mesh sharing keys on the skin too -- otherwise the first shape of a
+  -- given SIZE wins and every later one silently inherits its surface.
+  local function skinSig(name) return name and ("#" .. name) or "" end
+
+  -- Throw away every baked mesh and build it again under the current
+  -- lighting.
+  --
+  -- REBUILD, not just invalidate. Dropping t.mesh alone leaves each tracked
+  -- entry pointing at nil, and draw() skips anything without a mesh -- so
+  -- every body that already existed silently stops being drawn, and the
+  -- scene empties out at the moment the lighting changes. Each entry keeps
+  -- the closure that made its mesh so it can be remade here.
+  function D.rebake()
+    for k, m in pairs(shared) do
+      if m and m.clear then m:clear() end
+      shared[k] = nil
+    end
+    for _, t in ipairs(tracked) do
+      if t.build then
+        if not shared[t.sig] then shared[t.sig] = t.build() end
+        t.mesh = shared[t.sig]
+      else
+        t.mesh = nil
+      end
+    end
+  end
+
   function D.setLighting(v)
     v = v and true or false
     if v == lighting then return end
     lighting = v
     -- Meshes bake the shade at build time, so a change has to throw the
     -- cache away or the old lighting persists for every shape already seen.
-    for k, m in pairs(shared) do
-      if m and m.clear then m:clear() end
-      shared[k] = nil
-    end
-    for _, t in ipairs(tracked) do t.mesh = nil end
+    D.rebake()
   end
   function D.isLighting() return lighting end
 
@@ -5475,6 +5624,10 @@ love.physics3d.debug = (function()
 
   -- Drop every tracked body. Call when the world is destroyed, or the next
   -- frame draws meshes for bodies that no longer exist.
+  -- Skins SURVIVE a reset. They own a material and a texture, not any
+  -- geometry, and a game that rebuilds its world between rounds -- which is
+  -- what reset is for -- would otherwise have to re-register every surface
+  -- or silently fall back to debug green.
   function D.reset()
     for _, t in ipairs(tracked) do
       local m = t.mesh
@@ -5483,37 +5636,50 @@ love.physics3d.debug = (function()
     tracked, shared = {}, {}
   end
 
-  local function buildBox(mat, hx, hy, hz)
+  local function buildBox(mat, hx, hy, hz, skin)
     local m = dream:newMesh(mat)
     local mv, mn = m:getOrCreateBuffer("vertices"), m:getOrCreateBuffer("normals")
     local mt, mf = m:getOrCreateBuffer("texCoords"), m:getOrCreateBuffer("faces")
     local ax, ay, az = hx / U, hy / U, hz / U
+    -- Each face carries the two HALF-EXTENTS it spans, so its UVs can be
+    -- scaled by real size. Without this a texture fits 0..1 across whatever
+    -- the face happens to be, and a 4600px lane wears the same single tile
+    -- as a 12px lip -- one smeared to nothing, the other crisp.
     local faces = {
-      { { 0, 1, 0}, {-ax, ay, az}, {-ax, ay,-az}, { ax, ay,-az}, { ax, ay, az} },
-      { { 0,-1, 0}, {-ax,-ay,-az}, {-ax,-ay, az}, { ax,-ay, az}, { ax,-ay,-az} },
-      { { 0, 0, 1}, {-ax,-ay, az}, {-ax, ay, az}, { ax, ay, az}, { ax,-ay, az} },
-      { { 0, 0,-1}, {-ax, ay,-az}, {-ax,-ay,-az}, { ax,-ay,-az}, { ax, ay,-az} },
-      { { 1, 0, 0}, { ax,-ay,-az}, { ax,-ay, az}, { ax, ay, az}, { ax, ay,-az} },
-      { {-1, 0, 0}, {-ax,-ay, az}, {-ax,-ay,-az}, {-ax, ay,-az}, {-ax, ay, az} },
+      { { 0, 1, 0}, {-ax, ay, az}, {-ax, ay,-az}, { ax, ay,-az}, { ax, ay, az}, hx, hz },
+      { { 0,-1, 0}, {-ax,-ay,-az}, {-ax,-ay, az}, { ax,-ay, az}, { ax,-ay,-az}, hx, hz },
+      { { 0, 0, 1}, {-ax,-ay, az}, {-ax, ay, az}, { ax, ay, az}, { ax,-ay, az}, hx, hy },
+      { { 0, 0,-1}, {-ax, ay,-az}, {-ax,-ay,-az}, { ax,-ay,-az}, { ax, ay,-az}, hx, hy },
+      { { 1, 0, 0}, { ax,-ay,-az}, { ax,-ay, az}, { ax, ay, az}, { ax, ay,-az}, hz, hy },
+      { {-1, 0, 0}, {-ax,-ay, az}, {-ax,-ay,-az}, {-ax, ay,-az}, {-ax, ay, az}, hz, hy },
     }
+    -- uvScale is a number, or {u, v} when the two axes need different
+    -- repeats. A bowling lane needs exactly that: its texture must map
+    -- ACROSS the lane once and only once -- it is 39 boards wide, and a
+    -- fractional repeat saws a board in half at the edge -- while tiling
+    -- freely down a length forty times greater.
+    local s = skin and skin.uvScale
+    local su0, sv0 = s, s
+    if type(s) == "table" then su0, sv0 = s[1], s[2] end
     local base = 0
     for _, f in ipairs(faces) do
       local n = f[1]
+      local su, sv = 1, 1
+      if s then su, sv = f[6] * 2 * su0, f[7] * 2 * sv0 end
       for i = 2, 5 do
         mv:append({ f[i][1], f[i][2], f[i][3] })
         mn:append({ n[1], n[2], n[3] })
-        mt:append({ (i == 2 or i == 5) and 0 or 1, (i <= 3) and 0 or 1 })
+        mt:append({ ((i == 2 or i == 5) and 0 or 1) * su,
+                    ((i <= 3) and 0 or 1) * sv })
       end
       mf:append({ base + 1, base + 2, base + 3 })
       mf:append({ base + 1, base + 3, base + 4 })
       base = base + 4
     end
-    bakeShading(m, baseFor(mat))
-    m:create()
-    return m
+    return finishMesh(m, mat, skin)
   end
 
-  local function buildSphere(mat, r, seg)
+  local function buildSphere(mat, r, seg, skin)
     seg = seg or 12
     local m = dream:newMesh(mat)
     local mv, mn = m:getOrCreateBuffer("vertices"), m:getOrCreateBuffer("normals")
@@ -5537,9 +5703,7 @@ love.physics3d.debug = (function()
         mf:append({ a + 1, b, b + 1 })
       end
     end
-    bakeShading(m, baseFor(mat))
-    m:create()
-    return m
+    return finishMesh(m, mat, skin)
   end
 
   -- A PLANE, drawn as a quad with a grid ruled on it.
@@ -5550,20 +5714,32 @@ love.physics3d.debug = (function()
   -- ambiguous sliver that shows neither where the surface is nor which way
   -- it faces. The grid also gives the eye something to judge scale and
   -- perspective against, which a bare quad does not.
-  local function buildPlane(mat, hx, hz)
+  local function buildPlane(mat, hx, hz, skin)
     local m = dream:newMesh(mat)
     local mv, mn = m:getOrCreateBuffer("vertices"), m:getOrCreateBuffer("normals")
     local mt, mf = m:getOrCreateBuffer("texCoords"), m:getOrCreateBuffer("faces")
     local ax, az = hx / U, hz / U
+    local s = skin and skin.uvScale
+    local su, sv = 1, 1
+    if s then
+      local su0, sv0 = s, s
+      if type(s) == "table" then su0, sv0 = s[1], s[2] end
+      su, sv = hx * 2 * su0, hz * 2 * sv0
+    end
     local quad = { {-ax, 0,-az}, {-ax, 0, az}, { ax, 0, az}, { ax, 0,-az} }
     for i, p in ipairs(quad) do
       mv:append({ p[1], p[2], p[3] })
       mn:append({ 0, 1, 0 })
-      mt:append({ (i == 1 or i == 2) and 0 or 1, (i <= 2) and 0 or 1 })
+      mt:append({ ((i == 1 or i == 2) and 0 or 1) * su,
+                  ((i <= 2) and 0 or 1) * sv })
     end
     mf:append({ 1, 2, 3 }); mf:append({ 1, 3, 4 })
     local base = 4
-    local LINES = 8
+    -- THE RULED GRID IS A DEBUG AFFORDANCE, and a skinned plane does not get
+    -- one. It exists to give the eye scale and perspective on an untextured
+    -- quad; a texture does that job better, and grid lines drawn over a lane
+    -- read as damage to the floor rather than as a measuring aid.
+    local LINES = skin and -1 or 8
     local W = math.max(ax, az) * 0.006
     for i = 0, LINES do
       local t = -1 + 2 * i / LINES
@@ -5581,9 +5757,7 @@ love.physics3d.debug = (function()
         base = base + 4
       end
     end
-    bakeShading(m, baseFor(mat))
-    m:create()
-    return m
+    return finishMesh(m, mat, skin)
   end
 
   -- Meshes are SHARED by size: forty identical bumpers build one sphere,
@@ -5603,31 +5777,47 @@ love.physics3d.debug = (function()
   -- a very thin box rather than a true plane.
   local PLANE_RATIO = 0.06
 
-  function D.box(body, hx, hy, hz, density)
+  function D.box(body, hx, hy, hz, density, skinName)
     local s = b3.shape_box(body, hx, hy, hz, density)
     if dream then
       local dyn = isDynamic(body)
-      local mat = dyn and matDynamic or matStatic
-      local flat = hy < math.max(hx, hz) * PLANE_RATIO
+      local skin = skinFor(skinName)
+      local mat = matFor(dyn, skin)
+      -- A SKINNED box stays a box. The plane substitution exists because a
+      -- flattened box outline is an unreadable sliver in the debug view --
+      -- but a textured floor is read from its surface, and swapping it for a
+      -- zero-thickness quad loses the edge the ball rolls against.
+      local flat = (not skin) and hy < math.max(hx, hz) * PLANE_RATIO
       local sig = (flat and "p|" or "b|") .. (dyn and "d|" or "s|") ..
-                  string.format("%.2f|%.2f|%.2f", hx, hy, hz)
-      tracked[#tracked + 1] = { body = body, mesh = meshFor(sig, function()
-        if flat then return buildPlane(mat, hx, hz) end
-        return buildBox(mat, hx, hy, hz)
-      end) }
+                  string.format("%.2f|%.2f|%.2f", hx, hy, hz) .. skinSig(skinName)
+      local build = function()
+        if flat then return buildPlane(mat, hx, hz, skin) end
+        return buildBox(mat, hx, hy, hz, skin)
+      end
+      tracked[#tracked + 1] =
+        { body = body, sig = sig, build = build, mesh = meshFor(sig, build) }
     end
     return s
   end
 
-  function D.sphere(body, r, density)
+  function D.sphere(body, r, density, skinName)
     local s = b3.shape_sphere(body, r, density)
     if dream then
       local dyn = isDynamic(body)
-      local mat = dyn and matDynamic or matStatic
-      local sig = "s|" .. (dyn and "d|" or "s|") .. string.format("%.2f", r)
-      tracked[#tracked + 1] = { body = body, mesh = meshFor(sig, function()
-        return buildSphere(mat, r)
-      end) }
+      local skin = skinFor(skinName)
+      local mat = matFor(dyn, skin)
+      -- A skinned sphere gets more segments. Twelve is plenty to READ a
+      -- collider, but a ball the player watches roll shows every facet on
+      -- its silhouette -- and the texture's own detail makes the faceting
+      -- more obvious, not less.
+      local seg = skin and (skin.segments or 24) or 12
+      local sig = "s|" .. (dyn and "d|" or "s|") ..
+                  string.format("%.2f|%d", r, seg) .. skinSig(skinName)
+      local build = function()
+        return buildSphere(mat, r, seg, skin)
+      end
+      tracked[#tracked + 1] =
+        { body = body, sig = sig, build = build, mesh = meshFor(sig, build) }
     end
     return s
   end
@@ -5639,7 +5829,7 @@ love.physics3d.debug = (function()
   -- the same axis b3.shape_capsule uses. Box3D has three shape types and
   -- this was the missing one, so a cart that made a capsule got collision
   -- and no mesh: bowling pins that knocked each other down invisibly.
-  local function buildCapsule(mat, halfHeight, r, seg)
+  local function buildCapsule(mat, halfHeight, r, seg, skin)
     seg = seg or 12
     local m = dream:newMesh(mat)
     local mv, mn = m:getOrCreateBuffer("vertices"), m:getOrCreateBuffer("normals")
@@ -5677,21 +5867,23 @@ love.physics3d.debug = (function()
         mf:append({ a + 1, b, b + 1 })
       end
     end
-    bakeShading(m, baseFor(mat))
-    m:create()
-    return m
+    return finishMesh(m, mat, skin)
   end
 
-  function D.capsule(body, halfHeight, r, density)
+  function D.capsule(body, halfHeight, r, density, skinName)
     local s = b3.shape_capsule(body, halfHeight, r, density)
     if dream then
       local dyn = isDynamic(body)
-      local mat = dyn and matDynamic or matStatic
+      local skin = skinFor(skinName)
+      local mat = matFor(dyn, skin)
+      local seg = skin and (skin.segments or 24) or 12
       local sig = "c|" .. (dyn and "d|" or "s|") ..
-                  string.format("%.2f|%.2f", halfHeight, r)
-      tracked[#tracked + 1] = { body = body, mesh = meshFor(sig, function()
-        return buildCapsule(mat, halfHeight, r)
-      end) }
+                  string.format("%.2f|%.2f|%d", halfHeight, r, seg) .. skinSig(skinName)
+      local build = function()
+        return buildCapsule(mat, halfHeight, r, seg, skin)
+      end
+      tracked[#tracked + 1] =
+        { body = body, sig = sig, build = build, mesh = meshFor(sig, build) }
     end
     return s
   end
@@ -5705,8 +5897,18 @@ love.physics3d.debug = (function()
   -- Capped at both ends, unlike the capsule. The flat cap is the whole
   -- point: a rounded end makes an upright object balance on a curve and
   -- refuse to stay knocked over.
-  local function buildTaper(mat, h, r1, r2, yOffset, seg)
+  -- vRange (v0, v1) is which SLICE of the texture this section wears.
+  --
+  -- A profile built from stacked hulls -- a bowling pin, say -- is several
+  -- separate meshes that have to look like ONE object wearing ONE skin.
+  -- Each section's v would otherwise run 0..1 over its own little height,
+  -- so a texture with a stripe painted at 70% of the pin's height would
+  -- come out with that stripe repeated on all six pieces. Handing each
+  -- section the fraction of the whole it actually occupies is what makes
+  -- the skin continuous across the joins.
+  local function buildTaper(mat, h, r1, r2, yOffset, seg, skin, v0, v1)
     seg = seg or 12
+    v0, v1 = v0 or 0, v1 or 1
     local m = dream:newMesh(mat)
     local mv, mn = m:getOrCreateBuffer("vertices"), m:getOrCreateBuffer("normals")
     local mt, mf = m:getOrCreateBuffer("texCoords"), m:getOrCreateBuffer("faces")
@@ -5723,12 +5925,14 @@ love.physics3d.debug = (function()
     for j = 0, seg do
       local th = 2 * math.pi * j / seg
       local c, sn = math.cos(th), math.sin(th)
+      -- v is 1 at the BOTTOM and 0 at the top, so a texture authored with
+      -- the base at v=0 maps upright: the bottom ring samples 1 - v0.
       mv:append({ c * a, yb, sn * a })
       mn:append({ c / nlen, slope / nlen, sn / nlen })
-      mt:append({ j / seg, 1 })
+      mt:append({ j / seg, 1 - v0 })
       mv:append({ c * b, yt, sn * b })
       mn:append({ c / nlen, slope / nlen, sn / nlen })
-      mt:append({ j / seg, 0 })
+      mt:append({ j / seg, 1 - v1 })
     end
     for j = 0, seg - 1 do
       local i0 = j * 2 + 1
@@ -5756,49 +5960,65 @@ love.physics3d.debug = (function()
       mf:append({ cTop, i0 + 1, i0 + 3 })   -- top faces up
     end
 
-    bakeShading(m, baseFor(mat))
-    m:create()
-    return m
+    return finishMesh(m, mat, skin)
   end
 
-  function D.cylinder(body, height, r, yOffset, sides, density)
+  -- vRange, when given, is {v0, v1}: the slice of the skin's texture this
+  -- section wears, as a fraction of the whole profile it belongs to.
+  function D.cylinder(body, height, r, yOffset, sides, density, skinName, vRange)
     local s = b3.shape_cylinder(body, height, r, yOffset, sides, density)
     if dream then
       local dyn = isDynamic(body)
-      local mat = dyn and matDynamic or matStatic
+      local skin = skinFor(skinName)
+      local mat = matFor(dyn, skin)
+      local v0, v1 = vRange and vRange[1], vRange and vRange[2]
       local sig = "y|" .. (dyn and "d|" or "s|") ..
-                  string.format("%.2f|%.2f|%.2f|%d", height, r, yOffset or 0, sides or 12)
-      tracked[#tracked + 1] = { body = body, mesh = meshFor(sig, function()
-        return buildTaper(mat, height, r, r, yOffset, sides)
-      end) }
+                  string.format("%.2f|%.2f|%.2f|%d", height, r, yOffset or 0, sides or 12) ..
+                  skinSig(skinName) ..
+                  (vRange and string.format("|v%.3f|%.3f", v0, v1) or "")
+      local build = function()
+        return buildTaper(mat, height, r, r, yOffset, sides, skin, v0, v1)
+      end
+      tracked[#tracked + 1] =
+        { body = body, sig = sig, build = build, mesh = meshFor(sig, build) }
     end
     return s
   end
 
-  function D.cone(body, height, r1, r2, yOffset, slices, density)
+  function D.cone(body, height, r1, r2, yOffset, slices, density, skinName, vRange)
     local s = b3.shape_cone(body, height, r1, r2, yOffset, slices, density)
     if dream then
       local dyn = isDynamic(body)
-      local mat = dyn and matDynamic or matStatic
+      local skin = skinFor(skinName)
+      local mat = matFor(dyn, skin)
+      local v0, v1 = vRange and vRange[1], vRange and vRange[2]
       local sig = "k|" .. (dyn and "d|" or "s|") ..
                   string.format("%.2f|%.2f|%.2f|%.2f|%d",
-                                height, r1, r2, yOffset or 0, slices or 12)
-      tracked[#tracked + 1] = { body = body, mesh = meshFor(sig, function()
-        return buildTaper(mat, height, r1, r2, yOffset, slices)
-      end) }
+                                height, r1, r2, yOffset or 0, slices or 12) ..
+                  skinSig(skinName) ..
+                  (vRange and string.format("|v%.3f|%.3f", v0, v1) or "")
+      local build = function()
+        return buildTaper(mat, height, r1, r2, yOffset, slices, skin, v0, v1)
+      end
+      tracked[#tracked + 1] =
+        { body = body, sig = sig, build = build, mesh = meshFor(sig, build) }
     end
     return s
   end
 
-  function D.plane(body, hx, hz, thickness, density)
+  function D.plane(body, hx, hz, thickness, density, skinName)
     local s = b3.shape_box(body, hx, thickness or 1, hz, density)
     if dream then
       local dyn = isDynamic(body)
-      local mat = dyn and matDynamic or matStatic
-      local sig = "p|" .. (dyn and "d|" or "s|") .. string.format("%.2f|%.2f", hx, hz)
-      tracked[#tracked + 1] = { body = body, mesh = meshFor(sig, function()
-        return buildPlane(mat, hx, hz)
-      end) }
+      local skin = skinFor(skinName)
+      local mat = matFor(dyn, skin)
+      local sig = "p|" .. (dyn and "d|" or "s|") ..
+                  string.format("%.2f|%.2f", hx, hz) .. skinSig(skinName)
+      local build = function()
+        return buildPlane(mat, hx, hz, skin)
+      end
+      tracked[#tracked + 1] =
+        { body = body, sig = sig, build = build, mesh = meshFor(sig, build) }
     end
     return s
   end
