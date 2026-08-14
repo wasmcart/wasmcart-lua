@@ -995,21 +995,89 @@ b3.shape_enable_hit_events(shape, bool)
 -- view cannot drift from the simulation.
 local dbg = love.physics3d.debug
 dbg.init(dream, 120)          -- the 3D lib, and pixels per world unit
-dbg.box(body, hx, hy, hz [, density])      -- shape + mesh; thin ones draw
-                                           -- as PLANES, since a floor is
+
+-- Every builder makes the SHAPE and its MESH from the same numbers. The
+-- last argument of each is an optional SKIN name (see below).
+dbg.box(body, hx, hy, hz [, density] [, skin])
+                                           -- an UNSKINNED thin box draws as
+                                           -- a PLANE, since a floor is
                                            -- usually a flattened box and a
-                                           -- box outline describes it worst
-dbg.sphere(body, r [, density])
-dbg.plane(body, hx, hz [, thickness])      -- an explicit floor, ruled grid
+                                           -- box outline describes it worst.
+                                           -- A skinned one stays a box.
+dbg.sphere(body, r [, density] [, skin])
+dbg.plane(body, hx, hz [, thickness] [, density] [, skin])   -- explicit floor
+dbg.capsule(body, halfHeight, r [, density] [, skin])
+dbg.cylinder(body, height, r, yOffset, sides [, density] [, skin] [, vRange])
+dbg.cone(body, height, r1, r2, yOffset, slices [, density] [, skin] [, vRange])
+
 dbg.toggle()                  dbg.setEnabled(bool)   dbg.isEnabled()
 dbg.reset()                   -- on world teardown, or it draws dead bodies
+dbg.setBodyVisible(body, bool)  -- stop drawing a body without destroying it
 dbg.draw()                    -- inside the 3D pass
 dbg.count()
 
--- Static bodies draw green, dynamic magenta, both fullbright and two-sided
--- so the view never depends on the lighting or culling paths being right --
--- those are among the things it exists to check. Meshes are shared by size,
--- so forty identical bumpers cost one sphere.
+-- Static bodies draw green, dynamic magenta, two-sided so the view never
+-- depends on the culling path being right -- that is one of the things it
+-- exists to check. Shading is BAKED PER VERTEX from each builder's own
+-- normals, because this engine's 3D path has no runtime lighting; without
+-- it a sphere, a cylinder and a capsule are indistinguishable silhouettes.
+-- Meshes are shared by size signature, so forty identical bumpers cost one
+-- sphere.
+
+-- ── SKINS: the same geometry, wearing a real surface ────────────────
+--
+-- The two debug colours answer "is this body where I think it is". They
+-- cannot answer "does this look like a bowling alley", and a game built ON
+-- the default renderer would otherwise have to abandon it to get textures
+-- -- re-authoring every mesh by hand and taking back exactly the class of
+-- bug this renderer exists to prevent.
+--
+-- A skinned shape is still built from the shape's own dimensions by the
+-- same builders. Only the material and the vertex colour change.
+dbg.defineSkin("lane", {
+  texture   = img,            -- rides on EMISSION: with no runtime lights
+                              -- an albedo-only surface renders black
+  color     = { 1, 1, 1 },    -- tints the texture; replaces the debug palette
+  uvScale   = 1 / 256,        -- texture repeats per PIXEL, or {u, v} per-axis
+  segments  = 24,             -- sphere/capsule only; 12 is the debug default
+  roughness = 0.9, metallic = 0, cullMode = "none",
+})
+dbg.getSkin(name)
+
+-- uvScale is repeats per pixel so a texture stays the same physical size on
+-- a long surface and a short one. Per-axis {u, v} exists for the case where
+-- one axis must map EXACTLY ONCE: a bowling lane's texture is 39 boards
+-- across, and a fractional repeat saws a board in half at the gutter.
+--
+-- vRange (cylinder/cone only) is {v0, v1}: which slice of the skin's
+-- texture this section wears. A profile built from stacked hulls -- a
+-- bowling pin -- is several meshes that must look like one object wearing
+-- one skin, and each section's v would otherwise run 0..1 over its own
+-- little height. NOTE v RUNS FROM THE TOP DOWN: v=0 is the top of the
+-- profile, v=1 the bottom.
+--
+-- A skin named but never defined warns once and draws untextured, rather
+-- than silently rendering in debug green as though that were a choice.
+
+-- ── ART-DIRECTING THE LIGHT ─────────────────────────────────────────
+--
+-- The defaults are chosen to make a COLLIDER readable: high ambient, so
+-- nothing is ever lost in shadow. Those are the right defaults for a debug
+-- view and the wrong ones for a finished scene -- high ambient is exactly
+-- what makes a picture look flat, because it shrinks the difference
+-- between a face in the light and a face out of it.
+dbg.setLightRig({
+  ambient       = 0.24,             -- default 0.42
+  key           = { -0.45, 0.80, 0.40 },   keyColor  = { 1, 0.97, 0.90 },
+  fill          = {  0.65, 0.25, -0.55 },  fillColor = { 0.55, 0.65, 0.85 },
+  keyIntensity  = 0.75, fillIntensity = 0.55,
+})
+dbg.setLighting(bool)   dbg.isLighting()
+dbg.rebake()            -- re-bake every mesh under the current rig
+
+-- Shading is baked at MESH BUILD TIME, so changing the rig has to rebuild
+-- what already exists. setLightRig and setLighting do that for you; rebake
+-- is there if you change something else they cannot see.
 b3.shape_enable_contact_events(shape, bool)
 b3.world_set_hit_threshold(world, pxPerSec)  -- below this, no hit event
 b3.world_set_gravity(world, gx, gy, gz)
