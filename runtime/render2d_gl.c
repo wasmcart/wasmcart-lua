@@ -408,6 +408,15 @@ static const char *SHADER_FRAG_PROLOGUE =
     "uniform int u_textured;\n"
     "uniform highp vec2 love_ScreenSize;\n"
     "#define Image sampler2D\n"
+    /* LOVE's other sampler type names. These were defined in the vertex
+     * and 3D-fragment prologues but NOT here, so a cart shader declaring
+     * `uniform CubeImage tex;` compiled everywhere except the plain 2D
+     * pixel path -- where the driver saw an unknown identifier. That is a
+     * real cart-visible break: 3DreamEngine's blur_cube does exactly that,
+     * which killed love.draw every frame on a Mali GPU. */
+    "#define CubeImage samplerCube\n"
+    "#define ArrayImage sampler2DArray\n"
+    "#define VolumeImage sampler3D\n"
     "#define VaryingColor v_color\n"
     "#define VaryingTexCoord vec4(v_uv, 0.0, 1.0)\n"
     "#define number float\n"
@@ -581,6 +590,15 @@ static const char *SHADER_VERT3D_PROLOGUE =
     "uniform highp vec2 love_ScreenSize;\n"
     "uniform highp vec4 love_Color;\n"
     "#define Image sampler2D\n"
+    /* LOVE's other sampler type names. These were defined in the vertex
+     * and 3D-fragment prologues but NOT here, so a cart shader declaring
+     * `uniform CubeImage tex;` compiled everywhere except the plain 2D
+     * pixel path -- where the driver saw an unknown identifier. That is a
+     * real cart-visible break: 3DreamEngine's blur_cube does exactly that,
+     * which killed love.draw every frame on a Mali GPU. */
+    "#define CubeImage samplerCube\n"
+    "#define ArrayImage sampler2DArray\n"
+    "#define VolumeImage sampler3D\n"
     "#define Texel texture\n"
     "#define number float\n"
     "#define extern uniform\n"
