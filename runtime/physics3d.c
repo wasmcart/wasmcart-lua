@@ -299,6 +299,72 @@ static int l_shape_capsule(lua_State *L) {
     return shape_store(L, id, (int)luaL_checkinteger(L, 1));
 }
 
+/* b3.shape_cylinder(body, height, radius [, yOffset [, sides [, density]]])
+ *
+ * A tessellated cylinder, along local Y. Box3D builds it as a convex hull,
+ * so unlike a mesh or a compound this is legal on a DYNAMIC body — which is
+ * what makes a stacked profile (a bowling pin: flat base, belly, neck,
+ * head) possible at all. yOffset shifts it along Y in the body's own frame,
+ * so several of these attach to ONE body and fuse into a single solid.
+ *
+ * A flat-bottomed cylinder is not decoration: a capsule's rounded end makes
+ * an upright object rock and self-right, so pins built from capsules refuse
+ * to stay down. */
+static int l_shape_cylinder(lua_State *L) {
+    body_slot *b = body_at(L, 1);
+    float h  = px2m(luaL_checknumber(L, 2));
+    float r  = px2m(luaL_checknumber(L, 3));
+    float yo = px2m(luaL_optnumber(L, 4, 0.0));
+    int sides = (int)luaL_optinteger(L, 5, 12);
+    if (sides < 3)  sides = 3;
+    if (sides > 64) sides = 64;
+    b3ShapeDef def = b3DefaultShapeDef();
+    def.density = (float)luaL_optnumber(L, 6, 1.0);
+    b3HullData *hull = b3CreateCylinder(h, r, yo, sides);
+    if (!hull) luaL_error(L, "b3: could not build cylinder hull");
+    b3ShapeId id = b3CreateHullShape(b->id, &def, hull);
+    /* The create call clones the hull, so the builder's copy is ours to
+     * free -- leaking it once per pin per rack adds up fast. */
+    b3DestroyHull(hull);
+    return shape_store(L, id, (int)luaL_checkinteger(L, 1));
+}
+
+/* b3.shape_cone(body, height, radius1, radius2 [, yOffset [, slices
+ *               [, density]]])
+ *
+ * A tapered hull: radius1 at the bottom, radius2 at the top. Equal radii
+ * give a cylinder; a zero top gives a true cone. This is the piece that
+ * makes a pin's neck flare into its belly instead of stepping.
+ *
+ * b3CreateCone takes no yOffset the way b3CreateCylinder does, so the
+ * offset is applied by cloning through a transform. Without this a stacked
+ * profile could only ever have ONE cone in it, at the origin. */
+static int l_shape_cone(lua_State *L) {
+    body_slot *b = body_at(L, 1);
+    float h  = px2m(luaL_checknumber(L, 2));
+    float r1 = px2m(luaL_checknumber(L, 3));
+    float r2 = px2m(luaL_checknumber(L, 4));
+    float yo = px2m(luaL_optnumber(L, 5, 0.0));
+    int slices = (int)luaL_optinteger(L, 6, 12);
+    if (slices < 3)  slices = 3;
+    if (slices > 64) slices = 64;
+    b3ShapeDef def = b3DefaultShapeDef();
+    def.density = (float)luaL_optnumber(L, 7, 1.0);
+    b3HullData *hull = b3CreateCone(h, r1, r2, slices);
+    if (!hull) luaL_error(L, "b3: could not build cone hull");
+    b3HullData *placed = hull;
+    if (yo != 0.0f) {
+        b3Transform xf = b3Transform_identity;
+        xf.p = (b3Vec3){ 0, yo, 0 };
+        placed = b3CloneAndTransformHull(hull, xf, (b3Vec3){ 1, 1, 1 });
+        if (!placed) { b3DestroyHull(hull); luaL_error(L, "b3: could not place cone hull"); }
+    }
+    b3ShapeId id = b3CreateHullShape(b->id, &def, placed);
+    if (placed != hull) b3DestroyHull(placed);
+    b3DestroyHull(hull);
+    return shape_store(L, id, (int)luaL_checkinteger(L, 1));
+}
+
 /* ── surface material ───────────────────────────────────────────────────
  *
  * Box3D's shape defaults are friction 0.6, restitution 0, rolling
@@ -640,6 +706,8 @@ static const luaL_Reg b3_lib[] = {
     { "shape_box",          l_shape_box },
     { "shape_sphere",       l_shape_sphere },
     { "shape_capsule",      l_shape_capsule },
+    { "shape_cylinder",     l_shape_cylinder },
+    { "shape_cone",         l_shape_cone },
     { "shape_destroy",      l_shape_destroy },
 
     { "shape_set_friction",     l_shape_set_friction },

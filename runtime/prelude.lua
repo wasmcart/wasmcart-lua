@@ -5343,19 +5343,128 @@ love.physics3d.debug = (function()
   local on = false
   local matStatic, matDynamic
 
+  -- LIGHTING. This engine's 3D path has no runtime lights, so shading is
+  -- BAKED per vertex from the normal each builder already computes: a
+  -- two-light rig (a key from above-left, a cooler fill from the right)
+  -- plus ambient, evaluated once at mesh-build time.
+  --
+  -- Without it every mesh is a flat silhouette in one colour, and a sphere,
+  -- a cylinder and a capsule are indistinguishable -- which defeats a view
+  -- whose whole job is showing you the shape of a body. Off by default
+  -- would be the safer choice, except that flat IS the failure, so it is on
+  -- and D.setLighting(false) turns it back to the old fullbright look.
+  local COL_STATIC  = { 0.20, 1.00, 0.35 }
+  local COL_DYNAMIC = { 1.00, 0.20, 0.90 }
+  local lighting = true
+  local KEY   = { -0.45, 0.80, 0.40 }   -- normalized below
+  local FILL  = {  0.65, 0.25, -0.55 }
+  local KEY_C  = { 1.00, 0.97, 0.90 }
+  local FILL_C = { 0.55, 0.65, 0.85 }
+  local AMBIENT = 0.42
+
+  local function norm3(v)
+    local l = math.sqrt(v[1] * v[1] + v[2] * v[2] + v[3] * v[3])
+    if l < 1e-6 then return { 0, 1, 0 } end
+    return { v[1] / l, v[2] / l, v[3] / l }
+  end
+
+  -- The light a surface with this normal receives, as an RGB multiplier.
+  local function shadeFor(nx, ny, nz)
+    if not lighting then return 1, 1, 1 end
+    local k = KEY[1] * nx + KEY[2] * ny + KEY[3] * nz
+    local f = FILL[1] * nx + FILL[2] * ny + FILL[3] * nz
+    if k < 0 then k = 0 end
+    if f < 0 then f = 0 end
+    -- Half-lambert on the fill so faces turned away go dim, never black.
+    f = f * 0.5 + 0.15
+    local r = AMBIENT + k * KEY_C[1] * 0.75 + f * FILL_C[1] * 0.55
+    local g = AMBIENT + k * KEY_C[2] * 0.75 + f * FILL_C[2] * 0.55
+    local b = AMBIENT + k * KEY_C[3] * 0.75 + f * FILL_C[3] * 0.55
+    -- CLAMP. Ambient + key + fill sums past 1.0 on a face that catches both
+    -- lights (measured peak 1.215), and the simple mesh format packs colour
+    -- into a BYTE -- so an unclamped highlight is not a blown highlight, it
+    -- is "bad argument #2 to 'pack' (unsigned overflow)" and a dead cart.
+    if r > 1 then r = 1 end
+    if g > 1 then g = 1 end
+    if b > 1 then b = 1 end
+    return r, g, b
+  end
+
+  -- Bake the shade into a finished mesh, as ONE pass over the normals the
+  -- builder already wrote. Doing it here rather than inside each builder
+  -- means every shape -- box, sphere, capsule, taper, plane -- gets lit by
+  -- the same rig, and a new primitive cannot forget to.
+  --
+  -- The colour rides in the COLORS buffer, not `emissions`: the simple mesh
+  -- format collapses emission to a single luminance byte, so it cannot
+  -- carry a hue. The material stays white-emissive and this supplies both
+  -- the body's colour and its shading.
+  -- Which palette a mesh belongs to, from the material it was built with.
+  local function baseFor(mat)
+    if mat == matDynamic then return COL_DYNAMIC end
+    return COL_STATIC
+  end
+
+  local function bakeShading(m, base)
+    local mn = m:getOrCreateBuffer("normals")
+    local mc = m:getOrCreateBuffer("colors")
+    -- The simple shader computes `emission = VaryingColor.rgb *
+    -- VaryingMaterial.z`, and .z comes from this buffer. It defaults to
+    -- zero, which would make every mesh unlit and black, so each vertex
+    -- gets full emission and the COLOR carries the shading.
+    local me = m:getOrCreateBuffer("emissions")
+    -- APPEND, never set: a dynamic buffer asserts index <= length, so
+    -- writing into the empty colors buffer by index throws.
+    for i = 1, mn:getSize() do
+      local n = mn:getOrDefault(i, nil)
+      local nx, ny, nz = 0, 1, 0
+      if n then
+        nx = n.x or n[1] or 0
+        ny = n.y or n[2] or 1
+        nz = n.z or n[3] or 0
+      end
+      local sr, sg, sb = shadeFor(nx, ny, nz)
+      mc:append({ base[1] * sr, base[2] * sg, base[3] * sb, 1 })
+      me:append({ 1, 1, 1, 1 })
+    end
+  end
+
+  function D.setLighting(v)
+    v = v and true or false
+    if v == lighting then return end
+    lighting = v
+    -- Meshes bake the shade at build time, so a change has to throw the
+    -- cache away or the old lighting persists for every shape already seen.
+    for k, m in pairs(shared) do
+      if m and m.clear then m:clear() end
+      shared[k] = nil
+    end
+    for _, t in ipairs(tracked) do t.mesh = nil end
+  end
+  function D.isLighting() return lighting end
+
   function D.init(dreamLib, pxPerUnit)
     dream = dreamLib
     U = pxPerUnit or 120
-    -- Fullbright, and drawn on both sides: the debug view must not depend
-    -- on the lighting or culling paths being correct, since those are
-    -- among the things it exists to check.
+    -- Drawn on both sides: the debug view must not depend on the culling
+    -- path being correct, since that is one of the things it exists to
+    -- check. Shading is baked into vertex colours (see shadeFor), so the
+    -- material stays emissive -- there is no runtime light to rely on.
+    -- The "simple" pixel shader is REQUIRED, not a preference. The default
+    -- "material" shader reads a mesh's colour from a lookup texture indexed
+    -- by VertexMaterial and ignores the per-vertex colors buffer entirely,
+    -- so baked shading written there never reaches the screen and every
+    -- body renders flat white. "simple" is the one that does
+    -- `albedo = VaryingColor.rgb`.
     matStatic = dream:newMaterial("b3dbg_static")
-    matStatic:setColor(0.2, 1.0, 0.35, 1)
-    matStatic:setEmission(0.2, 1.0, 0.35)
+    matStatic:setPixelShader("simple")
+    matStatic:setColor(1, 1, 1, 1)
+    matStatic:setEmission(1, 1, 1)
     matStatic:setCullMode("none")
     matDynamic = dream:newMaterial("b3dbg_dynamic")
-    matDynamic:setColor(1.0, 0.2, 0.9, 1)
-    matDynamic:setEmission(1.0, 0.2, 0.9)
+    matDynamic:setPixelShader("simple")
+    matDynamic:setColor(1, 1, 1, 1)
+    matDynamic:setEmission(1, 1, 1)
     matDynamic:setCullMode("none")
   end
 
@@ -5399,6 +5508,7 @@ love.physics3d.debug = (function()
       mf:append({ base + 1, base + 3, base + 4 })
       base = base + 4
     end
+    bakeShading(m, baseFor(mat))
     m:create()
     return m
   end
@@ -5427,6 +5537,7 @@ love.physics3d.debug = (function()
         mf:append({ a + 1, b, b + 1 })
       end
     end
+    bakeShading(m, baseFor(mat))
     m:create()
     return m
   end
@@ -5470,6 +5581,7 @@ love.physics3d.debug = (function()
         base = base + 4
       end
     end
+    bakeShading(m, baseFor(mat))
     m:create()
     return m
   end
@@ -5565,6 +5677,7 @@ love.physics3d.debug = (function()
         mf:append({ a + 1, b, b + 1 })
       end
     end
+    bakeShading(m, baseFor(mat))
     m:create()
     return m
   end
@@ -5578,6 +5691,100 @@ love.physics3d.debug = (function()
                   string.format("%.2f|%.2f", halfHeight, r)
       tracked[#tracked + 1] = { body = body, mesh = meshFor(sig, function()
         return buildCapsule(mat, halfHeight, r)
+      end) }
+    end
+    return s
+  end
+
+  -- A TAPERED CYLINDER along local Y: r1 at the bottom, r2 at the top,
+  -- optionally lifted by yOffset in the body's own frame. Equal radii give
+  -- a plain cylinder, a zero top gives a cone, and several of these stacked
+  -- at different offsets on ONE body build a profile -- which is how a
+  -- bowling pin gets a flat base, a belly and a neck.
+  --
+  -- Capped at both ends, unlike the capsule. The flat cap is the whole
+  -- point: a rounded end makes an upright object balance on a curve and
+  -- refuse to stay knocked over.
+  local function buildTaper(mat, h, r1, r2, yOffset, seg)
+    seg = seg or 12
+    local m = dream:newMesh(mat)
+    local mv, mn = m:getOrCreateBuffer("vertices"), m:getOrCreateBuffer("normals")
+    local mt, mf = m:getOrCreateBuffer("texCoords"), m:getOrCreateBuffer("faces")
+    local hh = (h / 2) / U
+    local a, b = r1 / U, r2 / U
+    local yo = (yOffset or 0) / U
+    local yb, yt = yo - hh, yo + hh
+
+    -- The side normal leans by the taper, so a cone is not lit like a tube.
+    local slope = (a - b) / (2 * hh)
+    local nlen = math.sqrt(1 + slope * slope)
+
+    -- side wall: one ring at the bottom, one at the top
+    for j = 0, seg do
+      local th = 2 * math.pi * j / seg
+      local c, sn = math.cos(th), math.sin(th)
+      mv:append({ c * a, yb, sn * a })
+      mn:append({ c / nlen, slope / nlen, sn / nlen })
+      mt:append({ j / seg, 1 })
+      mv:append({ c * b, yt, sn * b })
+      mn:append({ c / nlen, slope / nlen, sn / nlen })
+      mt:append({ j / seg, 0 })
+    end
+    for j = 0, seg - 1 do
+      local i0 = j * 2 + 1
+      mf:append({ i0, i0 + 1, i0 + 2 })
+      mf:append({ i0 + 1, i0 + 3, i0 + 2 })
+    end
+
+    -- the two flat caps, each a fan around its own centre
+    local base = (seg + 1) * 2
+    mv:append({ 0, yb, 0 }); mn:append({ 0, -1, 0 }); mt:append({ 0.5, 0.5 })
+    mv:append({ 0, yt, 0 }); mn:append({ 0,  1, 0 }); mt:append({ 0.5, 0.5 })
+    local cBot, cTop = base + 1, base + 2
+    local ring = base + 3
+    for j = 0, seg do
+      local th = 2 * math.pi * j / seg
+      local c, sn = math.cos(th), math.sin(th)
+      mv:append({ c * a, yb, sn * a }); mn:append({ 0, -1, 0 })
+      mt:append({ 0.5 + c * 0.5, 0.5 + sn * 0.5 })
+      mv:append({ c * b, yt, sn * b }); mn:append({ 0,  1, 0 })
+      mt:append({ 0.5 + c * 0.5, 0.5 + sn * 0.5 })
+    end
+    for j = 0, seg - 1 do
+      local i0 = ring + j * 2
+      mf:append({ cBot, i0 + 2, i0 })       -- bottom faces down
+      mf:append({ cTop, i0 + 1, i0 + 3 })   -- top faces up
+    end
+
+    bakeShading(m, baseFor(mat))
+    m:create()
+    return m
+  end
+
+  function D.cylinder(body, height, r, yOffset, sides, density)
+    local s = b3.shape_cylinder(body, height, r, yOffset, sides, density)
+    if dream then
+      local dyn = isDynamic(body)
+      local mat = dyn and matDynamic or matStatic
+      local sig = "y|" .. (dyn and "d|" or "s|") ..
+                  string.format("%.2f|%.2f|%.2f|%d", height, r, yOffset or 0, sides or 12)
+      tracked[#tracked + 1] = { body = body, mesh = meshFor(sig, function()
+        return buildTaper(mat, height, r, r, yOffset, sides)
+      end) }
+    end
+    return s
+  end
+
+  function D.cone(body, height, r1, r2, yOffset, slices, density)
+    local s = b3.shape_cone(body, height, r1, r2, yOffset, slices, density)
+    if dream then
+      local dyn = isDynamic(body)
+      local mat = dyn and matDynamic or matStatic
+      local sig = "k|" .. (dyn and "d|" or "s|") ..
+                  string.format("%.2f|%.2f|%.2f|%.2f|%d",
+                                height, r1, r2, yOffset or 0, slices or 12)
+      tracked[#tracked + 1] = { body = body, mesh = meshFor(sig, function()
+        return buildTaper(mat, height, r1, r2, yOffset, slices)
       end) }
     end
     return s
@@ -5613,10 +5820,26 @@ love.physics3d.debug = (function()
     })
   end
 
+  -- Stop drawing a body without destroying it.
+  --
+  -- A body that is still in the world but should not be seen is a normal
+  -- situation, not an edge case: bowling parks knocked-down pins under the
+  -- deck between balls, and the renderer -- which draws every body it is
+  -- given, by design -- faithfully drew ten pins floating below the lane.
+  -- Moving them further away is not a fix, it just puts the problem
+  -- off-camera until the camera moves.
+  function D.setBodyVisible(body, v)
+    for _, t in ipairs(tracked) do
+      if t.body == body then t.hidden = not v end
+    end
+  end
+
   function D.draw()
     if not on or not dream then return end
     for _, t in ipairs(tracked) do
-      if t.mesh and t.body then dream:draw(t.mesh, bodyMatrix(t.body)) end
+      if t.mesh and t.body and not t.hidden then
+        dream:draw(t.mesh, bodyMatrix(t.body))
+      end
     end
   end
 
