@@ -5523,6 +5523,66 @@ love.physics3d.debug = (function()
   -- An explicit plane, for a world whose floor is a true plane. hx/hz are
   -- how much of it to DRAW: a plane is infinite and a mesh is not, so the
   -- extent is a rendering choice rather than a physical one.
+  -- A CAPSULE: a cylinder with a hemisphere on each end, along local Y --
+  -- the same axis b3.shape_capsule uses. Box3D has three shape types and
+  -- this was the missing one, so a cart that made a capsule got collision
+  -- and no mesh: bowling pins that knocked each other down invisibly.
+  local function buildCapsule(mat, halfHeight, r, seg)
+    seg = seg or 12
+    local m = dream:newMesh(mat)
+    local mv, mn = m:getOrCreateBuffer("vertices"), m:getOrCreateBuffer("normals")
+    local mt, mf = m:getOrCreateBuffer("texCoords"), m:getOrCreateBuffer("faces")
+    local rr, hh = r / U, halfHeight / U
+    -- Rings from the top cap, down the barrel, to the bottom cap. The
+    -- hemispheres are swept as a half-sphere each and simply OFFSET by the
+    -- half-height, which is what makes the barrel appear between them
+    -- without needing its own ring maths.
+    local rings = {}
+    for i = 0, seg // 2 do                     -- top hemisphere
+      local phi = (math.pi / 2) * i / (seg // 2)
+      rings[#rings + 1] = { math.sin(phi) * rr, hh + math.cos(phi) * rr,
+                            math.sin(phi), math.cos(phi) }
+    end
+    for i = 0, seg // 2 do                     -- bottom hemisphere
+      local phi = (math.pi / 2) * i / (seg // 2)
+      rings[#rings + 1] = { math.cos(phi) * rr, -hh - math.sin(phi) * rr,
+                            math.cos(phi), -math.sin(phi) }
+    end
+    for ri, ring in ipairs(rings) do
+      for j = 0, seg do
+        local th = 2 * math.pi * j / seg
+        local c, sn = math.cos(th), math.sin(th)
+        mv:append({ c * ring[1], ring[2], sn * ring[1] })
+        mn:append({ c * ring[3], ring[4], sn * ring[3] })
+        mt:append({ j / seg, (ri - 1) / (#rings - 1) })
+      end
+    end
+    for ri = 0, #rings - 2 do
+      for j = 0, seg - 1 do
+        local a = ri * (seg + 1) + j + 1
+        local b = a + seg + 1
+        mf:append({ a, b, a + 1 })
+        mf:append({ a + 1, b, b + 1 })
+      end
+    end
+    m:create()
+    return m
+  end
+
+  function D.capsule(body, halfHeight, r, density)
+    local s = b3.shape_capsule(body, halfHeight, r, density)
+    if dream then
+      local dyn = isDynamic(body)
+      local mat = dyn and matDynamic or matStatic
+      local sig = "c|" .. (dyn and "d|" or "s|") ..
+                  string.format("%.2f|%.2f", halfHeight, r)
+      tracked[#tracked + 1] = { body = body, mesh = meshFor(sig, function()
+        return buildCapsule(mat, halfHeight, r)
+      end) }
+    end
+    return s
+  end
+
   function D.plane(body, hx, hz, thickness, density)
     local s = b3.shape_box(body, hx, thickness or 1, hz, density)
     if dream then
