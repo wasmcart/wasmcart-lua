@@ -137,6 +137,66 @@ if [ ! -f vendor/libbox3d.a ]; then
     emar rcs ../../libbox3d.a *.o && rm -f *.o )
 fi
 
+# ── fetch + build Opus (libopus + libogg + opusfile) ────────────────
+# MP3 and FLAC are single-header (dr_mp3.h / dr_flac.h, committed next to
+# stb_vorbis.c) and need no fetch. Opus is the one codec with real
+# dependencies: the decoder itself, the Ogg container it always ships in, and
+# opusfile to tie them together.
+#
+# OPTIONAL, and off unless the sources are present or WCL_OPUS=1 asks for the
+# fetch: it is ~140 C files against two single headers, and no LOVE game needs
+# Opus (LOVE has no Opus decoder at all -- this is a wasmcart-lua extra). The
+# engine builds and every other codec works without it; sound_load() then logs
+# an explicit "built without Opus" line rather than failing mysteriously.
+OPUS_TAG=v1.5.2
+OGG_TAG=v1.3.5
+OPUSFILE_TAG=v0.12
+OPUS_FLAGS=""
+if [ "${WCL_OPUS:-0}" = "1" ] && [ ! -d vendor/opus ]; then
+  git clone --filter=blob:none --depth 1 -b "$OPUS_TAG" \
+    https://github.com/xiph/opus.git vendor/opus && rm -rf vendor/opus/.git
+  git clone --filter=blob:none --depth 1 -b "$OGG_TAG" \
+    https://github.com/xiph/ogg.git vendor/ogg && rm -rf vendor/ogg/.git
+  git clone --filter=blob:none --depth 1 -b "$OPUSFILE_TAG" \
+    https://github.com/xiph/opusfile.git vendor/opusfile && rm -rf vendor/opusfile/.git
+  # libogg needs its config_types.h generated; the sizes are fixed under wasm32.
+  sed -e 's/@INCLUDE_INTTYPES_H@/1/; s/@INCLUDE_STDINT_H@/1/; s/@INCLUDE_SYS_TYPES_H@/1/' \
+      -e 's/@SIZE16@/int16_t/; s/@USIZE16@/uint16_t/' \
+      -e 's/@SIZE32@/int32_t/; s/@USIZE32@/uint32_t/' \
+      -e 's/@SIZE64@/int64_t/; s/@USIZE64@/uint64_t/' \
+      vendor/ogg/include/ogg/config_types.h.in > vendor/ogg/include/ogg/config_types.h
+fi
+if [ -d vendor/opus ] && [ ! -f vendor/libopus.a ]; then
+  # OPUS_BUILD + VAR_ARRAYS + FLOATING_POINT replace opus's generated config.h,
+  # so no autotools run is needed under emcc. OP_ENABLE_HTTP=0 keeps opusfile
+  # to memory decoding: a cart has no sockets, and the http path would drag in
+  # imports a wasmcart host does not provide.
+  OPUS_INC="-Ivendor/opus/celt -Ivendor/opus/silk -Ivendor/opus/silk/float \
+            -Ivendor/opus/include -Ivendor/opus -Ivendor/ogg/include \
+            -Ivendor/opusfile/include -Ivendor/opusfile/src"
+  OPUS_SRC="$(ls vendor/opus/src/*.c vendor/opus/celt/*.c vendor/opus/silk/*.c \
+                 vendor/opus/silk/float/*.c 2>/dev/null \
+              | grep -v -E 'demo|_test|opus_compare|repacketizer_demo|/tests?/')"
+  OPUS_SRC="$OPUS_SRC vendor/ogg/src/bitwise.c vendor/ogg/src/framing.c"
+  OPUS_SRC="$OPUS_SRC vendor/opusfile/src/opusfile.c vendor/opusfile/src/info.c \
+            vendor/opusfile/src/internal.c vendor/opusfile/src/stream.c"
+  mkdir -p vendor/opus-obj && ( cd vendor/opus-obj && rm -f ./*.o )
+  ( cd vendor/opus-obj && emcc -O2 -msimd128 -msse2 -c $(for f in $OPUS_SRC; do echo "../../$f"; done) \
+      -DOPUS_BUILD=1 -DVAR_ARRAYS=1 -DFLOATING_POINT=1 \
+      -DOP_ENABLE_HTTP=0 -DOP_FIXED_POINT=0 -w \
+      $(echo "$OPUS_INC" | sed 's|-I|-I../../|g') && \
+    emar rcs ../libopus.a ./*.o && rm -f ./*.o )
+fi
+if [ -f vendor/libopus.a ]; then
+  # opusfile.h includes <opus_multistream.h>, so opus's own include dir is
+  # needed by decoders.c and not just by the library build.
+  OPUS_FLAGS="-DWCL_ENABLE_OPUS -Ivendor/opusfile/include -Ivendor/ogg/include \
+              -Ivendor/opus/include vendor/libopus.a"
+  echo "Opus: ENABLED"
+else
+  echo "Opus: disabled (WCL_OPUS=1 ./build.sh to fetch and enable)"
+fi
+
 # ── embed the Lua API surface (games ship ONLY their own Lua) ────────
 python3 - <<'PY'
 # The ffi shim is appended to the prelude as a PRELOADED MODULE rather than
@@ -172,10 +232,11 @@ mkdir -p ../build
 # fallback -- it is the reference implementation, not a legacy path.
 build_engine() {   # $1 = output, $2... = extra flags
   local out="$1"; shift
-  emcc runtime.c vorbis.c cartconf.c physics.c physics3d.c wc_taskpool.c \
+  emcc runtime.c vorbis.c decoders.c cartconf.c physics.c physics3d.c wc_taskpool.c \
     render2d_gl.c render3d_gl.c \
     vendor/liblua54.a vendor/libbox2d.a vendor/libbox3d.a \
-    -O2 -msimd128 -msse2 -DWC_USE_NET_PEER -DWC_PHYSICS_SIMD='"wasm-simd128"' "$@" \
+    -O2 -msimd128 -msse2 -DWC_USE_NET_PEER -DWC_PHYSICS_SIMD='"wasm-simd128"' \
+    $OPUS_FLAGS "$@" \
     -I vendor/lua/src -I vendor/box2d/include -I vendor/box3d/include \
     -I "$WASMCART_REPO/include" -I . \
     -s STANDALONE_WASM=1 --no-entry -sSUPPORT_LONGJMP=wasm \

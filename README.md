@@ -169,13 +169,33 @@ pad; keyboard arrows/z/x reach pad 1 so you can test at a desk.
 ### love.audio
 
 ```lua
-local s = love.audio.newSource("sounds/jump.wav")  -- WAV and OGG
+local s = love.audio.newSource("sounds/jump.wav")  -- see the codec table below
 s:setVolume(0.7); s:setPitch(1.2); s:setLooping(true)
 s:play()  s:pause()  s:seek(1.5)  s:tell()  s:isPlaying()
 love.audio.beep(440)                               -- generated square, no asset
 ```
 
 16 mixer voices at 48kHz.
+
+| Format | Decoder | Notes |
+| --- | --- | --- |
+| WAV | built into the mixer | 8-bit unsigned / 16-bit signed PCM |
+| Ogg Vorbis | stb_vorbis | |
+| MP3 | dr_mp3 | ID3v1/v2 tags skipped |
+| FLAC | dr_flac | |
+| Opus | libopus + opusfile | **opt-in**: `WCL_OPUS=1 runtime/build.sh` |
+
+The codec is chosen by **content, not by file extension** — an asset whose name
+disagrees with its bytes still plays, which is also what LÖVE does. Anything
+over two channels is downmixed to stereo. A file that cannot be decoded logs the
+reason rather than playing silence.
+
+Opus is off by default because it is the only codec with real dependencies
+(libopus + libogg + opusfile, ~140 C files fetched on demand) and it costs 161KB
+of engine; LÖVE itself has no Opus decoder at all. MP3 and FLAC are single
+headers and always present, together costing 90KB. A cart that asks for an Opus
+asset on an engine built without it gets an explicit "built without Opus" log
+line rather than silence.
 
 ### love.physics (Box2D v3)
 

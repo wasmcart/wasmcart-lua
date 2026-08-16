@@ -30,3 +30,11 @@ node_modules/
 # test carts get their engine copied in at pack time; the source of truth is
 # build/engine.wasm, and a committed copy would be a stale 669KB duplicate
 test/*/main.wasm
+
+# Opus (libopus + libogg + opusfile) is FETCHED by runtime/build.sh when
+# WCL_OPUS=1, like lua/box2d above. dr_mp3.h and dr_flac.h are NOT here: they
+# are single headers committed next to stb_vorbis.c, same as stb_image.h.
+runtime/vendor/opus/
+runtime/vendor/ogg/
+runtime/vendor/opusfile/
+runtime/vendor/opus-obj/

@@ -41,6 +41,18 @@
 extern int stb_vorbis_decode_memory(const unsigned char *mem, int len, int *channels,
                                     int *sample_rate, short **output);
 
+/* MP3/FLAC/Opus live in decoders.c for the same reason. Each returns the frame
+ * count (samples per channel) and hands back an interleaved S16 buffer the
+ * caller frees, or -1. See runtime/decoders.c for the output contract. */
+extern int wcl_decode_mp3(const unsigned char *data, int size,
+                          int16_t **out, int *channels, int *sample_rate);
+extern int wcl_decode_flac(const unsigned char *data, int size,
+                           int16_t **out, int *channels, int *sample_rate);
+#ifdef WCL_ENABLE_OPUS
+extern int wcl_decode_opus(const unsigned char *data, int size,
+                           int16_t **out, int *channels, int *sample_rate);
+#endif
+
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
 
@@ -952,6 +964,128 @@ typedef struct { char path[160]; int id; } sound_entry_t;
 static sound_entry_t sound_paths[MAX_SOUND_PATHS];
 static int sound_path_count;
 
+/* Decode a sound buffer, choosing the codec by CONTENT rather than by file
+ * extension.
+ *
+ * Sniffing is what LOVE does (Sound::newDecoder try-constructs each decoder in
+ * turn), and it is why a mislabeled asset still plays there. The extension test
+ * this replaced sent everything that was not `.ogg` to the WAV loader, so an
+ * `.mp3` handed RIFF-expecting code an ID3 header and the game just went quiet
+ * -- and unlike the ogg branch, that path logged nothing at all.
+ *
+ * Returns a mixer slot id, or -1 (having logged why).
+ */
+static int codec_decode(const unsigned char *b, int size, const char *path) {
+    char line[200];
+    int frames = -1, chans = 0, rate = 0;
+    int16_t *pcm = NULL;
+    const char *what = NULL;
+
+    if (size < 4) {
+        snprintf(line, sizeof line, "sound too small to identify: %s (%d bytes)", path, size);
+        wc_log(line, (unsigned int)strlen(line));
+        return -1;
+    }
+
+    /* "RIFF" -- hand to the mixer's own WAV parser, which owns its slot. */
+    if (b[0] == 'R' && b[1] == 'I' && b[2] == 'F' && b[3] == 'F') {
+        int id = wc_mixer_load_wav(b, size);
+        if (id < 0) {
+            snprintf(line, sizeof line, "wav decode failed: %s", path);
+            wc_log(line, (unsigned int)strlen(line));
+        }
+        return id;
+    }
+
+    /* "OggS" -- the container holds Vorbis OR Opus, and only the codec id in
+     * the first page's body says which ("OpusHead" vs "\x01vorbis"). Scan the
+     * first page rather than assuming the container implies the codec. */
+    if (b[0] == 'O' && b[1] == 'g' && b[2] == 'g' && b[3] == 'S') {
+        int scan = size < 512 ? size : 512;
+        int is_opus = 0;
+        for (int i = 0; i + 8 <= scan; i++) {
+            if (memcmp(b + i, "OpusHead", 8) == 0) { is_opus = 1; break; }
+        }
+        if (is_opus) {
+#ifdef WCL_ENABLE_OPUS
+            what = "opus";
+            frames = wcl_decode_opus(b, size, &pcm, &chans, &rate);
+#else
+            snprintf(line, sizeof line,
+                     "opus asset but this engine was built without Opus: %s", path);
+            wc_log(line, (unsigned int)strlen(line));
+            return -1;
+#endif
+        } else {
+            short *v = NULL;
+            frames = stb_vorbis_decode_memory(b, size, &chans, &rate, &v);
+            pcm = (int16_t *)v;
+            what = "ogg";
+        }
+    }
+    /* "fLaC" */
+    else if (b[0] == 'f' && b[1] == 'L' && b[2] == 'a' && b[3] == 'C') {
+        what = "flac";
+        frames = wcl_decode_flac(b, size, &pcm, &chans, &rate);
+    }
+    /* MP3: an ID3 tag, or a bare frame sync. 0xFF followed by 0xEx/0xFx.
+     *
+     * ADTS-AAC shares that sync, so a stricter test would check the layer bits
+     * (byte[1] & 0x06, which is 00 only for ADTS) before falling through. We do
+     * not ship an AAC decoder, and LOVE has none either off Apple, so an ADTS
+     * file here is a user error that dr_mp3 will reject on its own -- the point
+     * of noting it is that the check belongs BEFORE this one if AAC ever lands. */
+    else if ((b[0] == 'I' && b[1] == 'D' && b[2] == '3') ||
+             (b[0] == 0xFF && (b[1] & 0xE0) == 0xE0)) {
+        what = "mp3";
+        frames = wcl_decode_mp3(b, size, &pcm, &chans, &rate);
+    }
+    else {
+        snprintf(line, sizeof line,
+                 "unrecognized sound format: %s (starts %02X %02X %02X %02X)",
+                 path, b[0], b[1], b[2], b[3]);
+        wc_log(line, (unsigned int)strlen(line));
+        return -1;
+    }
+
+    if (frames <= 0 || !pcm) {
+        if (pcm) free(pcm);
+        snprintf(line, sizeof line, "%s decode failed: %s", what, path);
+        wc_log(line, (unsigned int)strlen(line));
+        return -1;
+    }
+
+    /* The mixer mixes mono or stereo. Anything wider (5.1 FLAC, multichannel
+     * Opus) would be read as interleaved stereo and play at the wrong rate, so
+     * fold it down instead: averaging keeps every channel audible, where
+     * claiming stereo would drop all but the first two AND desync the rest. */
+    if (chans > 2) {
+        int16_t *st = (int16_t *)malloc((size_t)frames * 2 * sizeof(int16_t));
+        if (!st) { free(pcm); return -1; }
+        for (int f = 0; f < frames; f++) {
+            int l = 0, r = 0;
+            for (int c = 0; c < chans; c += 2) l += pcm[(size_t)f * chans + c];
+            for (int c = 1; c < chans; c += 2) r += pcm[(size_t)f * chans + c];
+            int nl = (chans + 1) / 2, nr = chans / 2;
+            st[f * 2]     = (int16_t)(l / (nl ? nl : 1));
+            st[f * 2 + 1] = (int16_t)(r / (nr ? nr : 1));
+        }
+        free(pcm);
+        pcm = st;
+        chans = 2;
+        snprintf(line, sizeof line, "%s: downmixed to stereo: %s", what, path);
+        wc_log(line, (unsigned int)strlen(line));
+    }
+
+    int id = wc_mixer_load_raw(pcm, frames, chans > 1 ? 2 : 1, rate);
+    free(pcm);
+    if (id < 0) {
+        snprintf(line, sizeof line, "no free sound slot for %s", path);
+        wc_log(line, (unsigned int)strlen(line));
+    }
+    return id;
+}
+
 static int sound_load(const char *path) {
     for (int i = 0; i < sound_path_count; i++)
         if (strcmp(sound_paths[i].path, path) == 0) return sound_paths[i].id;
@@ -960,19 +1094,26 @@ static int sound_load(const char *path) {
     /* Resolve the asset, allowing an extension fallback: a cart may ship
      * WAV where the game's source asks for OGG (or vice versa). Codec
      * choice is a packaging decision, not a gameplay one, so honoring the
-     * sibling file beats failing and leaving the game silent. */
+     * sibling file beats failing and leaving the game silent.
+     *
+     * Now that every codec is decoded by content, the fallback tries ALL of
+     * them rather than the one ogg<->wav pair: what the sibling file actually
+     * contains no longer has to match the extension it was found under. */
+    static const char *const SND_EXTS[] = { ".ogg", ".wav", ".mp3", ".flac", ".opus" };
     char resolved[192];
     snprintf(resolved, sizeof resolved, "%s", path);
     int size = wc_asset_size(resolved, (unsigned int)strlen(resolved));
     if (size <= 0) {
-        size_t rl = strlen(resolved);
-        if (rl > 4) {
-            const char *alt = NULL;
-            if (strcmp(resolved + rl - 4, ".ogg") == 0) alt = ".wav";
-            else if (strcmp(resolved + rl - 4, ".wav") == 0) alt = ".ogg";
-            if (alt) {
-                memcpy(resolved + rl - 4, alt, 5);
+        /* Strip the requested extension, then try each known one in turn. */
+        const char *dot = strrchr(path, '.');
+        if (dot && (size_t)(dot - path) < sizeof resolved - 8) {
+            size_t stem = (size_t)(dot - path);
+            for (unsigned e = 0; e < sizeof SND_EXTS / sizeof *SND_EXTS; e++) {
+                if (strcmp(dot, SND_EXTS[e]) == 0) continue;   /* already tried */
+                snprintf(resolved, sizeof resolved, "%.*s%s",
+                         (int)stem, path, SND_EXTS[e]);
                 size = wc_asset_size(resolved, (unsigned int)strlen(resolved));
+                if (size > 0) break;
             }
         }
     }
@@ -986,24 +1127,7 @@ static int sound_load(const char *path) {
     unsigned char *buf = (unsigned char *)malloc((size_t)size);
     if (!buf) return -1;
     wc_load_asset(path, (unsigned int)strlen(path), (char *)buf, (unsigned int)size);
-    int id;
-    size_t plen = strlen(path);
-    if (plen > 4 && strcmp(path + plen - 4, ".ogg") == 0) {
-        int chans = 0, rate = 0;
-        short *pcm = NULL;
-        int frames = stb_vorbis_decode_memory(buf, size, &chans, &rate, &pcm);
-        if (frames > 0 && pcm) {
-            id = wc_mixer_load_raw(pcm, frames, chans > 1 ? 2 : 1, rate);
-            free(pcm);
-        } else {
-            char line[200];
-            snprintf(line, sizeof line, "ogg decode failed: %s", path);
-            wc_log(line, (unsigned int)strlen(line));
-            id = -1;
-        }
-    } else {
-        id = wc_mixer_load_wav(buf, size);
-    }
+    int id = codec_decode(buf, size, path);
     free(buf);
     sound_entry_t *e = &sound_paths[sound_path_count++];
     snprintf(e->path, sizeof e->path, "%s", path);
