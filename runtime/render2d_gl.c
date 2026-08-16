@@ -2070,6 +2070,34 @@ void wcl_r2d_disable(void) {
 
 int wcl_r2d_active(void) { return ready && !frame_disabled; }
 
+/* Refuse one primitive; the frame stays on the GPU. See render2d_gl.h.
+ *
+ * Up to REFUSE_SLOTS distinct reasons are remembered so that a cart tripping
+ * two different ones hears about both -- a single "already warned" flag would
+ * report whichever lost the race and hide the other for the whole run. The
+ * pointers compare by ADDRESS because every caller passes a string literal
+ * with static storage, which makes this a pointer compare rather than a
+ * strcmp per refused draw. */
+#define REFUSE_SLOTS 8
+static const char *refused_seen[REFUSE_SLOTS];
+static int refused_count;
+
+void wcl_r2d_refuse(const char *what) {
+    for (int i = 0; i < refused_count; i++)
+        if (refused_seen[i] == what) return;
+    if (refused_count < REFUSE_SLOTS) refused_seen[refused_count++] = what;
+
+    WC_LOG("GPU 2D: REFUSED a draw the GL backend cannot express. wasmcart "
+           "targets a GPU, so this primitive is SKIPPED rather than quietly "
+           "finishing the frame on a software rasterizer. The rest of the "
+           "frame renders normally. Fix the draw:");
+    /* NOT WC_LOG(what): that macro is `wc_log(s, sizeof(s) - 1)`, the length
+     * of a string LITERAL. `what` is a const char *, so sizeof is the pointer
+     * width and the reason would log as three characters -- "ras" for every
+     * raster_* caller, which is precisely the half that says what to fix. */
+    wc_log(what, (unsigned int)strlen(what));
+}
+
 int wcl_r2d_solid(int x, int y, int w, int h, uint32_t color, int alpha) {
     if (!wcl_r2d_active() || w <= 0 || h <= 0) return 0;
     if (textured_batch_count) flush_textured_batch();

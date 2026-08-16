@@ -46,14 +46,30 @@ extern wcl_r2d_stats_t wcl_r2d_stats;
 #ifdef WCL_ENABLE_GL2D
 
 int  wcl_r2d_init(int width, int height);
-/* returns 1 when this frame renders via GL; 0 when the caller must clear
- * and CPU-rasterize the framebuffer (sticky cpu_mode, see render2d_gl.c) */
+/* returns 1 when this frame renders via GL; 0 only when there is no usable
+ * GL context at all, which the shipped engine treats as fatal rather than as
+ * a reason to rasterize in software. See wcl_r2d_refuse. */
 int  wcl_r2d_begin(uint32_t clear_color);
-/* fb: the cart framebuffer - blitted to GL when the frame was CPU-rendered */
+/* fb: the cart framebuffer - blitted to GL when the frame was CPU-rendered.
+ * Only engine-cpu.wasm (the differ's oracle) ever renders that way. */
 void wcl_r2d_end(const uint32_t *fb);
 void wcl_r2d_disable(void);
 void wcl_r2d_disable_why(const char *why);
 int  wcl_r2d_active(void);
+
+/* Refuse ONE primitive the GL backend cannot express, without touching the
+ * frame. wasmcart targets a GPU: a draw the backend will not do is a defect
+ * in the cart, and silently finishing the frame on a software rasterizer
+ * hides it behind a picture that still looks right while the frame time
+ * triples and any bound shader stops being applied.
+ *
+ * So the primitive is dropped and named, and everything else in the frame
+ * renders on the GPU exactly as it would have.
+ *
+ * Logged once per distinct reason, not once per draw: a cart that trips this
+ * trips it every frame, and 60 identical lines a second bury the one that
+ * matters. */
+void wcl_r2d_refuse(const char *what);
 int  wcl_r2d_solid(int x, int y, int w, int h, uint32_t color, int alpha);
 int  wcl_r2d_line(int x0, int y0, int x1, int y1, uint32_t color, int alpha);
 /* Blit an RGBA image onto an arbitrary destination parallelogram. `pixels`
@@ -226,6 +242,11 @@ static inline void wcl_r2d_end(const uint32_t *fb) { (void)fb; }
 static inline void wcl_r2d_disable(void) {}
 static inline void wcl_r2d_disable_why(const char *why) { (void)why; }
 static inline int wcl_r2d_active(void) { return 0; }
+/* In the CPU comparator there is no GPU path to keep, so a refusal is a
+ * no-op: the scanline rasterizer below draws the primitive itself. That
+ * asymmetry is the point -- engine-cpu.wasm is the oracle the GL build is
+ * diffed against, and it has to be able to draw what GL refuses. */
+static inline void wcl_r2d_refuse(const char *what) { (void)what; }
 static inline int wcl_r2d_solid(int x, int y, int w, int h, uint32_t color, int alpha) {
     (void)x; (void)y; (void)w; (void)h; (void)color; (void)alpha; return 0;
 }

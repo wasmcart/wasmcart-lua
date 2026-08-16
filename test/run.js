@@ -440,23 +440,33 @@ async function main() {
     }
   }
 
-  // ── the CPU-fallback blit must show what the cart drew ────────────
-  // When a frame falls back, the software rasterizer draws it and wc_gl_blit
-  // presents it as a fullscreen quad, so the GPU's output must equal the
-  // cart's framebuffer EXACTLY -- the blit changes only how pixels reach the
-  // screen, not what they are.
+  // ── the blit must show what was CPU-drawn ─────────────────────────
+  // wc_gl_blit presents a software-drawn framebuffer as a fullscreen quad,
+  // so the GPU's output must equal that framebuffer EXACTLY -- the blit
+  // changes only how pixels reach the screen, not what they are.
   //
-  // This needs a cart that actually falls back. It used to use test/prims,
-  // which fell back because it drew circles; now that circles render on the
-  // GPU, prims stays on GL, its software framebuffer is empty, and the gate
-  // reported "the cart drew nothing". Point it at a cart that still falls
-  // back for a reason GL2D does not implement -- a concave polygon fill.
+  // This gate has been re-pointed three times, and each time it said so
+  // rather than silently passing: first test/prims (fell back on circles,
+  // which moved to the GPU), then test/fallback (a self-intersecting
+  // polygon, which now REFUSES instead of falling back). Both times it
+  // failed with "the cart drew nothing" -- correct, because its premise
+  // had expired.
+  //
+  // It is now pointed at the LUA ERROR SCREEN, which is the only frame the
+  // shipped engine still draws in software and the only one it should be:
+  // Lua is dead, so there is no cart left to render, and the screen exists
+  // to be readable rather than fast. Unlike the previous two triggers this
+  // premise cannot expire by GL2D gaining a feature.
   const glEngine = GL_ENGINE;
   if (fs.existsSync(glEngine)) {
     const { execFileSync } = require('child_process');
+    const errDir = path.join(ROOT, 'test', 'lua-error');
+    fs.mkdirSync(errDir, { recursive: true });
+    fs.writeFileSync(path.join(errDir, 'main.lua'),
+      'function love.draw() this_function_does_not_exist() end\n');
     try {
       const out = execFileSync(process.execPath,
-        [path.join(ROOT, 'tools', 'gl-verify.mjs'), glEngine, path.join(ROOT, 'test', 'fallback'), '3'],
+        [path.join(ROOT, 'tools', 'gl-verify.mjs'), glEngine, errDir, '3'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       const m = out.match(/(\d+) differing pixels/);
       console.log(`\nok    gl-display   GPU output identical to software (${m ? m[1] : '0'} differing)`);
@@ -980,6 +990,68 @@ async function main() {
         console.log('\nskip  meshfail     no GL context available on this machine');
       } else {
         console.log('\nFAIL  meshfail     the cart did not run');
+        for (const l of txt.trim().split('\n').slice(-6)) console.log(`      ${l}`);
+        failed++;
+      }
+    }
+  }
+
+  // ── the GPU is a REQUIREMENT, not a preference ────────────────────
+  // engine.wasm must never rasterize in software. Two carts, one invariant
+  // each, both needing a REAL GL context -- without one there is no GPU path
+  // to lose and both would pass for the wrong reason, so a missing context
+  // is a skip rather than a green tick.
+  //
+  //   gpuonly     no primitive may cost the frame its GPU path
+  //   gpurecover  a REFUSED primitive is skipped, and the frame carries on
+  //               on the GPU -- before it, after it, and on later frames
+  //
+  // gpuonly existed for months with nothing running it, which is how the
+  // fallback survived unnoticed: the cart that would have caught the symptom
+  // was never executed.
+  for (const [cart, okMsg] of [
+    ['gpuonly', 'every primitive kept the GPU path'],
+    ['gpurecover', 'a refused draw is skipped, not rasterized in software'],
+  ]) {
+    const dir = path.join(ROOT, 'test', cart);
+    if (!fs.existsSync(path.join(dir, 'main.lua')) || !fs.existsSync(glEngine)) continue;
+    const { execFileSync } = require('child_process');
+    try {
+      const out = execFileSync(process.execPath,
+        [path.join(ROOT, 'tools', 'gl-mesh-verify.mjs'), '--logs', glEngine, dir, '3'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      const lines = out.split('\n');
+      const noGl = lines.some(l => /no usable GL context/.test(l));
+      const okLine = lines.some(l => /GPUONLY OK|GPURECOVER OK/.test(l));
+      const badLines = lines.filter(l => /GPU LOST AFTER|RECOVER:.*(LOST|CPU path|expired)|FAILED/.test(l));
+      // gpurecover is only meaningful if the polygon was ACTUALLY refused.
+      // If a later change makes self-intersecting fills renderable, the cart
+      // would pass having tested nothing -- so require the refusal in the log.
+      const refused = lines.some(l => /GPU 2D: REFUSED/.test(l));
+      if (noGl) {
+        console.log(`\nFAIL  ${cart.padEnd(12)}ran without GL, so the assertions prove nothing`);
+        failed++;
+      } else if (badLines.length || !okLine) {
+        console.log(`\nFAIL  ${cart.padEnd(12)}${badLines.length ? 'the GPU 2D requirement broke:' : 'the cart never reached its verdict:'}`);
+        for (const l of (badLines.length ? badLines : lines.slice(-8))) console.log(`      ${l}`);
+        failed++;
+      } else if (cart === 'gpurecover' && !refused) {
+        console.log(`\nFAIL  gpurecover   nothing was refused, so this proved nothing --`);
+        console.log(`      the self-intersecting fill now renders, and this cart needs a new trigger`);
+        failed++;
+      } else if (cart === 'gpuonly' && refused) {
+        console.log(`\nFAIL  gpuonly      a primitive was REFUSED; every one of these must render:`);
+        for (const l of lines.filter(l => /REFUSED|polygon|circle|print|setCanvas/.test(l))) console.log(`      ${l}`);
+        failed++;
+      } else {
+        console.log(`ok    ${cart.padEnd(12)} ${okMsg}`);
+      }
+    } catch (err) {
+      const txt = (err.stdout || '') + (err.stderr || '');
+      if (/Cannot find|ERR_MODULE_NOT_FOUND|createWebGL2Context/.test(txt)) {
+        console.log(`skip  ${cart.padEnd(12)} no GL context available on this machine`);
+      } else {
+        console.log(`\nFAIL  ${cart.padEnd(12)}the cart did not run`);
         for (const l of txt.trim().split('\n').slice(-6)) console.log(`      ${l}`);
         failed++;
       }

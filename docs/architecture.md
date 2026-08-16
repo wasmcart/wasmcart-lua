@@ -257,15 +257,15 @@ booted to "missing asset: main.lua", the Cavern port included. Declaring
 ## GL display path
 
 `wc_gl_blit` -- the spec's standard display path, where a 2D cart uploads its
-finished pixels as a texture and draws one fullscreen quad -- is still how a
-**fallback** frame reaches the screen. It is no longer how normal frames do:
-GL2D renders those directly, so the blit only runs when something drops the
-frame to the software rasterizer.
+finished pixels as a texture and draws one fullscreen quad -- is no longer how
+normal frames reach the screen. GL2D renders those directly. The blit now runs
+for exactly one frame type: the **Lua error screen**, which is CPU-drawn by
+design so it still appears when the cart itself is broken.
 
-`tools/gl-verify.mjs` gates that path: it runs a cart that deliberately falls
-back against a real WebGL2 context, reads the GPU framebuffer back, and
-requires it to equal the cart's software framebuffer **exactly**. The blit
-changes only how pixels reach the screen, never what they are.
+`tools/gl-verify.mjs` gates that path: it runs a deliberately-broken cart
+against a real WebGL2 context, reads the GPU framebuffer back, and requires it
+to equal the software framebuffer **exactly**. The blit changes only how
+pixels reach the screen, never what they are.
 
 Two things it caught, both worth keeping in mind when reading GL back:
 
@@ -283,7 +283,7 @@ Two things it caught, both worth keeping in mind when reading GL back:
 
 | artifact | what it is |
 |---|---|
-| `build/engine.wasm` | **the engine.** GL2D + the software rasterizer, which still renders every frame GL2D cannot. This is what `template/main.wasm` ships. |
+| `build/engine.wasm` | **the engine.** GL2D. Never rasterizes a cart frame in software: a draw GL2D cannot express is refused, not fallen back on. This is what `template/main.wasm` ships. |
 | `build/engine-cpu.wasm` | software only, imports nothing from `gl`. **A test artifact, not a shipped runtime**: it is the oracle the GL build is diffed against. Carts ship `engine.wasm`. |
 
 The goldens (`test/blit`, `test/prims`, `test/render-hash.js`) run against the
@@ -387,26 +387,39 @@ the row offset, and `mediump` is only guaranteed ~10 bits of mantissa in
 GLES -- at r=66 that put 24 pixels a whole pixel outside the software fill.
 Colour and UVs stay `mediump`.
 
-**The CPU fallback is whole-frame and sticky.** Two things still take it, and
-both are deliberate rather than unfinished:
+**The shipped engine never rasterizes in software.** The GPU is a
+requirement of the platform, not a preference, so `engine.wasm` has no
+whole-frame fallback: a draw the GL backend cannot express is **refused**.
+That one primitive is skipped and named in the log, and the rest of the
+frame renders on the GPU exactly as it would have.
+
+Four things refuse, and all four are deliberate rather than unfinished:
 
 - **self-intersecting polygon fills**, because even-odd leaves the overlap as
   a hole and any triangulation of the outline would fill it in. That is a
   wrong answer, not a missing feature.
-- **the Lua error screen**, which is CPU-drawn by design so it still appears
-  when the cart itself is broken.
+- **polygons past `WCL_MAX_POLY_PTS`**.
+- **`love.graphics.print` with an exhausted glyph atlas**.
+- **`setCanvas` with no FBO slot left** (`MAX_TARGETS` in use at once).
 
-Anything that trips one calls `wcl_r2d_disable()`, and from then on every
-frame is rasterized in software and presented with one `wc_gl_blit`.
-Reconciling per draw instead would cost ~0.19 ms each way, which a real frame
-pays dozens of times.
+`wcl_r2d_refuse()` logs each distinct reason once -- a cart that trips one
+trips it every frame, and 60 identical lines a second bury the one that
+matters -- and never touches `frame_disabled`.
 
-The stickiness has a sharp edge worth knowing: **anything that trips the
-fallback during `love.load` costs the cart GL for its entire life.** That is
-not hypothetical -- GL2D used to initialize on the first `wc_render`, so a
-cart preparing art in a canvas at load time (a standard LÖVE pattern) lost GL
-permanently and silently. `kitchen-sink` was doing exactly that and ran at
-0.54x until initialization moved ahead of `love.load`.
+This replaced a whole-frame fallback that was also **sticky for the rest of
+the run**, which was the worst of both worlds: the picture still looked
+right while the frame time tripled and every bound shader silently stopped
+being applied. The symptom (a shader not applying) surfaced far from the
+cause (a polygon, often frames earlier). It had a sharp edge too --
+anything tripping it during `love.load` cost the cart GL for its entire
+life. `kitchen-sink` ran at 0.54x that way until GL2D initialization moved
+ahead of `love.load`.
+
+The Lua error screen is the one frame still drawn in software, and the only
+one that should be: Lua is dead, so there is no cart left to render, and the
+screen exists to be readable rather than fast. It is presented with one
+`wc_gl_blit`, and `test/run.js`'s `gl-display` gate diffs that blit against
+the framebuffer pixel for pixel.
 
 Measured on the real carts, 300 frames each, AMD 890M via native-gles:
 
@@ -436,12 +449,13 @@ implementation-defined diamond-exit rule, which does not have to match
 Bresenham, and a shallow diagonal came out a row off. Axis-aligned lines are
 exact; if a cart needs Bresenham-exact diagonals it should not use GL2D.
 
-One consequence worth knowing: `setCanvas` trips the fallback the moment it
-is called, *including in `love.load`*. A cart that prepares its art in a
-canvas at load time never reaches the GL path, which is why `test/gl2d/`
-loads a PNG instead. That cart exists precisely because a cart which trips
-the fallback measures the software path on **both** engines and reports a
-perfect match while proving nothing -- `test/prims` does exactly that.
+One consequence of the old sticky fallback is still worth knowing, because
+it shaped the test carts: `setCanvas` used to trip it the moment it was
+called, *including in `love.load`*, so a cart preparing art in a canvas at
+load time never reached the GL path. That is why `test/gl2d/` loads a PNG
+instead. The hazard it guarded against has not gone away -- a cart measuring
+the software path on **both** engines reports a perfect match while proving
+nothing, which is exactly what `test/prims` does.
 
 ## Physics: two libraries, one worker pool
 

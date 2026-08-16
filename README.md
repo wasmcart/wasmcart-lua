@@ -9,9 +9,9 @@ native players, handhelds, and terminals. MIT, all layers open.
 
 Drawing goes through **GL2D**, a batched WebGL2 renderer: one atlas, one draw
 call for a whole frame of sprites, and coverage for circles computed in the
-fragment shader. A software rasterizer is built into the same binary and
-renders anything GL2D does not, so the engine never depends on a feature being
-implemented twice.
+fragment shader. **The GPU is a requirement, not a preference**: the shipped
+engine never rasterizes a cart frame in software. A draw GL2D cannot express
+is refused and named in the log, and the rest of the frame renders normally.
 
 wasmcart games are **gamepad games first**: design for d-pad + face buttons +
 sticks and they'll feel right on every device (desktop testing maps
@@ -373,7 +373,7 @@ two artifacts:
 
 | artifact | what it is |
 |---|---|
-| `build/engine.wasm` | **the engine** (~629 KB). GL2D plus the software rasterizer. This is what `template/main.wasm` ships. |
+| `build/engine.wasm` | **the engine** (~629 KB). GL2D. Refuses what it cannot draw rather than falling back to software. This is what `template/main.wasm` ships. |
 | `build/engine-cpu.wasm` | software only, imports nothing from `gl`. **A test artifact, not a shipped runtime**: it is the oracle the GL build is diffed against. Carts ship `engine.wasm`. |
 
 ## Performance

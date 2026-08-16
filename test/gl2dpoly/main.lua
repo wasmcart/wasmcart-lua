@@ -8,7 +8,9 @@
 -- exact for any SIMPLE polygon. Self-intersecting polygons are the one case
 -- that must NOT be triangulated: even-odd leaves the overlap as a hole (a
 -- pentagram's centre is empty) while a triangulation of the outline fills it
--- in, so those keep the scanline fill. test/fallback covers that.
+-- in, so there is no single correct GPU answer. The GL backend REFUSES those
+-- rather than guessing or dropping the frame to software; test/gpurecover
+-- covers that, and asserts the rest of the frame still renders on the GPU.
 
 function love.draw()
   love.graphics.setBackgroundColor(0.05, 0.05, 0.1)
