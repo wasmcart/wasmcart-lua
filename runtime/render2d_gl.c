@@ -13,13 +13,15 @@
  *     +/-1 is accepted here; the software path remains the reference
  *     implementation and stays bit-exact.
  *
- *  2. The CPU fallback is WHOLE-FRAME and STICKY. Anything this backend does
- *     not implement (rotation, canvas render targets, scissor, additive
- *     blending, TTF text, polygons, circles) calls wcl_r2d_disable(), and
- *     from then on every frame is rasterized in software and presented with
- *     one wc_gl_blit. Mixing per-draw would mean reconciling the GL
- *     framebuffer against wc_framebuffer on every switch (~0.19 ms measured),
- *     which a real cart would pay dozens of times per frame.
+ *  2. There is NO CPU fallback. wasmcart targets a GPU, so a primitive this
+ *     backend cannot express is REFUSED by wcl_r2d_refuse() -- skipped and
+ *     named in the log -- and the rest of the frame renders on the GPU.
+ *     A whole-frame fallback was worse than a missing shape: the picture
+ *     still looked right while the frame time tripled and any bound shader
+ *     silently stopped applying, with the symptom surfacing far from the
+ *     cause. Mixing the two per draw is not an option either -- it would
+ *     mean reconciling the GL framebuffer against wc_framebuffer on every
+ *     switch (~0.19 ms measured), dozens of times per frame.
  */
 #include "render2d_gl.h"
 #include "render3d_gl.h"
@@ -1896,10 +1898,6 @@ void wcl_r2d_end(const uint32_t *fb) {
     wcl_r2d_stats = frame_stats;
 }
 
-/* Warned once, not per call: a cart that trips the fallback trips it every
- * frame, and 60 identical log lines a second buries the one that matters. */
-static int warned_shader_dropped;
-
 /* ── the seam render3d_gl.c reaches through ───────────────────────────
  *
  * The 3D pipeline is a separate translation unit with its own VAO, buffers
@@ -2036,34 +2034,20 @@ GLuint wcl_r2d__upload_standalone(const void *pixels, int w, int h) {
     return t;
 }
 
-void wcl_r2d_disable_why(const char *why) {
-    /* The GPU 2D path is not a preference, it is the contract. Anything that
-     * silently drops the whole frame to the software rasterizer is a DEFECT,
-     * and a silent one is the worst kind: the picture still looks right while
-     * the frame time quietly triples. Say which primitive did it. */
-    if (wcl_r2d_active()) {
-        WC_LOG("GPU 2D path DISABLED for the rest of the run -- this is a BUG, not a fallback:");
-        WC_LOG(why);
-    }
-    wcl_r2d_disable();
-}
-
+/* Hand the frame to the software rasterizer. The ONLY caller is the Lua
+ * error screen: Lua is dead there, so there is no cart left to render and
+ * the screen exists to be readable rather than fast.
+ *
+ * Nothing a cart draws reaches this. A primitive GL2D cannot express is
+ * refused by wcl_r2d_refuse() and the frame stays on the GPU -- see the note
+ * there for why a whole-frame fallback was a worse failure mode than a
+ * missing shape. */
 void wcl_r2d_disable(void) {
     if (wcl_r2d_active()) flush_batches();
     /* Depth testing and culling are global GL state. Leaving them enabled
-     * while the frame falls back to the software path would apply them to
-     * wc_gl_blit's fullscreen present quad, which can discard it entirely. */
+     * while the error screen is presented would apply them to wc_gl_blit's
+     * fullscreen quad, which can discard it entirely. */
     wcl_r3d_reset();
-    /* A bound shader cannot follow the frame onto the software rasterizer --
-     * there is no CPU path that runs GLSL. Rendering would carry on looking
-     * plausible while the shader did nothing at all, so say it out loud. */
-    if (active_shader >= 0 && !warned_shader_dropped) {
-        warned_shader_dropped = 1;
-        WC_LOG("love.graphics.setShader: a custom shader is bound, but this "
-               "frame used a feature the GL backend does not implement, so the "
-               "engine fell back to the software rasterizer for the rest of "
-               "the run. The shader is NOT being applied from here on.");
-    }
     frame_disabled = 1;
     cpu_mode = 1;
 }

@@ -623,6 +623,7 @@ using them is not portable back to it. Excluded from the percentage
 above.
 
 - `love.audio.beep`
+- `love.debugRead`
 - `love.debugValue`
 - `love.filesystem.exists`
 - `love.filesystem.load_save`
@@ -650,6 +651,26 @@ above.
 - `love.pad.wasReleased`
 - `love.physics.World`
 - `love.physics.stats`
+- `love.physics3d.debug.box`
+- `love.physics3d.debug.capsule`
+- `love.physics3d.debug.cone`
+- `love.physics3d.debug.count`
+- `love.physics3d.debug.cylinder`
+- `love.physics3d.debug.defineSkin`
+- `love.physics3d.debug.draw`
+- `love.physics3d.debug.getSkin`
+- `love.physics3d.debug.init`
+- `love.physics3d.debug.isEnabled`
+- `love.physics3d.debug.isLighting`
+- `love.physics3d.debug.plane`
+- `love.physics3d.debug.rebake`
+- `love.physics3d.debug.reset`
+- `love.physics3d.debug.setBodyVisible`
+- `love.physics3d.debug.setEnabled`
+- `love.physics3d.debug.setLightRig`
+- `love.physics3d.debug.setLighting`
+- `love.physics3d.debug.sphere`
+- `love.physics3d.debug.toggle`
 - `love.window.focus`
 - `love.window.getDimensions`
 - `love.window.getHeight`

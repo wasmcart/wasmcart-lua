@@ -138,9 +138,10 @@ What a port usually has to change:
   to the driver.
 - **Do not build your own projection from `transform_projection`.** It is
   the identity here: vertices arrive already in clip space.
-- **A shader is GPU-only.** If the renderer falls back to the software
-  rasterizer (a feature GL2D does not implement), the shader stops applying
-  and the engine logs that it has. It never silently renders unshaded.
+- **A shader is GPU-only**, and here that is all there is: the engine never
+  falls back to a software rasterizer, so a bound shader keeps applying for
+  the whole frame. `newShader` fails loudly on a host with no GL context
+  rather than silently rendering unshaded.
 
 See `examples/shaders/` for a working cart and `docs/api.md` for the full
 surface, the `send` types, and the limits.
@@ -166,9 +167,9 @@ What a port usually has to change:
   the frame into one draw, while a *mesh* is its own draw call, because the
   batcher is hardwired to quads. A hundred small meshes is a hundred draws;
   merge them into one mesh, or just use sprites.
-- **A mesh is GPU-only.** If the renderer falls back to the software
-  rasterizer, `newMesh` and `draw(mesh, ...)` fail loudly rather than
-  drawing nothing.
+- **A mesh is GPU-only.** `newMesh` fails loudly on a host with no GL
+  context rather than drawing nothing. There is no software path for a
+  textured, per-vertex-coloured triangle.
 
 `setColor` tints a mesh, multiplying its per-vertex colours, exactly as it
 does a sprite. See `examples/mesh/` for a working cart.
@@ -191,20 +192,26 @@ Two things differ from LÖVE's Box2D v2:
   `collider:enter("Class")` after `world:update(dt)` is the supported form
   (this is what windfield already exposes, so most games need no change).
 
-Joints, ray casts, and preSolve/postSolve are not implemented and error
-clearly rather than silently doing nothing.
+Joints are implemented, both LOVE-shaped (`love.physics.new*Joint`) and raw
+`b2`. Ray casts and preSolve/postSolve are not, and error clearly rather than
+silently doing nothing.
 
 ## 7. Performance notes
 
-The v1 renderer is a software rasterizer. It sustains 1280x720 at 60fps with
-hundreds of draw calls, but the cost model differs from LÖVE's GPU path:
+Drawing goes through **GL2D**, a batched WebGL2 renderer, so the cost model is
+close to LÖVE's own — a GPU on both sides. The engine never falls back to
+software; a draw GL2D cannot express is refused and logged (see the API
+reference).
 
-- **large filled areas are the expensive thing**, not draw-call count. A
-  full-screen `rectangle("fill")` per frame costs real time; the automatic
-  background clear already covers you.
-- `SpriteBatch` exists and behaves the same, but here it is just a retained
-  draw list — there is no per-draw GPU state change to amortize, so batching
-  is a correctness/compatibility feature rather than a speed one.
+- **Draw-call count is what matters**, as in LÖVE. GL2D keeps every image in
+  one shared atlas, so a whole frame of sprites is typically a single draw
+  call no matter which images they come from. What breaks a batch is a state
+  change: `setBlendMode`, `setCanvas`, `setShader`, a scissor change, or a
+  mesh (always its own call). Group those rather than interleaving them.
+- Large filled areas are cheap now — they are the GPU's best case. The
+  automatic background clear costs essentially nothing.
+- `SpriteBatch` exists and behaves the same. GL2D already batches sprites
+  frame-wide, so it is a compatibility feature more than a speed one here.
 - Rotated rectangles go through the polygon path; unrotated ones take a fast
   path. Rotation is not free but is not dramatic either.
 - Per-frame table churn is the usual real cost. The GC runs one budgeted step
@@ -225,4 +232,6 @@ Check `gc_kb` and `draw_calls` in the debug state if a port feels slow.
    shaders may need GLSL ES 1.00 spellings modernized — see 6a).
 8. If it uses windfield, forward it to the engine's native `wf`.
 
-Assets: PNG for images, WAV/OGG for audio, TTF for fonts.
+Assets: PNG for images, WAV/OGG/MP3/FLAC for audio (Opus with an opt-in
+build), TTF for fonts. The audio codec is picked by content, so an extension
+that disagrees with the bytes still plays.

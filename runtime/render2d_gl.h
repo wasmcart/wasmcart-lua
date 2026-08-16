@@ -4,9 +4,9 @@
 /* Largest filled polygon either layer will handle.
  *
  * Shared so the Lua prelude, the software rasterizer and the GL path all
- * agree. If they disagree the failure is silent and expensive: a polygon
- * the prelude emits but the GL path refuses drops the ENTIRE FRAME -- 3D
- * included -- to the software rasterizer for the rest of the run.
+ * agree. If they disagree a polygon the prelude happily emits is refused by
+ * the GL path and simply does not appear -- logged, but still a shape the
+ * cart author expected to see.
  *
  * 256 covers a full-screen circle at ~1.4 degrees per segment, which is
  * smoother than any 1080p display resolves. */
@@ -54,7 +54,6 @@ int  wcl_r2d_begin(uint32_t clear_color);
  * Only engine-cpu.wasm (the differ's oracle) ever renders that way. */
 void wcl_r2d_end(const uint32_t *fb);
 void wcl_r2d_disable(void);
-void wcl_r2d_disable_why(const char *why);
 int  wcl_r2d_active(void);
 
 /* Refuse ONE primitive the GL backend cannot express, without touching the
@@ -114,8 +113,9 @@ int  wcl_r2d_stencil_begin(int action, int value);
 void wcl_r2d_stencil_end(void);
 void wcl_r2d_stencil_test(int compare, int value);
 
-/* Fill a CONVEX polygon as a triangle fan. Returns 0 for a concave one --
- * a fan would cover area outside it -- so the caller falls back. */
+/* Fill a polygon. Convex ones fan directly; concave ones are ear-clipped,
+ * which is exact for any SIMPLE polygon. Returns 0 for a self-intersecting
+ * one or a point count past the cap, and the caller refuses the draw. */
 int  wcl_r2d_poly(const double *xs, const double *ys, int n,
                   uint32_t color, int alpha);
 
@@ -240,7 +240,6 @@ static inline int wcl_r2d_init(int width, int height) {
 static inline int wcl_r2d_begin(uint32_t clear_color) { (void)clear_color; return 0; }
 static inline void wcl_r2d_end(const uint32_t *fb) { (void)fb; }
 static inline void wcl_r2d_disable(void) {}
-static inline void wcl_r2d_disable_why(const char *why) { (void)why; }
 static inline int wcl_r2d_active(void) { return 0; }
 /* In the CPU comparator there is no GPU path to keep, so a refusal is a
  * no-op: the scanline rasterizer below draws the primitive itself. That

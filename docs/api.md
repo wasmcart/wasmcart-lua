@@ -33,6 +33,31 @@ function love.gamepadreleased(joy, button) end
 
 ## love.graphics
 
+### The GPU is a requirement
+
+Drawing goes through GL2D. The shipped engine has **no software fallback**:
+it never rasterizes a cart frame on the CPU, and there is no flag to make it.
+
+So a draw GL2D cannot express is **refused**. That one primitive is skipped
+and named in the log; everything else in the frame renders normally. Four
+things refuse, and all four are deliberate rather than unfinished:
+
+| Refused | Why |
+|---|---|
+| `polygon("fill", ...)` that self-intersects | even-odd leaves the overlap hollow (a pentagram's centre is empty) while any triangulation of the outline fills it in. Those are different pictures and neither is "the" right one, so the engine refuses rather than silently picking. Say which you meant: `love.math.triangulate` then draw the pieces gives you the **filled** reading, and splitting the shape into non-self-intersecting parts yourself gives you the hollow one. |
+| `polygon("fill", ...)` past 256 points | `WCL_MAX_POLY_PTS` |
+| `print` / `printf` with the glyph atlas full | too many distinct characters or font sizes alive at once |
+| `setCanvas(c)` with no FBO slot left | more than 16 canvases used as render targets at once (`MAX_TARGETS`) |
+
+The alternative — quietly finishing the frame in software — is a worse
+failure mode than a missing shape, because the picture still *looks* right
+while the frame time triples and any bound shader stops being applied. The
+symptom then surfaces far from the cause.
+
+Each distinct reason is logged **once**, not once per draw, so check the log
+if a shape is missing. `wc.gpu2d()` reports whether the GPU path is live; it
+exists for conformance tests rather than for carts to branch on.
+
 ### State
 
 | Function | Notes |
@@ -249,11 +274,10 @@ A vertex shader defines
   engine uploads it separately (with `GL_REPEAT` and mipmaps) the first time
   it is sent.
 - **Limits:** 64 shaders, 15 sampler uniforms per shader, 16 KB of source.
-- **Shaders need GL.** `newShader` fails on a host with no GL context, and
-  `setShader` fails if the renderer has fallen back to the software
-  rasterizer, rather than drawing unshaded and looking almost right. If a
-  later draw trips that fallback while a shader is bound, the engine says so
-  in the cart log.
+- **Shaders need GL.** `newShader` fails on a host with no GL context rather
+  than drawing unshaded and looking almost right. Once bound, a shader stays
+  applied for the whole frame: the engine has no software fallback for a
+  draw to drop it into (see "The GPU is a requirement").
 
 A compile or link failure raises a Lua error, and the driver's own info log
 is written to the cart log so you see the real message.
@@ -313,11 +337,11 @@ Draw modes: `"fan"` (the default), `"strip"`, `"triangles"`.
   hundred sprites are; put them in one mesh instead.
 - **`love.graphics.setColor` tints a mesh**, multiplying its per-vertex
   colours, exactly as it does a sprite.
-- **Meshes need GL.** `newMesh` fails on a host with no GL context, and
-  `draw` fails if the renderer has fallen back to the software rasterizer.
-  There is no software path that rasterizes a textured, per-vertex-coloured
-  triangle, and inventing an approximate one that disagreed with GL would be
-  worse than saying so.
+- **Meshes need GL.** `newMesh` fails on a host with no GL context. There is
+  no software path that rasterizes a textured, per-vertex-coloured triangle,
+  and inventing an approximate one that disagreed with GL would be worse than
+  saying so. (The shipped engine never falls back to software anyway — see
+  "The GPU is a requirement" below.)
 - **Limits:** 32 meshes, 4096 vertices each.
 
 ### 3D
@@ -771,7 +795,7 @@ that as "unknown, assume nothing", not as "unreliable".
 ## love.audio
 
 ```lua
-local s = love.audio.newSource("sounds/hit.wav")   -- .wav or .ogg
+local s = love.audio.newSource("sounds/hit.wav")   -- see the codec table
 s:play() s:stop() s:pause() s:resume()
 s:setVolume(v) s:getVolume()
 s:setPitch(p)  s:getPitch()
@@ -784,6 +808,21 @@ love.audio.beep(freq, [volume])    -- generated square wave, no asset needed
 ```
 
 16 voices, 48kHz output.
+
+| Format | Decoder | Notes |
+|---|---|---|
+| WAV | built into the mixer | 8-bit unsigned / 16-bit signed PCM |
+| Ogg Vorbis | stb_vorbis | |
+| MP3 | dr_mp3 | ID3v1/v2 tags skipped |
+| FLAC | dr_flac | |
+| Opus | libopus + opusfile | **opt-in**: `WCL_OPUS=1 runtime/build.sh` |
+
+The codec is chosen by **content, not by file extension**, which is what
+LOVE does — an asset whose name disagrees with its bytes still plays, and
+`sounds/hit.wav` holding an mp3 is fine. Anything over two channels is
+downmixed to stereo. A file that cannot be decoded logs the reason rather
+than playing silence, including an Opus asset on an engine built without
+Opus.
 
 ## love.physics / wf (Box2D v3)
 
