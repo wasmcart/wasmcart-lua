@@ -258,6 +258,45 @@ async function main() {
     }
   }
 
+  // ── audio codecs, end to end through love.audio.newSource ─────────
+  // The native harness (test/run-decoders.sh) proves the PCM is right; this
+  // proves the ENGINE reaches those decoders -- asset lookup, the content
+  // sniffer, the mixer slot. It includes an mp3 deliberately named .wav,
+  // which is exactly what the extension-based dispatch used to load silently
+  // as garbage.
+  //
+  // Opus is conditional: engine.wasm only carries it when built with
+  // WCL_OPUS=1, so a plain build reports 1 expected failure rather than
+  // pretending the codec is there. Checked against the log, not assumed.
+  const acDir = path.join(ROOT, 'test', 'audiocodec');
+  if (fs.existsSync(path.join(acDir, 'main.lua'))) {
+    const ra = await runCart(ENGINE, acDir, 2);
+    const acFails = ra.fields.score;
+    const acTotal = ra.fields.aux;
+    const noOpus = ra.logs.some(l => l.includes('built without Opus'));
+    const expected = noOpus ? 1 : 0;
+    if (ra.trap || ra.fields.lua_ok === 0) {
+      console.log(`\nFAIL  audiocodec did not run: ${ra.trap || 'lua error'}`);
+      for (const l of ra.logs.slice(0, 10)) console.log(`      ${l}`);
+      failed++;
+    } else if (acFails > expected) {
+      console.log(`\nFAIL  audiocodec  ${acFails}/${acTotal} codecs failed to load`);
+      for (const l of ra.logs.filter(l => /FAILED|failed|unrecognized/.test(l))) {
+        console.log(`      ${l}`);
+      }
+      failed++;
+    } else if (!ra.logs.some(l => l.includes('downmixed to stereo'))) {
+      // The 5.1 fixture loading is not proof it was FOLDED: a build that
+      // passed 6 channels straight to the mixer would also "load". Assert the
+      // downmix actually ran.
+      console.log(`\nFAIL  audiocodec  6-channel FLAC loaded without being downmixed`);
+      failed++;
+    } else {
+      const note = noOpus ? ' (opus not built in)' : ' incl. opus';
+      console.log(`ok    audiocodec   ${acTotal - acFails}/${acTotal} codecs loaded${note}`);
+    }
+  }
+
   // ── b3 surface material / damping / sleep / contact events ────────
   // Behavioural, not just presence: each case is one a pre-extension
   // binding passes vacuously (restitution 0.9 and 0.0 bounced identically
