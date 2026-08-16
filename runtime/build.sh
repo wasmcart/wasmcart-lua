@@ -260,11 +260,57 @@ build_engine ../build/engine-cpu.wasm
 # the template ships the engine so `run.sh` works with no build step
 cp ../build/engine.wasm ../template/main.wasm
 
-# pack the flagship example as a ready-to-run demo cart
-if [ -d ../examples/ping/app ]; then
-  node "$WASMCART_REPO/bin/wasmcart-pack.js" \
-    --wasm ../build/engine.wasm --assets ../examples/ping/app \
-    --name ping --width 1280 --height 720 \
-    -o ../build/ping.wasc > /dev/null
-  echo "packed ../build/ping.wasc"
-fi
+# ── pack the release set ────────────────────────────────────────────
+# THE CARTS ATTACHED TO A GITHUB RELEASE ARE BUILT HERE, not by hand.
+#
+# This used to pack ping alone, and the other seven carts in build/ were
+# whatever some earlier run had left there. By v0.5.0 they were three weeks
+# stale -- still carrying the v0.1.0 engine -- and attaching them to a release
+# would have shipped players an engine with none of the release's work in it.
+# Packing the whole set here is what stops that drifting again: the carts are
+# always as new as the engine sitting next to them.
+#
+# Each entry is "name:appdir:WxH". The resolution is the cart's OWN, declared
+# in the manifest so a host sizes its window -- and a self-provisioned GL
+# context -- before the cart runs. Getting it wrong is not cosmetic: a cart
+# handed a smaller context than it draws into renders in a corner of it.
+# cavern is 1152x768 from its conf.lua; everything else is the 1280x720
+# default. A cart with a conf.lua still overrides this at boot, but the
+# manifest is what the host has to go on BEFORE boot.
+RELEASE_CARTS="
+ping:../examples/ping/app:1280x720
+breakout:../examples/breakout/app:1280x720
+kitchen-sink:../examples/kitchen-sink/app:1280x720
+particles:../examples/particles/app:1280x720
+platformer:../examples/platformer/app:1280x720
+shmup:../examples/shmup/app:1280x720
+template:../template/app:1280x720
+cavern:../ports/cavern/app:1152x768
+"
+
+packed=0
+for entry in $RELEASE_CARTS; do
+  name="${entry%%:*}"; rest="${entry#*:}"
+  appdir="${rest%%:*}"; res="${rest##*:}"
+  w="${res%x*}"; h="${res#*x}"
+  # Validate the WxH here. wasmcart-pack takes --width/--height as numbers and
+  # simply OMITS manifest.width/height when they do not parse -- it exits 0 and
+  # writes a cart that looks fine. A cart with no declared resolution is handed
+  # whatever context size the host guesses, which is the "renders into a corner"
+  # failure the packer's own comment warns about. Catch the typo here, where it
+  # is a one-line fix, rather than in a player's window.
+  case "$w$h" in
+    *[!0-9]*|"") echo "bad resolution '$res' for $name in RELEASE_CARTS" >&2; exit 1 ;;
+  esac
+  [ -d "$appdir" ] || { echo "skipped $name (no $appdir)"; continue; }
+  if node "$WASMCART_REPO/bin/wasmcart-pack.js" \
+       --wasm ../build/engine.wasm --assets "$appdir" \
+       --name "$name" --width "$w" --height "$h" \
+       -o "../build/$name.wasc" > /dev/null; then
+    packed=$((packed + 1))
+  else
+    echo "FAILED to pack $name" >&2
+    exit 1
+  fi
+done
+echo "packed $packed release carts into ../build/ (see RELEASE_CARTS)"
