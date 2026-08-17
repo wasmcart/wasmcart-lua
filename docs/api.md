@@ -29,6 +29,7 @@ function love.keypressed(key) end    -- pad 1 edges, mapped to key names
 function love.keyreleased(key) end
 function love.gamepadpressed(joy, button) end
 function love.gamepadreleased(joy, button) end
+function love.wheelmoved(dx, dy) end -- scroll notches; only fired when nonzero
 ```
 
 ## love.graphics
@@ -666,6 +667,84 @@ A game that reads only `love.mouse` works perfectly on desktop and ignores
 every touch on a phone -- that is the #1 pointer portability trap. Poll all
 ten slots (the loop is free) unless the game genuinely wants only a cursor.
 `examples/breakout` draws a per-slot stroke trace showing exactly this.
+
+### Scroll wheel
+
+```lua
+function love.wheelmoved(dx, dy) end  -- the LOVE-shaped callback
+local dx, dy = love.mouse.wheel()     -- or poll the same delta
+```
+
+Units are **notches**: one detent of a mouse wheel is `1.0`. A trackpad or
+free-spin wheel reports fractions, because the underlying ABI carries
+1/120-notch integers rather than clicks -- so precision scrolling is not
+rounded away. `dy` is positive UP.
+
+One delta PER FRAME. The host accumulates every platform event and hands
+over the total, so a trackpad flick (dozens of events) is one call and a
+game behaves the same at 30fps as at 144. The callback is skipped entirely
+when nothing scrolled, so a handler is not called sixty times a second by
+hardware with no wheel.
+
+**Zero is the normal state on most devices.** A phone with no mouse attached
+never scrolls, exactly as a desktop never fills touch slots 1-9. Read it and
+let it be zero; never gate a feature on whether a wheel exists.
+
+### Covering every device: the three-binding rule
+
+Every device this engine runs on has **at least one** of a gamepad, a
+touchscreen, or a mouse. So a game needing one continuous axis -- camera
+zoom, throttle, a scrub bar -- needs exactly three bindings to be playable
+everywhere:
+
+| input | move | continuous axis |
+|---|---|---|
+| gamepad | a stick | shoulders/triggers, or the other stick |
+| touch | one-finger drag | **pinch** (derive it yourself, below) |
+| mouse | drag | **wheel** |
+
+Mouse buttons as a zoom modifier (right-drag, middle-drag) are deliberately
+NOT on that list: they work, but a phone has no right click, so they cover
+nothing that pinch and the wheel do not already cover better.
+
+### Pinch: the game computes it
+
+There is no pinch callback and there will not be one -- SDL2 had
+`SDL_MULTIGESTURE` and SDL3 removed it, because gestures belong to the app.
+Two pointer slots is all it takes:
+
+```lua
+-- two contacts down -> pinch
+local ax, ay, _, aOn = wc.pointer(1)
+local bx, by, _, bOn = wc.pointer(2)
+if aOn and bOn then
+  local d = math.sqrt((bx-ax)^2 + (by-ay)^2)
+  local mx, my = (ax+bx) * 0.5, (ay+by) * 0.5     -- the midpoint
+  if not pinch then
+    pinch = { d0 = d, zoom0 = cam.zoom }
+  else
+    -- ANCHOR AT THE MIDPOINT: scale, then shift the camera so the world
+    -- point under the midpoint is still under it. Everyone forgets this
+    -- step, and zooming about the screen centre while pinching a corner
+    -- looks wrong on the very first try.
+    local wx, wy = screenToWorld(mx, my)
+    cam.zoom = pinch.zoom0 * (d / pinch.d0)
+    local nx, ny = screenToWorld(mx, my)
+    cam.x, cam.y = cam.x + (wx - nx), cam.y + (wy - ny)
+  end
+else
+  pinch = nil
+end
+```
+
+### Gesture priority, when a drag can mean two things
+
+If a one-finger drag does something irreversible (fling a unit, fire, commit
+an order) and two fingers mean camera, the second finger landing must
+**cancel** the one-finger action rather than complete it. A palm brush or a
+slightly-early second thumb otherwise commits a move the player never meant,
+and touch has no undo. The rule that falls out: a tap SELECTS, a drag ACTS,
+and gaining a contact abandons whatever the single contact was doing.
 
 For hosts that draw ON-SCREEN touch pads, pack with an advisory `controls`
 hint (`wasmcart-pack --controls dpad,a,b,start`) so the overlay shows only

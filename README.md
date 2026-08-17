@@ -166,6 +166,21 @@ Buttons: `a b x y l r start select up down left right l3 r3`.
 pad; keyboard arrows/z/x reach pad 1 so you can test at a desk.
 `love.keypressed` / `love.gamepadpressed` callbacks fire on edges.
 
+Pointer, touch and wheel:
+
+```lua
+love.mouse.getPosition()           -- pointer slot 0 (the mouse)
+wc.pointer(slot)                   -- slots 1-9 are touch fingers
+function love.wheelmoved(dx, dy)   -- scroll in NOTCHES; 1.0 = one detent
+```
+
+`love.wheelmoved` fires once per frame with the accumulated delta and is
+skipped when nothing scrolled, so hardware with no wheel never calls it.
+Every device has a gamepad, a touchscreen or a mouse, so a continuous axis
+(camera zoom, throttle) wants three bindings: a stick, a pinch derived from
+two pointer slots, and the wheel -- see `docs/api.md` for the pinch recipe
+and the gesture-priority rule.
+
 ### love.audio
 
 ```lua
