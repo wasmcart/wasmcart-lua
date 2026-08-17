@@ -32,6 +32,7 @@ typedef struct {
     uint32_t         audio_cap;
     wc_pad_t        *pads;               /* [4] */
     wc_pointer_t    *pointers;           /* [10]: 0 = mouse, 1-9 = touch */
+    wc_wheel_t      *wheel;              /* scroll delta, 1/120 notch (v3.1) */
     uint8_t         *keys;               /* [32] bitmask */
     wc_time_t       *time;
     wc_host_info_t  *host_info;

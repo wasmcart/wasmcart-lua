@@ -189,6 +189,7 @@ static const wc_native_regions_t wcl_native_regions = {
     .audio_cap          = AUDIO_CAP,
     .pads               = wc_pads,
     .pointers           = wc_pointers,
+    .wheel              = &wc_wheel,
     .keys               = wc_keys,
     .time               = &wc_time,
     .host_info          = &wc_host_info,
@@ -1590,6 +1591,21 @@ static int l_pointer(lua_State *S) {
     return 4;
 }
 
+/* wheel() -> dx, dy  (scroll delta for THIS frame, in notches)
+ *
+ * The ABI carries 1/120-notch integers -- the WHEEL_DELTA convention, so a
+ * trackpad's fractional scroll is not rounded to a click. Lua gets notches
+ * as a float, because that is what LOVE's wheelmoved() hands a game: one
+ * detent = 1.0.
+ *
+ * The host zeroes the field after every frame, so this is always "since the
+ * last frame" and there is nothing to clear here. */
+static int l_wheel(lua_State *S) {
+    lua_pushnumber(S, (lua_Number)wc_wheel.dx / 120.0);
+    lua_pushnumber(S, (lua_Number)wc_wheel.dy / 120.0);
+    return 2;
+}
+
 /* Rumble. pad_id is 0-based at the ABI boundary; the prelude does the
  * 1-based -> 0-based conversion so love.pad numbering stays uniform. */
 static int l_pad_has_rumble(lua_State *S) {
@@ -2823,6 +2839,7 @@ static const luaL_Reg wc_lib[] = {
     {"asset_read",  l_asset_read},
     {"asset_exists", l_asset_exists},
     {"pointer",     l_pointer},
+    {"wheel",       l_wheel},
     {"shader_new",  l_shader_new},
     {"shader_use",  l_shader_use},
     {"shader_send", l_shader_send},

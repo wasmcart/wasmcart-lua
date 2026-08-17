@@ -3358,6 +3358,23 @@ function mouse.isDown(...)
   return false
 end
 
+-- SCROLL WHEEL, as a poll. Returns this frame's delta in NOTCHES (one
+-- detent = 1.0; a trackpad or free-spin wheel gives fractions, because the
+-- ABI carries 1/120-notch units rather than clicks).
+--
+-- The canonical surface is the love.wheelmoved CALLBACK below -- that is
+-- what real LOVE gives you and what game code expects. This exists for the
+-- polling style, and for anything that wants to read the delta more than
+-- once in a frame.
+--
+-- ZERO IS THE NORMAL STATE on most hardware: a phone with no mouse
+-- attached never scrolls, exactly as a desktop never fills touch slots
+-- 1-9. Read it unconditionally and let it be 0; never gate a feature on
+-- "does this device have a wheel".
+function mouse.wheel()
+  return wc.wheel()
+end
+
 function mouse.setVisible() end
 function mouse.isVisible() return true end
 function mouse.setGrabbed() end
@@ -6141,6 +6158,18 @@ function __wasmcart_frame(b1, lx1, ly1, rx1, ry1,
       end
     end
     prev_mouse = buttons
+  end
+
+  -- Wheel -> love.wheelmoved(dx, dy), the real LOVE signature. Fired once
+  -- per frame with the accumulated delta, which is what the host wrote: a
+  -- trackpad flick is dozens of host events and a game that saw each one
+  -- separately would scroll differently at 30fps than at 144.
+  --
+  -- Skipped entirely at zero, so a game with a wheelmoved handler is not
+  -- called sixty times a second by hardware that has no wheel.
+  if love.wheelmoved then
+    local wdx, wdy = wc.wheel()
+    if wdx ~= 0 or wdy ~= 0 then love.wheelmoved(wdx, wdy) end
   end
 
   if love.update then love.update(FIXED_DT) end
