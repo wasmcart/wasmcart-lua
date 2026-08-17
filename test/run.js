@@ -1152,6 +1152,76 @@ async function main() {
     }
   }
 
+  // ── scroll wheel: a delta the framebuffer cannot show ─────────────────
+  //
+  // Same blind spot as rumble -- nothing about scrolling reaches the
+  // pixels, so the smoke run cannot see it. The fake host writes
+  // wc_wheel_t directly (the real host accumulates platform events into
+  // the same field), which lets the two things that actually break be
+  // checked:
+  //
+  //   * the 1/120-notch unit conversion: 120 in the struct must arrive in
+  //     Lua as 1.0, and 60 as 0.5, or every cart's zoom speed is wrong
+  //   * no caching in the prelude: on a frame the host wrote 0, the cart
+  //     must read 0 rather than the last nonzero value, and wheelmoved
+  //     must not fire at all. (The REAL host's zero-after-frame duty is
+  //     covered on the other side of the boundary, in wasmcart's
+  //     test/wheel.test.js -- this suite drives the field directly, so it
+  //     can only prove the cart half.)
+  const wheelDir = path.join(ROOT, 'test', 'wheel');
+  if (fs.existsSync(path.join(wheelDir, 'main.lua'))) {
+    // wheel_ptr is u32 index 17 of wc_info_t (byte offset 68), v3.1.
+    const WHEEL_PTR_OFF = 68;
+    // frame -> [dx, dy] in 1/120 notch units. Frames not listed scroll
+    // nothing, which is what proves the clear.
+    const script = { 1: [0, 120], 3: [-120, -60] };
+    const wr = await runCart(ENGINE, wheelDir, 6, {
+      input: (frame, d, infoPtr) => {
+        const wp = d.getUint32(infoPtr + WHEEL_PTR_OFF, true);
+        if (!wp) return;                       // cart declared no buffer
+        const [dx, dy] = script[frame] || [0, 0];
+        d.setInt32(wp, dx, true);
+        d.setInt32(wp + 4, dy, true);
+      },
+    });
+
+    const problems = [];
+    if (wr.trap || wr.fields.lua_ok === 0) {
+      problems.push(`cart did not run: ${wr.trap || 'lua error'}`);
+    }
+    const cbs = wr.logs.filter(l => l.startsWith('@wheel cb '));
+    const polls = wr.logs.filter(l => l.startsWith('@wheel poll '));
+    if (!wr.logs.some(l => l.startsWith('@wheel boot poll=true cb=true'))) {
+      problems.push('love.mouse.wheel or love.wheelmoved is missing');
+    }
+    // Exactly two scroll events were scripted, so exactly two callbacks.
+    if (cbs.length !== 2) {
+      problems.push(`${cbs.length} wheelmoved calls, expected 2 ` +
+        `(a callback on a zero frame means the guard is missing)`);
+    }
+    if (!cbs.some(l => /dx=0\.0000 dy=1\.0000/.test(l))) {
+      problems.push('120 units did not arrive as 1.0 notch: ' + (cbs[0] || 'no call'));
+    }
+    if (!cbs.some(l => /dx=-1\.0000 dy=-0\.5000/.test(l))) {
+      problems.push('fractional/negative delta wrong (want dx=-1.0 dy=-0.5): ' +
+        (cbs[1] || 'no second call'));
+    }
+    // THE CLEAR: the frames between scroll events must read zero.
+    const zeroFrames = polls.filter(l => /dx=0\.0000 dy=0\.0000/.test(l));
+    if (zeroFrames.length < 3) {
+      problems.push(`only ${zeroFrames.length} frames read zero; the delta is ` +
+        `not being cleared between frames`);
+    }
+    if (problems.length) {
+      console.log('\nFAIL  wheel');
+      for (const p of problems) console.log(`      ${p}`);
+      failed++;
+    } else {
+      console.log(`\nok    wheel        ${cbs.length} callbacks, 1/120 units exact, ` +
+        `cleared between frames`);
+    }
+  }
+
   // ── rumble: the ABI boundary the cart cannot see ──────────────────
   // Nothing about rumble reaches the framebuffer, so the smoke run above is
   // blind to it. The fake host records every call instead, which is the only
