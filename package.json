@@ -27,6 +27,6 @@
     "LICENSE"
   ],
   "devDependencies": {
-    "wasmcart": "^0.17.0"
+    "wasmcart": "^0.22.0"
   }
 }
