@@ -738,6 +738,28 @@ int wcl_r3d_target_bind(const int *handles, const int *layer, int n,
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         bound_color_count = 0;
         wcl_r2d__screen_viewport();
+        /* REBIND THE 2D STATE, exactly as the success path and the
+         * back-to-screen path above both do.
+         *
+         * The 2D renderer caches its program/VAO/buffer/texture bindings and
+         * skips calls it believes are redundant, so every exit from this
+         * function has to tell it the GL state moved underneath it. The other
+         * two did; this one did not, which left the cart drawing through a
+         * stale cache after a failed bind.
+         *
+         * FOUND WHILE CHASING SOMETHING ELSE, and it is worth being precise
+         * about that: the black-window bug of 2026-08-21 was NOT this. Its
+         * cause was in webgl-node (makeCurrent lived only on the wrapper, so
+         * wasmcart's teardown could not switch contexts and deleted another
+         * context's identically-numbered textures -- fixed in webgl-node
+         * 1.5.1 / wasmcart 0.24.0). Adding this line alone did not fix that,
+         * and it was tested.
+         *
+         * It ships because it is a real asymmetry: whatever makes a bind fail
+         * in the future, the recovery path should leave the renderer in the
+         * same known state the other exits do, rather than turning a
+         * recoverable failure into a silently mis-rendered frame. */
+        wcl_r2d__rebind_2d_state();
         return 0;
     }
 
