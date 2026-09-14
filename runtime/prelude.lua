@@ -3514,6 +3514,26 @@ end
 
 -- ── love.math ──────────────────────────────────────────────────────
 local lmath = {}
+--- Compose a local matrix from position/quaternion/scale, optionally
+--- multiplied by a parent world matrix. Returns 16 numbers, column-major.
+---
+--- The scene-graph inner loop in C: doing it in Lua cost 0.79ms a frame for
+--- 2000 objects, of which the tree walk itself was only 0.045ms.
+---
+--- Defined on `lmath` rather than on `love.math` directly, because the
+--- assignment below REPLACES love.math wholesale -- an earlier version set it
+--- on love.math first and was silently wiped, so the cart saw nothing.
+lmath.composeMatrix = function(px, py, pz, qx, qy, qz, qw, sx, sy, sz, parent)
+  if parent then
+    return wc.mat4_compose_mul(px, py, pz, qx, qy, qz, qw, sx, sy, sz,
+      parent[1], parent[2], parent[3], parent[4],
+      parent[5], parent[6], parent[7], parent[8],
+      parent[9], parent[10], parent[11], parent[12],
+      parent[13], parent[14], parent[15], parent[16])
+  end
+  return wc.mat4_compose_mul(px, py, pz, qx, qy, qz, qw, sx, sy, sz)
+end
+
 love.math = lmath
 
 -- deterministic: the ONLY entropy is the host seed

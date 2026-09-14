@@ -2237,6 +2237,67 @@ static int l_fbuffer_compose_trs(lua_State *S) {
     return 1;
 }
 
+/* mat4_compose_mul(px,py,pz, qx,qy,qz,qw, sx,sy,sz, [parent16...])
+ *   -> 16 numbers: the LOCAL matrix, and optionally parent * local.
+ *
+ * The scene-graph inner loop. Object3D:updateMatrixWorld composes a local
+ * matrix from position/quaternion/scale and then multiplies it by the
+ * parent's world matrix, per object per frame. Measured on 2000 objects:
+ * compose 0.275ms, multiply 0.514ms, traversal only 0.045ms -- so the
+ * arithmetic is the cost and the tree walk is not.
+ *
+ * The walk stays in Lua (it is cheap, and it owns the dirty flags and the
+ * visibility rules); only the arithmetic moves. Returns the 16 elements in
+ * COLUMN-major order, which is how three.lua's Matrix4 stores them.
+ *
+ * With no parent supplied the local matrix is returned unmultiplied, which
+ * is what a root object needs. */
+static int l_mat4_compose_mul(lua_State *S) {
+    double px = lua_tonumber(S, 1), py = lua_tonumber(S, 2), pz = lua_tonumber(S, 3);
+    double qx = lua_tonumber(S, 4), qy = lua_tonumber(S, 5);
+    double qz = lua_tonumber(S, 6), qw = lua_tonumber(S, 7);
+    double sx = lua_tonumber(S, 8), sy = lua_tonumber(S, 9), sz = lua_tonumber(S, 10);
+
+    double x2 = qx+qx, y2 = qy+qy, z2 = qz+qz;
+    double xx = qx*x2, xy = qx*y2, xz = qx*z2;
+    double yy = qy*y2, yz = qy*z2, zz = qz*z2;
+    double wx = qw*x2, wy = qw*y2, wz = qw*z2;
+
+    /* Column-major, matching three.js's Matrix4 storage. */
+    double m[16];
+    m[0]  = (1.0 - (yy + zz)) * sx;
+    m[1]  = (xy + wz) * sx;
+    m[2]  = (xz - wy) * sx;
+    m[3]  = 0.0;
+    m[4]  = (xy - wz) * sy;
+    m[5]  = (1.0 - (xx + zz)) * sy;
+    m[6]  = (yz + wx) * sy;
+    m[7]  = 0.0;
+    m[8]  = (xz + wy) * sz;
+    m[9]  = (yz - wx) * sz;
+    m[10] = (1.0 - (xx + yy)) * sz;
+    m[11] = 0.0;
+    m[12] = px; m[13] = py; m[14] = pz; m[15] = 1.0;
+
+    if (lua_isnumber(S, 11)) {
+        double p[16], r[16];
+        for (int i = 0; i < 16; i++) p[i] = lua_tonumber(S, 11 + i);
+        /* r = parent * local, column-major. */
+        for (int c = 0; c < 4; c++) {
+            for (int rw = 0; rw < 4; rw++) {
+                r[c*4 + rw] = p[rw]      * m[c*4]
+                            + p[4 + rw]  * m[c*4 + 1]
+                            + p[8 + rw]  * m[c*4 + 2]
+                            + p[12 + rw] * m[c*4 + 3];
+            }
+        }
+        for (int i = 0; i < 16; i++) lua_pushnumber(S, r[i]);
+    } else {
+        for (int i = 0; i < 16; i++) lua_pushnumber(S, m[i]);
+    }
+    return 16;
+}
+
 /* shader_send_fbuffer(handle, name, id, offset, count) -- the zero-read
  * upload: the floats are already in C, so this is a bounds check and a GL
  * call with no Lua traversal whatsoever. */
@@ -3188,6 +3249,7 @@ static const luaL_Reg wc_lib[] = {
     {"fbuffer_free", l_fbuffer_free},
     {"fbuffer_set", l_fbuffer_set},
     {"fbuffer_compose_trs", l_fbuffer_compose_trs},
+    {"mat4_compose_mul", l_mat4_compose_mul},
     {"fbuffer_get", l_fbuffer_get},
     {"shader_send_fbuffer", l_shader_send_fbuffer},
     {"shader_send_image", l_shader_send_image},
