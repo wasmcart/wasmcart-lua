@@ -1986,6 +1986,51 @@ function graphics.getStackDepth() return tdepth end
 -- handed to the driver, because a driver error points at line numbers in
 -- generated code the cart author never wrote.
 
+-- ── love.graphics.newFloatBuffer ─────────────────────────────────────
+--
+-- A buffer of floats owned by the ENGINE, not by Lua.
+--
+-- Not a LOVE API. It exists because re-uploading a large uniform array every
+-- frame otherwise costs one Lua table read per number even when nothing
+-- changed: measured with a 2000-instance static scene, that read was
+-- essentially the whole frame (0.47ms, against 0.006ms of actual Lua work).
+--
+-- A cart writes values when they change and uploads by handle. An unchanged
+-- frame re-uploads with no Lua traversal at all.
+--
+--   local buf = love.graphics.newFloatBuffer(2000 * 16)
+--   buf:set(i * 16, m1, m2, ..., m16)      -- 0-based float offset
+--   shader:sendBuffer("instanceMatrix", buf, offset, count)
+local FloatBuffer = {}
+FloatBuffer.__index = FloatBuffer
+
+function FloatBuffer:set(offset, ...)
+  return wc.fbuffer_set(self.id, offset, ...)
+end
+
+function FloatBuffer:get(offset, count)
+  return wc.fbuffer_get(self.id, offset, count or 1)
+end
+
+function FloatBuffer:getSize() return self.size end
+
+function FloatBuffer:release()
+  if self.id then wc.fbuffer_free(self.id); self.id = nil end
+end
+
+love.graphics.newFloatBuffer = function(count)
+  count = math.floor(count or 0)
+  if count <= 0 then
+    error("love.graphics.newFloatBuffer: count must be positive", 2)
+  end
+  local id = wc.fbuffer_new(count)
+  if id < 0 then
+    error("love.graphics.newFloatBuffer: out of buffers or too large " ..
+          "(max 16 buffers, 65536 floats each)", 2)
+  end
+  return setmetatable({ id = id, size = count }, FloatBuffer)
+end
+
 local Shader = {}
 Shader.__index = Shader
 function Shader:type() return "Shader" end
@@ -2008,6 +2053,17 @@ function Shader:getHandle() return self.id end
 function Shader:send(name, a, ...)
   if rawtype(name) ~= "string" then
     error("Shader:send: the uniform name must be a string", 2)
+  end
+  if rawtype(a) == "table" and getmetatable(a) == FloatBuffer then
+    -- A FloatBuffer: the floats already live in C, so this uploads with no
+    -- Lua traversal at all. Optional (offset, count) select a sub-range.
+    --
+    -- CHECKED FIRST, and that ordering is load-bearing: a FloatBuffer is a
+    -- table, so the generic table branch below matches it happily and sends
+    -- it as a vector built from whatever fields it happens to have. The
+    -- symptom was every instance in a scene collapsing onto one transform,
+    -- with no error anywhere.
+    return wc.shader_send_fbuffer(self.id, name, a.id, ...)
   end
   if rawtype(a) == "table" then
     -- A GPU render target binds as a sampler of its own texture TYPE
@@ -2032,7 +2088,10 @@ function Shader:send(name, a, ...)
     if a.id and (a.w or a.canvas) then          -- an Image or a Canvas
       return wc.shader_send_image(self.id, name, a.id)
     end
-    return wc.shader_send(self.id, name, a)
+    -- The extra arguments are the optional (offset, count) sub-range for a
+    -- FLAT mat4 array, which lets a batching renderer upload a slice of one
+    -- big array without copying it out first.
+    return wc.shader_send(self.id, name, a, ...)
   end
   if rawtype(a) == "boolean" then
     return wc.shader_send_bool(self.id, name, a, ...)
@@ -2040,9 +2099,19 @@ function Shader:send(name, a, ...)
   if rawtype(a) == "number" then
     return wc.shader_send(self.id, name, a, ...)
   end
+  if rawtype(a) == "string" then
+    -- A string of already-packed little-endian float bytes. The
+    -- zero-marshalling path: a Lua string is contiguous in C, so the bytes go
+    -- straight to GL with no per-element table walk. Length decides the
+    -- shape: 4-16 bytes is a vector, 64 is a mat4, any multiple of 64 is a
+    -- mat4 array. Build one with string.pack, or keep a buffer the cart packs
+    -- once and reuses.
+    return wc.shader_send(self.id, name, a)
+  end
   error("Shader:send('" .. name .. "'): unsupported value type '" ..
         rawtype(a) .. "'. Supported: number(s), a table of 1-4 numbers, a 4x4 " ..
-        "table-of-tables, boolean(s), an Image or a Canvas.", 2)
+        "table-of-tables, a list of those (mat4 array), a STRING of packed " ..
+        "float bytes, boolean(s), an Image or a Canvas.", 2)
 end
 
 -- LOVE's introspection helper, and a READ-ONLY one. The obvious shortcut --

@@ -240,6 +240,21 @@ s:send("u_lut", myCanvas)              -- sampler2D
 s:send("u_bones", { m1, m2, m3 })      -- mat4[3], one upload
 ```
 
+A **flat** table of 16*N numbers is also a `mat4[N]`, and it is the cheapest
+shape to build: the cart writes numbers in place with no allocation, and the
+binding reads one per element instead of walking nested tables at 21 lookups
+per matrix. It takes an optional `(offset, count)` sub-range so a renderer
+that batches can upload a slice of one big array without copying it out:
+
+```lua
+s:send("u_bones", flat)                  -- all of it
+s:send("u_bones", flat, 256 * 16, 64 * 16)   -- 64 matrices from offset 256
+```
+
+For data that is re-uploaded every frame but rarely changes, see
+**[Float buffers](#float-buffers)** below, which removes the Lua read
+entirely.
+
 The `mat4[N]` form exists for **instanced rendering**, where per-instance
 data has to reach the shader as a uniform array indexed by `gl_InstanceID`
 (there are no per-instance vertex attributes). Sending the elements
@@ -499,6 +514,32 @@ lighting:send("normalMap", normal)
 **Shader sampler types:** `Image` (2D), `CubeImage`, `ArrayImage`,
 `VolumeImage` — declare with the type that matches the texture, or the
 shader will not compile.
+
+### Float buffers
+
+`love.graphics.newFloatBuffer(count)` allocates floats that live in **engine
+memory** rather than in a Lua table.
+
+```lua
+local buf = love.graphics.newFloatBuffer(2000 * 16)
+buf:set(i * 16, m1, m2, --[[ ... ]] m16)      -- 0-based offset, in floats
+shader:send("instanceMatrix", buf, offset, count)   -- offset/count optional
+buf:release()
+```
+
+Not a LOVE API. It exists because re-uploading a large uniform array costs
+one Lua table read per number in the binding, **every frame, even when
+nothing changed**. Measured with a 2000-instance static scene: the cart's own
+per-frame work was 0.006 ms and the whole frame was 0.47 ms, so almost all of
+it was that read of 32000 numbers. Writing each value once into a buffer the
+engine owns brought the same scene to 0.19 ms.
+
+Use it when a cart re-sends the same large array across frames. For a small
+uniform, or one that is rebuilt from scratch anyway, a plain table is simpler
+and the difference is not measurable.
+
+**Limits:** 16 buffers, 65536 floats each. `getFFIPointer` is deliberately
+absent for the same reason ByteData refuses it: there is no FFI here.
 
 ### Custom vertex formats
 
