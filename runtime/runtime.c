@@ -3250,19 +3250,6 @@ static int l_mesh3d_set_instances(lua_State *S) {
     int id = ARGI(2);
     int off = lua_isnumber(S, 3) ? (int)lua_tointeger(S, 3) : 0;
     int n = ARGI(4);
-    {
-        static int logged = 0;
-        if (!logged) {
-            logged = 1;
-            char b[192];
-            int bn = snprintf(b, sizeof b,
-                   "set_instances mesh=%d fb=%d off=%d n=%d fblen=%d used=%d",
-                   mesh, id, off, n,
-                   (id >= 0 && id < MAX_FBUFS) ? fbufs[id].len : -1,
-                   (id >= 0 && id < MAX_FBUFS) ? fbufs[id].used : -1);
-            wc_log(b, bn);
-        }
-    }
     if (id < 0 || id >= MAX_FBUFS || !fbufs[id].used || n < 1) {
         lua_pushboolean(S, 0);
         return 1;
