@@ -113,6 +113,19 @@ static mesh3d_t meshes3d[MAX_MESHES3D];
 static GLuint vao3d;
 static int vao3d_ready;
 
+/* The mesh whose attribute layout vao3d currently holds.
+ *
+ * There is ONE shared VAO, so every mesh has to point the attributes at its
+ * own VBO before drawing. But re-specifying them for a mesh that is ALREADY
+ * bound is pure cost, and drawing the same mesh repeatedly is exactly what
+ * instancing does: a scene drawing four batches of one mesh was issuing 16
+ * glVertexAttribPointer, 16 glEnableVertexAttribArray and 16
+ * glDisableVertexAttribArray a frame to describe the same layout four times.
+ *
+ * Any state change that invalidates the VAO's contents must clear this.
+ * NULL means "unknown, re-specify".  */
+static mesh3d_t *attribs_bound_mesh = NULL;
+
 static uint32_t depth_compare;   /* 0 = test disabled */
 static int depth_write;
 static int cull_mode;            /* 0 none, 1 back, 2 front */
@@ -319,12 +332,18 @@ int wcl_r3d_mesh_new_format(const wcl_attrib_t *attribs, int n_attribs,
     m->count = count;
     m->cap = count;
     m->used = 1;
+    /* A newly created mesh cannot be the one whose layout is bound, but a
+     * slot recycled at the same address could be. Be explicit rather than
+     * rely on the free path having run. */
+    if (attribs_bound_mesh == m) attribs_bound_mesh = NULL;
     wcl_r2d__rebind_2d_state();
     return slot;
 }
 
 /* Point the 3D attributes at `m`'s VBO. Must run with vao3d bound. */
 static void bind_mesh_attribs(mesh3d_t *m) {
+    if (m == attribs_bound_mesh) return;
+    attribs_bound_mesh = m;
     if (m->n_attribs > 0) { bind_format_attribs(m); return; }
     glBindBuffer(GL_ARRAY_BUFFER, m->vbo);
     const GLsizei stride = (GLsizei)sizeof(wcl_vertex3d_t);
@@ -373,6 +392,10 @@ int wcl_r3d_mesh_new(const wcl_vertex3d_t *verts, int count) {
     m->count = count;
     m->cap = count;
     m->used = 1;
+    /* A newly created mesh cannot be the one whose layout is bound, but a
+     * slot recycled at the same address could be. Be explicit rather than
+     * rely on the free path having run. */
+    if (attribs_bound_mesh == m) attribs_bound_mesh = NULL;
     wcl_r2d__rebind_2d_state();
     return slot;
 }
@@ -438,6 +461,11 @@ int wcl_r3d_mesh_set_texture(int handle, const void *pixels, int w, int h) {
 void wcl_r3d_mesh_free(int handle) {
     mesh3d_t *m = mesh_by_handle(handle);
     if (!m) return;
+    /* The attribute cache is keyed by POINTER, and this slot can be handed
+     * out again for a different mesh at the same address. Clearing it here
+     * means a reused slot re-specifies rather than inheriting a layout that
+     * points into a deleted buffer. */
+    if (attribs_bound_mesh == m) attribs_bound_mesh = NULL;
     if (m->vbo) glDeleteBuffers(1, &m->vbo);
     if (m->ebo) glDeleteBuffers(1, &m->ebo);
     if (m->tex) glDeleteTextures(1, &m->tex);
