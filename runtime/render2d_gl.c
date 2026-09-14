@@ -153,6 +153,10 @@ static int blend_mode_cur = WCL_BLEND_ALPHA;
 static void restore_screen_viewport(void);
 static int blend_premult_cur = 0;
 static void flush_batches(void);
+/* Undo whatever the 3D pipeline left bound, before a 2D draw reads it. The
+ * 3D path used to restore this itself after every draw; it now defers here so
+ * consecutive 3D draws do not pay for state nothing looks at in between. */
+void wcl_r3d__restore_for_2d(void);
 /* Custom shaders (defined further down). Declared here because set_textured
  * and bind_texture, which sit above them, must consult the bound program. */
 /* 8 was sized for a 2D cart, where a shader is an effect and two or three is
@@ -1796,6 +1800,15 @@ static void bind_texture(GLuint texture) {
 
 static void flush_solid_batch(void) {
     if (!solid_batch_count) return;
+    /* Reclaim whatever the 3D pipeline left bound, before this reads the 2D
+     * VAO and buffers.
+     *
+     * Hooked HERE rather than in flush_batches, because that is also called
+     * at the top of every 3D draw (via wcl_r2d__flush_for_3d) and restoring
+     * there would have each 3D draw tear down the state it was about to use.
+     * These two functions early-return on an empty batch, so this runs only
+     * when 2D geometry is genuinely about to be drawn. */
+    wcl_r3d__restore_for_2d();
     set_blend(solid_batch_has_alpha);
     glBindBuffer(GL_ARRAY_BUFFER, buffer);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(vertex_t) * solid_batch_count),
@@ -1835,6 +1848,7 @@ static void flush_batches(void) {
     flush_solid_batch();
     flush_textured_batch();
 }
+
 
 int wcl_r2d_init(int w, int h) {
     if (ready) return 1;
@@ -2018,6 +2032,8 @@ void wcl_r2d_end(const uint32_t *fb) {
 void wcl_r2d__flush_for_3d(void) {
     if (wcl_r2d_active()) flush_batches();
 }
+
+
 
 GLuint wcl_r2d__active_program(void) {
     if (active_shader < 0) return 0;

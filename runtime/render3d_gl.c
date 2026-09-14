@@ -113,6 +113,11 @@ static mesh3d_t meshes3d[MAX_MESHES3D];
 static GLuint vao3d;
 static int vao3d_ready;
 
+/* Set when a 3D draw has left the pipeline in 3D state. Read by the 2D side
+ * immediately before it draws, so the restore is paid once per 2D/3D
+ * transition rather than once per 3D draw. */
+static int r3d_state_dirty = 0;
+
 /* The mesh whose attribute layout vao3d currently holds.
  *
  * There is ONE shared VAO, so every mesh has to point the attributes at its
@@ -1077,6 +1082,14 @@ void wcl_r3d_frame_begin(void) {
 
 int wcl_r3d_used_this_frame(void) { return used_this_frame; }
 
+/* Called by the 2D renderer before it draws. Idempotent and cheap when there
+ * is nothing to undo, which is the common case in a 2D-only frame. */
+void wcl_r3d__restore_for_2d(void) {
+    if (!r3d_state_dirty) return;
+    r3d_state_dirty = 0;
+    wcl_r3d_leave();
+}
+
 void wcl_r3d_leave(void) {
     if (depth_test_on) { glDisable(GL_DEPTH_TEST); depth_test_on = 0; }
     if (cull_on) { glDisable(GL_CULL_FACE); cull_on = 0; }
@@ -1196,7 +1209,25 @@ static int mesh_draw_common(int handle, uint32_t tint, int alpha, int instances)
 #endif
 
     used_this_frame = 1;
-    wcl_r3d_leave();
+    /* NOT wcl_r3d_leave() here.
+     *
+     * Tearing down the 3D state after every draw meant two consecutive 3D
+     * draws paid a full teardown and setup between them: disable depth,
+     * disable cull, rebind the 2D VAO and both 2D buffers, then immediately
+     * bind the 3D VAO and re-enable everything. On a scene of 2000 separate
+     * meshes that was 16000 GL calls a frame to return to a state nothing
+     * looked at in between.
+     *
+     * The 2D pipeline is the only thing that needs its state back, and it
+     * asks for it: wcl_r2d__flush_for_3d runs before any 2D draw and now
+     * restores whatever 3D left behind. So the teardown happens once per
+     * 2D/3D transition instead of once per 3D draw.
+     *
+     * `r3d_state_dirty` is what tells the 2D side there is something to
+     * restore; without it a 2D draw would inherit the 3D VAO and read
+     * vertices at the wrong stride, which renders garbage rather than
+     * failing. */
+    r3d_state_dirty = 1;
     return 1;
 }
 
