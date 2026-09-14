@@ -1894,7 +1894,7 @@ static int l_shader_send(lua_State *S) {
         }
         int nfloats = (int)(blen / 4);
 
-        enum { MAX_FLOATS = 256 * 16 };
+        enum { MAX_FLOATS = 1024 * 16 };
         if (nfloats > MAX_FLOATS) { lua_pushboolean(S, 0); return 1; }
 
         /* Only the shapes wcl_r2d_shader_send_float understands. Anything
@@ -1938,7 +1938,7 @@ static int l_shader_send(lua_State *S) {
          * offering, and 256 matrices is past what any uniform array on this
          * target can hold anyway. */
         if (nested2) {
-            enum { MAX_MAT4 = 256 };
+            enum { MAX_MAT4 = 1024 };
             if (len < 1 || len > MAX_MAT4) { lua_pushboolean(S, 0); return 1; }
             static float ms[MAX_MAT4 * 16];
             for (int k = 0; k < len; k++) {
@@ -1998,7 +1998,7 @@ static int l_shader_send(lua_State *S) {
          * Checked before the len == 16 case below so a 16-element flat table
          * still means one matrix, which is what every existing cart sends. */
         if (len > 16 && (len % 16) == 0) {
-            enum { MAX_FLAT = 256 * 16 };
+            enum { MAX_FLAT = 1024 * 16 };
 
             /* OPTIONAL SUB-RANGE: send(name, flat, offset, count).
              *
