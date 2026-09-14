@@ -83,7 +83,7 @@ typedef struct {
  * Indices are assigned in DECLARATION ORDER, so the same format always
  * produces the same bindings and one VAO can be reused across meshes that
  * share a format. */
-#define WCL_MAX_ATTRIBS 8
+#define WCL_MAX_ATTRIBS 12
 #define WCL_ATTRIB_NAME_MAX 32
 
 typedef struct {
@@ -246,6 +246,10 @@ void wcl_r3d_get_color_mask(int *r, int *g, int *b, int *a);
 /* Instanced draw: the same mesh `count` times, with gl_InstanceID varying.
  * Returns 0 on the same terms as wcl_r3d_mesh_draw. */
 int  wcl_r3d_mesh_draw_instanced(int handle, int count, uint32_t tint, int alpha);
+/* Per-instance matrices: count*16 floats, four vec4 columns per matrix.
+ * Bound as attributes 4..7 with divisor 1, so the vertex stage gets a
+ * hardware fetch instead of a dynamic index into a uniform array. */
+int  wcl_r3d_mesh_set_instances(int handle, const float *data, int count);
 
 /* Driver limits, for love.graphics.getSystemLimits(). */
 int  wcl_r3d_limit(int which);   /* 0 multicanvas, 1 texturesize, 2 cubetexturesize,
@@ -342,8 +346,11 @@ static inline void wcl_r3d_get_color_mask(int *r, int *g, int *b, int *a) {
 static inline int wcl_r3d_mesh_draw_instanced(int h, int c, uint32_t t, int a) {
     (void)h; (void)c; (void)t; (void)a; return 0;
 }
+static inline int wcl_r3d_mesh_set_instances(int h, const float *d, int c) {
+    (void)h; (void)d; (void)c; return 0;
+}
 static inline int wcl_r3d_limit(int which) { (void)which; return 0; }
-#define WCL_MAX_ATTRIBS 8
+#define WCL_MAX_ATTRIBS 12
 #define WCL_ATTRIB_NAME_MAX 32
 typedef struct {
     char name[WCL_ATTRIB_NAME_MAX];

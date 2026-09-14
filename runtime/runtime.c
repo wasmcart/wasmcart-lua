@@ -3240,6 +3240,41 @@ static int l_gl_limit(lua_State *S) {
     return 1;
 }
 
+/* mesh3d_set_instances(mesh_id, fbuf_id, offset, count_matrices)
+ *
+ * Uploads per-instance matrices straight from a FloatBuffer, so the floats
+ * never pass through Lua. `count` is MATRICES, not floats; the C side wants
+ * 16 floats each and checking that here keeps the arithmetic in one place. */
+static int l_mesh3d_set_instances(lua_State *S) {
+    int mesh = ARGI(1);
+    int id = ARGI(2);
+    int off = lua_isnumber(S, 3) ? (int)lua_tointeger(S, 3) : 0;
+    int n = ARGI(4);
+    {
+        static int logged = 0;
+        if (!logged) {
+            logged = 1;
+            char b[192];
+            int bn = snprintf(b, sizeof b,
+                   "set_instances mesh=%d fb=%d off=%d n=%d fblen=%d used=%d",
+                   mesh, id, off, n,
+                   (id >= 0 && id < MAX_FBUFS) ? fbufs[id].len : -1,
+                   (id >= 0 && id < MAX_FBUFS) ? fbufs[id].used : -1);
+            wc_log(b, bn);
+        }
+    }
+    if (id < 0 || id >= MAX_FBUFS || !fbufs[id].used || n < 1) {
+        lua_pushboolean(S, 0);
+        return 1;
+    }
+    if (off < 0 || off + n * 16 > fbufs[id].len) {
+        lua_pushboolean(S, 0);
+        return 1;
+    }
+    lua_pushboolean(S, wcl_r3d_mesh_set_instances(mesh, fbufs[id].data + off, n));
+    return 1;
+}
+
 static int l_mesh3d_draw_instanced(lua_State *S) {
     int ok = wcl_r3d_mesh_draw_instanced(ARGI(1), ARGI(2), cur_rgb(), cur_a);
     if (ok) dbg_draw_calls++;
@@ -3363,6 +3398,7 @@ static const luaL_Reg wc_lib[] = {
     {"mesh3d_draw",         l_mesh3d_draw},
     {"mesh3d_release",      l_mesh3d_release},
     {"mesh3d_draw_instanced", l_mesh3d_draw_instanced},
+    {"mesh3d_set_instances", l_mesh3d_set_instances},
     {"target_new",      l_target_new},
     {"target_free",     l_target_free},
     {"target_supported", l_target_supported},

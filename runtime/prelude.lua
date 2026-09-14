@@ -2898,6 +2898,25 @@ end
 -- This is the difference between 1000 draw calls and 1. Per-instance data
 -- goes in a uniform array indexed by gl_InstanceID; there is no per-instance
 -- attribute buffer, matching what LOVE's own drawInstanced offers.
+-- Mesh3D:setInstanceMatrices(fbuf, count, offset)
+--
+-- Upload per-instance model matrices from a FloatBuffer, bound as a vertex
+-- attribute with divisor 1. The vertex stage then reads `InstanceMatrix`
+-- directly instead of indexing a uniform array by gl_InstanceID, which is a
+-- hardware fetch rather than an indexed constant read, and removes the
+-- uniform-array size limit on batch size entirely.
+--
+-- `count` is MATRICES; `offset` is in FLOATS into the buffer, so one buffer
+-- can back several meshes. Returns false if the range does not fit, rather
+-- than uploading a short buffer and drawing garbage.
+function Mesh3D:setInstanceMatrices(fbuf, count, offset)
+  if getmetatable(fbuf) ~= FloatBuffer then
+    error("Mesh3D:setInstanceMatrices: expected a FloatBuffer", 2)
+  end
+  return wc.mesh3d_set_instances(self.id, fbuf.id, offset or 0,
+                                 math.floor(count or 0))
+end
+
 function graphics.drawInstanced(mesh, count, ...)
   if getmetatable(mesh) ~= Mesh3D then
     error("love.graphics.drawInstanced: expected a 3D Mesh (one created with " ..

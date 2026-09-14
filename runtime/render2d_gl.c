@@ -640,6 +640,13 @@ static const char *SHADER_VERT3D_PROLOGUE =
     "in vec2 VertexTexCoord;\n"
     "in vec3 VertexNormal;\n"
     "in vec4 VertexColor;\n"
+    /* Per-instance model matrix, attribute locations 4..7 (a mat4 attribute
+     * is four consecutive vec4 columns). Bound with divisor 1, so it
+     * advances once per instance. A shader that ignores it costs nothing:
+     * an unread attribute is optimised out and its array simply goes
+     * unused. Declaring it unconditionally is what lets a cart write
+     * `InstanceMatrix * pos` without any opt-in flag. */
+    "in mat4 InstanceMatrix;\n"
     "out vec2 v_uv;\n"
     "out vec4 v_color;\n"
     "out vec3 v_normal;\n"
@@ -1129,6 +1136,12 @@ static int shader_rewrite_es100(const char *src, char *dst, size_t cap,
 /* Pin the attribute indices, then link. Shared by the default program and
  * every cart shader so one VAO stays valid across all of them. */
 static void bind_attribs_and_link(GLuint prog) {
+    /* A mat4 attribute consumes FOUR consecutive locations from the one it
+     * is bound to, which is why the 3D instance matrix sits at 8..11, past
+     * every index the attribute registry can assign. It was at 4..7 and the
+     * registry handed 4 to a declared vertex attribute, pinning two things
+     * to one location. render3d_gl.c mirrors this as A3_INST0. */
+    glBindAttribLocation(prog, 8, "InstanceMatrix");
     glBindAttribLocation(prog, ATTR_POS, "a_pos");
     glBindAttribLocation(prog, ATTR_UV, "a_uv");
     glBindAttribLocation(prog, ATTR_COLOR, "a_color");

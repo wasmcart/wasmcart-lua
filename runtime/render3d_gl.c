@@ -80,6 +80,22 @@ extern int    wcl_r2d__claim_texture_unit(int handle, GLint loc, GLuint tex,
 #define A3_COLOR  2
 #define A3_NORMAL 3
 
+/* PER-INSTANCE MATRIX ATTRIBUTE.
+ *
+ * A mat4 attribute occupies FOUR consecutive attribute slots, one per column
+ * (GL has no single mat4 vertex attribute; the linker assigns a run of vec4
+ * locations). 4..7 is the run after the built-in four.
+ *
+ * This is the difference between a hardware fetch and a dynamic index into a
+ * uniform array. Measured on 12-suzanne (1000 instances, 505 verts each),
+ * the uniform-array form cost 0.100 ms/frame of which ~0.09 ms was vertex
+ * processing, and batch size barely moved it -- the work is per instanced
+ * vertex, not per draw. */
+#define A3_INST0  8
+#define A3_INST1  9
+#define A3_INST2  10
+#define A3_INST3  11
+
 /* These MUST match render2d_gl.c's ATTR_*, which is what bind_attribs_and_link
  * pins for every program. If they drift, nothing fails loudly: the shader
  * reads colour from the normal attribute and the model renders in the
@@ -103,6 +119,12 @@ typedef struct {
     wcl_attrib_t attribs[WCL_MAX_ATTRIBS];
     int n_attribs;
     int stride;
+    /* Per-instance matrix buffer: 16 floats per instance, divisor 1.
+     * inst_count is how many instances it currently holds. 0 = none, and
+     * the draw falls back to the uniform-array path the cart may be using. */
+    GLuint inst_vbo;
+    int inst_count;
+    int inst_cap;
     int used;
 } mesh3d_t;
 static mesh3d_t meshes3d[MAX_MESHES3D];
@@ -225,13 +247,19 @@ static void registry_seed(void) {
 }
 
 /* The index for `name`, registering it if new. -1 when the registry is
- * full, which is a hard refusal rather than a silent collision. */
+ * full, which is a hard refusal rather than a silent collision.
+ *
+ * Indices A3_INST0..A3_INST3 are RESERVED for the per-instance matrix and
+ * are never handed out here. They were originally 4..7, which the registry
+ * could and did assign to a declared vertex attribute -- the program then
+ * had two different things pinned to the same location and rendered a
+ * screenful of stretched triangles rather than failing. */
 static int attrib_index(const char *name) {
     registry_seed();
-    for (int i = 0; i < WCL_MAX_ATTRIBS; i++)
+    for (int i = 0; i < A3_INST0; i++)
         if (attrib_registry[i].used && !strcmp(attrib_registry[i].name, name))
             return i;
-    for (int i = 0; i < WCL_MAX_ATTRIBS; i++) {
+    for (int i = 0; i < A3_INST0; i++) {
         if (!attrib_registry[i].used) {
             snprintf(attrib_registry[i].name, WCL_ATTRIB_NAME_MAX, "%s", name);
             attrib_registry[i].used = 1;
@@ -253,7 +281,7 @@ void wcl_r3d_bind_format_attribs(unsigned int program) {
     /* Bind EVERY known name. Binding a name the program does not declare is
      * a no-op in GL, so one unconditional pass covers every shader without
      * knowing which format it will be drawn with. */
-    for (int i = 0; i < WCL_MAX_ATTRIBS; i++)
+    for (int i = 0; i < A3_INST0; i++)
         if (attrib_registry[i].used)
             glBindAttribLocation((GLuint)program, (GLuint)i, attrib_registry[i].name);
 }
@@ -289,7 +317,7 @@ static void bind_format_attribs(mesh3d_t *m) {
             offset += (size_t)a->components * 4;
         }
     }
-    for (int i = 0; i < WCL_MAX_ATTRIBS; i++)
+    for (int i = 0; i < A3_INST0; i++)
         if (!supplied[i]) glDisableVertexAttribArray((GLuint)i);
     if (m->index_count) glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m->ebo);
 }
@@ -297,7 +325,11 @@ static void bind_format_attribs(mesh3d_t *m) {
 int wcl_r3d_mesh_new_format(const wcl_attrib_t *attribs, int n_attribs,
                             const void *verts, int count, int stride) {
     if (!wcl_r2d_active() || !attribs || n_attribs < 1 || count < 1) return -1;
-    if (n_attribs > WCL_MAX_ATTRIBS) {
+    /* A3_INST0, not WCL_MAX_ATTRIBS: the array is sized to include the
+     * reserved per-instance matrix run, which a declared format can never
+     * use. Checking against the array size accepted formats the registry
+     * then could not assign, which failed at bind time instead of here. */
+    if (n_attribs > A3_INST0) {
         WC_LOG("love.graphics.newMesh: too many vertex attributes (8 max)");
         return -1;
     }
@@ -346,10 +378,40 @@ int wcl_r3d_mesh_new_format(const wcl_attrib_t *attribs, int n_attribs,
 }
 
 /* Point the 3D attributes at `m`'s VBO. Must run with vao3d bound. */
+/* Point attributes 4..7 at the mesh's per-instance matrix buffer, one vec4
+ * column each, all with divisor 1 so they advance once per INSTANCE rather
+ * than once per vertex. Disables them when the mesh has no instance buffer,
+ * because the VAO is shared and a leftover enabled array still points into
+ * some other mesh's storage. */
+static void bind_instance_attribs(mesh3d_t *m) {
+    if (!m->inst_vbo || m->inst_count < 1) {
+        for (int i = A3_INST0; i <= A3_INST3; i++) {
+            glDisableVertexAttribArray((GLuint)i);
+            /* The divisor is VAO state and the VAO is SHARED, so a stale 1
+             * left here would make a later mesh that reuses these locations
+             * advance once per instance instead of once per vertex. */
+            glVertexAttribDivisor((GLuint)i, 0);
+        }
+        return;
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, m->inst_vbo);
+    for (int c = 0; c < 4; c++) {
+        GLuint loc = (GLuint)(A3_INST0 + c);
+        glEnableVertexAttribArray(loc);
+        glVertexAttribPointer(loc, 4, GL_FLOAT, 0, (GLsizei)(16 * sizeof(float)),
+                              (const void *)(size_t)(c * 4 * sizeof(float)));
+        glVertexAttribDivisor(loc, 1);
+    }
+}
+
 static void bind_mesh_attribs(mesh3d_t *m) {
     if (m == attribs_bound_mesh) return;
     attribs_bound_mesh = m;
-    if (m->n_attribs > 0) { bind_format_attribs(m); return; }
+    if (m->n_attribs > 0) {
+        bind_format_attribs(m);
+        bind_instance_attribs(m);
+        return;
+    }
     glBindBuffer(GL_ARRAY_BUFFER, m->vbo);
     const GLsizei stride = (GLsizei)sizeof(wcl_vertex3d_t);
     glEnableVertexAttribArray(A3_POS);
@@ -369,8 +431,11 @@ static void bind_mesh_attribs(mesh3d_t *m) {
     /* Disable anything a DECLARED-format mesh enabled earlier: the VAO is
      * shared, and a leftover array still points into that mesh's buffer.
      * Only indices past the built-in four can be affected. */
-    for (int i = 4; i < WCL_MAX_ATTRIBS; i++)
+    for (int i = 4; i < A3_INST0; i++)
         glDisableVertexAttribArray((GLuint)i);
+    /* AFTER the disable loop above, which covers 4..7 and would otherwise
+     * undo this. */
+    bind_instance_attribs(m);
     if (m->index_count) glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m->ebo);
 }
 
@@ -473,6 +538,7 @@ void wcl_r3d_mesh_free(int handle) {
     if (attribs_bound_mesh == m) attribs_bound_mesh = NULL;
     if (m->vbo) glDeleteBuffers(1, &m->vbo);
     if (m->ebo) glDeleteBuffers(1, &m->ebo);
+    if (m->inst_vbo) glDeleteBuffers(1, &m->inst_vbo);
     if (m->tex) glDeleteTextures(1, &m->tex);
     memset(m, 0, sizeof *m);
 }
@@ -1110,6 +1176,61 @@ void wcl_r3d_reset(void) {
     if (depth_test_on) { glDisable(GL_DEPTH_TEST); depth_test_on = 0; }
     if (cull_on) { glDisable(GL_CULL_FACE); cull_on = 0; }
     glDepthMask(1);
+}
+
+/* Upload per-instance matrices for this mesh.
+ *
+ * `data` is count*16 floats, column-major per matrix in the order GL wants a
+ * mat4 attribute: four consecutive vec4 columns. DYNAMIC_DRAW because an
+ * animated field rewrites this every frame; an unchanged one simply does not
+ * call again, and the buffer persists.
+ *
+ * Returns 0 on failure so the caller can fall back rather than draw wrong. */
+int wcl_r3d_mesh_set_instances(int handle, const float *data, int count) {
+    mesh3d_t *m = mesh_by_handle(handle);
+    if (!m || !wcl_r2d_active() || !data || count < 1) return 0;
+    wcl_r2d__flush_for_3d();
+    if (!m->inst_vbo) glGenBuffers(1, &m->inst_vbo);
+    if (!m->inst_vbo) return 0;
+
+    /* TRANSPOSE ON UPLOAD.
+     *
+     * Callers store matrices ROW-major, because Shader:send transposes for
+     * them on the way to a uniform. A vertex ATTRIBUTE gets no such
+     * courtesy: the four vec4 columns are consumed exactly as written. So
+     * the transpose that send() used to do has to happen here, or every
+     * instance draws with its transform transposed -- which for a
+     * translation puts the whole field in the wrong place while still
+     * rendering plausibly, the kind of wrong that reads as a camera bug. */
+    static float *staging = NULL;
+    static int staging_cap = 0;
+    if (count > staging_cap) {
+        float *grown = (float *)realloc(staging, (size_t)count * 16 * sizeof(float));
+        if (!grown) return 0;
+        staging = grown;
+        staging_cap = count;
+    }
+    for (int i = 0; i < count; i++) {
+        const float *src = data + (size_t)i * 16;
+        float *dst = staging + (size_t)i * 16;
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++)
+                dst[c * 4 + r] = src[r * 4 + c];
+    }
+
+    glBindBuffer(GL_ARRAY_BUFFER, m->inst_vbo);
+    const GLsizeiptr bytes = (GLsizeiptr)((size_t)count * 16 * sizeof(float));
+    if (count > m->inst_cap) {
+        glBufferData(GL_ARRAY_BUFFER, bytes, staging, GL_DYNAMIC_DRAW);
+        m->inst_cap = count;
+    } else {
+        glBufferSubData(GL_ARRAY_BUFFER, 0, bytes, staging);
+    }
+    m->inst_count = count;
+    /* The layout now differs from whatever is bound (this mesh may have had
+     * no instance buffer at all), so force a re-specify on the next draw. */
+    if (attribs_bound_mesh == m) attribs_bound_mesh = NULL;
+    return 1;
 }
 
 /* ── the draw ─────────────────────────────────────────────────────── */
