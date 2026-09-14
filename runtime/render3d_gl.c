@@ -958,15 +958,53 @@ int wcl_r3d_limit(int which) {
 
 /* ── depth and cull state ─────────────────────────────────────────── */
 
+/* The depth/cull state GL actually holds.
+ *
+ * The enable/disable pair was already tracked, but the func, mask, cull face
+ * and winding were re-issued on EVERY draw. A scene of 2000 separate meshes
+ * therefore spent 8000 GL calls a frame re-setting values that had not
+ * changed since the first draw.
+ *
+ * -1 means "unknown", forcing the first call after a state reset. */
+static GLenum gl_depth_func_set = 0;
+static int    gl_depth_mask_set = -1;
+static GLenum gl_cull_face_set  = 0;
+static int    gl_front_face_cw_set = -1;
+
+/* Called when something outside this file disturbs the depth/cull state, so
+ * the tracking cannot go stale and skip a call that is genuinely needed. */
+void wcl_r3d__forget_depth_cull_state(void) {
+    gl_depth_func_set = 0;
+    gl_depth_mask_set = -1;
+    gl_cull_face_set = 0;
+    gl_front_face_cw_set = -1;
+}
+
 static void apply_depth(void) {
     int want = depth_compare != 0;
     if (want != depth_test_on) {
         if (want) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
         depth_test_on = want;
     }
-    if (want) glDepthFunc((GLenum)depth_compare);
+    if (want && (GLenum)depth_compare != gl_depth_func_set) {
+        glDepthFunc((GLenum)depth_compare);
+        gl_depth_func_set = (GLenum)depth_compare;
+    }
     /* The write mask applies even with the test disabled, which is how
-     * LOVE's setDepthMode("always", true) depth-prepass idiom works. */
+     * LOVE's setDepthMode("always", true) depth-prepass idiom works.
+     *
+     * DELIBERATELY NOT CACHED, unlike the func, cull face and winding above.
+     *
+     * Caching it broke rendering: three.lua's static instanced scenes went
+     * from pixel-identical against real three.js to 404 differing pixels.
+     * Something changes the mask outside this file's knowledge -- the
+     * frame-start depth clear is the likely path -- and the invalidation
+     * hooks added for the 2D renderer did not cover it.
+     *
+     * One call per draw is a real cost, but a wrong depth mask silently
+     * corrupts the image, and the other four cached values already remove
+     * most of the per-draw state traffic. Cache this only with a test that
+     * proves the invalidation is complete. */
     glDepthMask((GLboolean)(depth_write ? 1 : 0));
 }
 
@@ -976,8 +1014,18 @@ static void apply_cull(void) {
         if (want) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
         cull_on = want;
     }
-    if (want) glCullFace(cull_mode == 1 ? GL_BACK : GL_FRONT);
-    glFrontFace(front_face_cw ? GL_CW : GL_CCW);
+    if (want) {
+        GLenum face = (cull_mode == 1) ? GL_BACK : GL_FRONT;
+        if (face != gl_cull_face_set) {
+            glCullFace(face);
+            gl_cull_face_set = face;
+        }
+    }
+    int cw = front_face_cw ? 1 : 0;
+    if (cw != gl_front_face_cw_set) {
+        glFrontFace(cw ? GL_CW : GL_CCW);
+        gl_front_face_cw_set = cw;
+    }
 }
 
 void wcl_r3d_depth_mode(uint32_t compare, int write) {

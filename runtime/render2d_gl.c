@@ -187,6 +187,11 @@ typedef struct {
     uniform_slot_t ucache[MAX_UNIFORM_CACHE];
     int ucount;
 } shader_t;
+/* render3d_gl.c caches the depth/cull state it has set, to avoid re-issuing
+ * it per draw. This file changes glDepthMask directly in a few places, so it
+ * has to say so or that cache goes stale and skips a call that is needed. */
+void wcl_r3d__forget_depth_cull_state(void);
+
 static shader_t shaders[MAX_SHADERS];
 static int active_shader = -1;   /* -1 = the engine's default program */
 
@@ -2943,6 +2948,7 @@ void wcl_r2d_clear(uint32_t color, int alpha) {
     glDepthMask(1);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     if (!dwrite) glDepthMask(0);
+    wcl_r3d__forget_depth_cull_state();
 }
 
 void wcl_r2d_forget(const void *key) {
@@ -3102,6 +3108,7 @@ int wcl_r2d_stencil_begin(int action, int value) {
     if (had_scissor) glEnable(GL_SCISSOR_TEST);
     glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
     glDepthMask(GL_FALSE);
+    wcl_r3d__forget_depth_cull_state();
     glStencilFunc(GL_ALWAYS, value, 0xFF);
     glStencilMask(0xFF);
 
@@ -3126,6 +3133,7 @@ void wcl_r2d_stencil_end(void) {
     flush_batches();
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_TRUE);
+    wcl_r3d__forget_depth_cull_state();
     glStencilMask(0x00);
     if (!stencil_test_on) glDisable(GL_STENCIL_TEST);
 }
