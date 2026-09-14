@@ -2008,6 +2008,20 @@ function FloatBuffer:set(offset, ...)
   return wc.fbuffer_set(self.id, offset, ...)
 end
 
+--- Compose position / Euler rotation / scale into instance `index` (0-based),
+--- in the row-major mat4 layout a uniform upload wants.
+---
+--- The whole point is that the Euler-to-quaternion and the compose both
+--- happen in C: doing them in Lua was measured at 0.63ms a frame for 2000
+--- instances, against 0.008ms for the renderer that consumed the result.
+---
+--- `order` is 0..5 for XYZ, YXZ, ZXY, ZYX, YZX, XZY, matching three.js's
+--- naming and defaulting to XYZ.
+function FloatBuffer:composeTRS(index, px, py, pz, ex, ey, ez, sx, sy, sz, order)
+  return wc.fbuffer_compose_trs(self.id, index,
+    px, py, pz, ex, ey, ez, sx, sy, sz, order or 0)
+end
+
 function FloatBuffer:get(offset, count)
   return wc.fbuffer_get(self.id, offset, count or 1)
 end

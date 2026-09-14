@@ -2151,6 +2151,92 @@ static int l_fbuffer_get(lua_State *S) {
     return n;
 }
 
+/* fbuffer_compose_trs(id, index, px,py,pz, ex,ey,ez, sx,sy,sz [, order])
+ *
+ * Compose one instance's position / Euler rotation / scale straight into the
+ * buffer, in the row-major layout a mat4 uniform upload wants.
+ *
+ * WHY THIS IS IN C. Profiling three.lua's instanced path found that with
+ * 2000 moving instances, HALF the frame was Lua, and nearly all of that was
+ * two calls per instance: building a quaternion from Euler angles (0.364ms)
+ * and composing it into the instance buffer (0.269ms). The renderer itself
+ * was 0.008ms. That is fixed arithmetic over N items with no branching and
+ * no allocation, which is exactly what an interpreter is worst at and C is
+ * best at.
+ *
+ * The Euler order is three.js's default XYZ unless `order` says otherwise,
+ * encoded 0..5 as XYZ, YXZ, ZXY, ZYX, YZX, XZY -- the same order the Lua
+ * Euler class lists them in, so the two cannot drift apart silently.
+ *
+ * Returns false rather than clamping on a bad index: silently writing the
+ * wrong instance would draw a plausible, wrong picture. */
+static int l_fbuffer_compose_trs(lua_State *S) {
+    int id  = ARGI(1);
+    int idx = ARGI(2);
+    if (id < 0 || id >= MAX_FBUFS || !fbufs[id].used) {
+        lua_pushboolean(S, 0); return 1;
+    }
+    int off = idx * 16;
+    if (idx < 0 || off + 16 > fbufs[id].len) { lua_pushboolean(S, 0); return 1; }
+
+    double px = lua_tonumber(S, 3), py = lua_tonumber(S, 4), pz = lua_tonumber(S, 5);
+    double ex = lua_tonumber(S, 6), ey = lua_tonumber(S, 7), ez = lua_tonumber(S, 8);
+    double sx = lua_tonumber(S, 9), sy = lua_tonumber(S, 10), sz = lua_tonumber(S, 11);
+    int order = lua_isnumber(S, 12) ? (int)lua_tointeger(S, 12) : 0;
+
+    /* Euler -> quaternion, half-angle form, matching Quaternion:setFromEuler. */
+    double c1 = cos(ex * 0.5), s1 = sin(ex * 0.5);
+    double c2 = cos(ey * 0.5), s2 = sin(ey * 0.5);
+    double c3 = cos(ez * 0.5), s3 = sin(ez * 0.5);
+    double qx, qy, qz, qw;
+    switch (order) {
+    case 1: /* YXZ */
+        qx = s1*c2*c3 + c1*s2*s3; qy = c1*s2*c3 - s1*c2*s3;
+        qz = c1*c2*s3 - s1*s2*c3; qw = c1*c2*c3 + s1*s2*s3; break;
+    case 2: /* ZXY */
+        qx = s1*c2*c3 - c1*s2*s3; qy = c1*s2*c3 + s1*c2*s3;
+        qz = c1*c2*s3 + s1*s2*c3; qw = c1*c2*c3 - s1*s2*s3; break;
+    case 3: /* ZYX */
+        qx = s1*c2*c3 - c1*s2*s3; qy = c1*s2*c3 + s1*c2*s3;
+        qz = c1*c2*s3 - s1*s2*c3; qw = c1*c2*c3 + s1*s2*s3; break;
+    case 4: /* YZX */
+        qx = s1*c2*c3 + c1*s2*s3; qy = c1*s2*c3 + s1*c2*s3;
+        qz = c1*c2*s3 - s1*s2*c3; qw = c1*c2*c3 - s1*s2*s3; break;
+    case 5: /* XZY */
+        qx = s1*c2*c3 - c1*s2*s3; qy = c1*s2*c3 - s1*c2*s3;
+        qz = c1*c2*s3 + s1*s2*c3; qw = c1*c2*c3 + s1*s2*s3; break;
+    default: /* XYZ */
+        qx = s1*c2*c3 + c1*s2*s3; qy = c1*s2*c3 - s1*c2*s3;
+        qz = c1*c2*s3 + s1*s2*c3; qw = c1*c2*c3 - s1*s2*s3; break;
+    }
+
+    double x2 = qx+qx, y2 = qy+qy, z2 = qz+qz;
+    double xx = qx*x2, xy = qx*y2, xz = qx*z2;
+    double yy = qy*y2, yz = qy*z2, zz = qz*z2;
+    double wx = qw*x2, wy = qw*y2, wz = qw*z2;
+
+    float *d = fbufs[id].data + off;
+    /* ROW-major: send() transposes on upload, and the rest of three.lua
+     * assumes this layout. Writing column-major here would draw nothing with
+     * no GL error, which is the failure mode this project has paid for. */
+    d[0]  = (float)((1.0 - (yy + zz)) * sx);
+    d[1]  = (float)((xy - wz) * sy);
+    d[2]  = (float)((xz + wy) * sz);
+    d[3]  = (float)px;
+    d[4]  = (float)((xy + wz) * sx);
+    d[5]  = (float)((1.0 - (xx + zz)) * sy);
+    d[6]  = (float)((yz - wx) * sz);
+    d[7]  = (float)py;
+    d[8]  = (float)((xz - wy) * sx);
+    d[9]  = (float)((yz + wx) * sy);
+    d[10] = (float)((1.0 - (xx + yy)) * sz);
+    d[11] = (float)pz;
+    d[12] = 0.0f; d[13] = 0.0f; d[14] = 0.0f; d[15] = 1.0f;
+
+    lua_pushboolean(S, 1);
+    return 1;
+}
+
 /* shader_send_fbuffer(handle, name, id, offset, count) -- the zero-read
  * upload: the floats are already in C, so this is a bounds check and a GL
  * call with no Lua traversal whatsoever. */
@@ -3101,6 +3187,7 @@ static const luaL_Reg wc_lib[] = {
     {"fbuffer_new", l_fbuffer_new},
     {"fbuffer_free", l_fbuffer_free},
     {"fbuffer_set", l_fbuffer_set},
+    {"fbuffer_compose_trs", l_fbuffer_compose_trs},
     {"fbuffer_get", l_fbuffer_get},
     {"shader_send_fbuffer", l_shader_send_fbuffer},
     {"shader_send_image", l_shader_send_image},
