@@ -2237,6 +2237,92 @@ static int l_fbuffer_compose_trs(lua_State *S) {
     return 1;
 }
 
+/* fbuffer_compose_trs_batch(id, first, count, src)
+ *   src = a flat Lua array of count*9 numbers: px,py,pz, ex,ey,ez, sx,sy,sz
+ *
+ * Compose MANY instances in one call.
+ *
+ * fbuffer_compose_trs already moved the arithmetic into C, but it is called
+ * once per instance, and an 11-argument Lua->C crossing is not free: measured
+ * at roughly 0.18ms per 2000 calls, independent of what the function does.
+ * For a 2000-instance scene that crossing was a large share of what remained.
+ *
+ * Reading the inputs from one flat array costs 9 lua_rawgeti per instance
+ * instead of 11 stack arguments plus a call, and there is exactly one
+ * crossing for the whole batch.
+ *
+ * The Euler order applies to every instance in the batch, which is what a
+ * renderer wants: three.js's order is a per-object property but in practice
+ * a scene uses one. A cart with mixed orders calls this once per group. */
+static int l_fbuffer_compose_trs_batch(lua_State *S) {
+    int id    = ARGI(1);
+    int first = ARGI(2);
+    int count = ARGI(3);
+    if (id < 0 || id >= MAX_FBUFS || !fbufs[id].used || !lua_istable(S, 4)) {
+        lua_pushboolean(S, 0); return 1;
+    }
+    if (first < 0 || count <= 0) { lua_pushboolean(S, 0); return 1; }
+    if ((first + count) * 16 > fbufs[id].len) { lua_pushboolean(S, 0); return 1; }
+    if ((int)lua_rawlen(S, 4) < count * 9) { lua_pushboolean(S, 0); return 1; }
+
+    int order = lua_isnumber(S, 5) ? (int)lua_tointeger(S, 5) : 0;
+    float *base = fbufs[id].data + first * 16;
+
+    for (int k = 0; k < count; k++) {
+        int o = k * 9;
+        double v[9];
+        for (int j = 0; j < 9; j++) {
+            lua_rawgeti(S, 4, o + j + 1);
+            v[j] = lua_tonumber(S, -1);
+            lua_pop(S, 1);
+        }
+        double px = v[0], py = v[1], pz = v[2];
+        double ex = v[3], ey = v[4], ez = v[5];
+        double sx = v[6], sy = v[7], sz = v[8];
+
+        double c1 = cos(ex * 0.5), s1 = sin(ex * 0.5);
+        double c2 = cos(ey * 0.5), s2 = sin(ey * 0.5);
+        double c3 = cos(ez * 0.5), s3 = sin(ez * 0.5);
+        double qx, qy, qz, qw;
+        switch (order) {
+        case 1: qx = s1*c2*c3 + c1*s2*s3; qy = c1*s2*c3 - s1*c2*s3;
+                qz = c1*c2*s3 - s1*s2*c3; qw = c1*c2*c3 + s1*s2*s3; break;
+        case 2: qx = s1*c2*c3 - c1*s2*s3; qy = c1*s2*c3 + s1*c2*s3;
+                qz = c1*c2*s3 + s1*s2*c3; qw = c1*c2*c3 - s1*s2*s3; break;
+        case 3: qx = s1*c2*c3 - c1*s2*s3; qy = c1*s2*c3 + s1*c2*s3;
+                qz = c1*c2*s3 - s1*s2*c3; qw = c1*c2*c3 + s1*s2*s3; break;
+        case 4: qx = s1*c2*c3 + c1*s2*s3; qy = c1*s2*c3 + s1*c2*s3;
+                qz = c1*c2*s3 - s1*s2*c3; qw = c1*c2*c3 - s1*s2*s3; break;
+        case 5: qx = s1*c2*c3 - c1*s2*s3; qy = c1*s2*c3 - s1*c2*s3;
+                qz = c1*c2*s3 + s1*s2*c3; qw = c1*c2*c3 + s1*s2*s3; break;
+        default: qx = s1*c2*c3 + c1*s2*s3; qy = c1*s2*c3 - s1*c2*s3;
+                 qz = c1*c2*s3 + s1*s2*c3; qw = c1*c2*c3 - s1*s2*s3; break;
+        }
+
+        double x2 = qx+qx, y2 = qy+qy, z2 = qz+qz;
+        double xx = qx*x2, xy = qx*y2, xz = qx*z2;
+        double yy = qy*y2, yz = qy*z2, zz = qz*z2;
+        double wx = qw*x2, wy = qw*y2, wz = qw*z2;
+
+        float *d = base + k * 16;
+        d[0]  = (float)((1.0 - (yy + zz)) * sx);
+        d[1]  = (float)((xy - wz) * sy);
+        d[2]  = (float)((xz + wy) * sz);
+        d[3]  = (float)px;
+        d[4]  = (float)((xy + wz) * sx);
+        d[5]  = (float)((1.0 - (xx + zz)) * sy);
+        d[6]  = (float)((yz - wx) * sz);
+        d[7]  = (float)py;
+        d[8]  = (float)((xz - wy) * sx);
+        d[9]  = (float)((yz + wx) * sy);
+        d[10] = (float)((1.0 - (xx + yy)) * sz);
+        d[11] = (float)pz;
+        d[12] = 0.0f; d[13] = 0.0f; d[14] = 0.0f; d[15] = 1.0f;
+    }
+    lua_pushboolean(S, 1);
+    return 1;
+}
+
 /* mat4_compose_mul(px,py,pz, qx,qy,qz,qw, sx,sy,sz, [parent16...])
  *   -> 16 numbers: the LOCAL matrix, and optionally parent * local.
  *
@@ -3249,6 +3335,7 @@ static const luaL_Reg wc_lib[] = {
     {"fbuffer_free", l_fbuffer_free},
     {"fbuffer_set", l_fbuffer_set},
     {"fbuffer_compose_trs", l_fbuffer_compose_trs},
+    {"fbuffer_compose_trs_batch", l_fbuffer_compose_trs_batch},
     {"mat4_compose_mul", l_mat4_compose_mul},
     {"fbuffer_get", l_fbuffer_get},
     {"shader_send_fbuffer", l_shader_send_fbuffer},

@@ -2017,6 +2017,16 @@ end
 ---
 --- `order` is 0..5 for XYZ, YXZ, ZXY, ZYX, YZX, XZY, matching three.js's
 --- naming and defaulting to XYZ.
+--- Compose `count` instances starting at `first` (0-based) from one flat
+--- array of count*9 numbers: px,py,pz, ex,ey,ez, sx,sy,sz per instance.
+---
+--- One Lua->C crossing for the whole batch. The per-instance form below is
+--- convenient but an 11-argument crossing costs about 0.18ms per 2000 calls
+--- on its own, before the function does anything.
+function FloatBuffer:composeTRSBatch(first, count, src, order)
+  return wc.fbuffer_compose_trs_batch(self.id, first, count, src, order or 0)
+end
+
 function FloatBuffer:composeTRS(index, px, py, pz, ex, ey, ez, sx, sy, sz, order)
   return wc.fbuffer_compose_trs(self.id, index,
     px, py, pz, ex, ey, ez, sx, sy, sz, order or 0)
