@@ -162,13 +162,58 @@ static void flush_batches(void);
  * draws anything. Each slot is a handle and a few ints; the programs
  * themselves live in the driver either way. */
 #define MAX_SHADERS 64
+
+/* Uniform locations, cached per shader.
+ *
+ * glGetUniformLocation is a STRING LOOKUP in the driver and its answer never
+ * changes for the life of a linked program, yet Shader:send called it on
+ * every send. A three.lua scene drawing four instanced batches was issuing 45
+ * of them per frame for uniforms whose locations were fixed at link time.
+ *
+ * Small and linear on purpose: a shader has a handful of uniforms, a linear
+ * scan over a few short strings beats a hash, and the miss path (one
+ * glGetUniformLocation, once) is the same cost it used to pay every time. */
+#define MAX_UNIFORM_CACHE 32
+#define UNIFORM_NAME_MAX 48
+typedef struct {
+    char  name[UNIFORM_NAME_MAX];
+    GLint loc;
+} uniform_slot_t;
+
 typedef struct {
     GLuint program;
     GLint tex_uniform, textured_uniform;
     int used;
+    uniform_slot_t ucache[MAX_UNIFORM_CACHE];
+    int ucount;
 } shader_t;
 static shader_t shaders[MAX_SHADERS];
 static int active_shader = -1;   /* -1 = the engine's default program */
+
+/* The program GL currently has bound, so a redundant glUseProgram is free.
+ *
+ * Shader:send has to make its target program current to write a uniform, and
+ * then put back whatever was current before. That was two unconditional
+ * glUseProgram calls PER SEND: a three.lua scene drawing four instanced
+ * batches issued 96 of them a frame, for four draws.
+ *
+ * Almost all of those pairs are redundant -- the renderer sends several
+ * uniforms to the same program in a row, and often to the program that is
+ * already bound. Tracking what is bound turns each into a comparison.
+ *
+ * 0 is not a valid program name in GL, so it is a safe "unknown" that forces
+ * the first bind. */
+static GLuint bound_program = 0;
+
+/* Called by any code that binds a program WITHOUT going through use_program,
+ * so the tracked value cannot go stale. render3d_gl.c's sampler path does
+ * exactly that: a stale value there would skip a needed bind and write the
+ * uniform into whatever program happened to be current. */
+static void use_program(GLuint p) {
+    if (p == bound_program) return;
+    glUseProgram(p);
+    bound_program = p;
+}
 static int blend_enabled = -1;
 static int textured_enabled = -1;
 static GLuint bound_texture;
@@ -1327,6 +1372,10 @@ int wcl_r2d_shader_new(const char *pixel_src, const char *vertex_src, int is_3d,
     shader_t *sh = &shaders[slot];
     sh->program = prog;
     sh->used = 1;
+    /* A reused slot must NOT inherit the previous program's cached uniform
+     * locations: they would be wrong for the new program and would silently
+     * write to whatever happens to live there. */
+    sh->ucount = 0;
     sh->tex_uniform = glGetUniformLocation(prog, "u_tex");
     sh->textured_uniform = glGetUniformLocation(prog, "u_textured");
     for (int i = 0; i < SHADER_TEX_UNITS; i++) shader_samplers[slot][i].used = 0;
@@ -1334,11 +1383,11 @@ int wcl_r2d_shader_new(const char *pixel_src, const char *vertex_src, int is_3d,
     /* Seed the program's own uniform state. Uniform values belong to the
      * PROGRAM, so this cannot wait for the first draw under the shared
      * set_textured cache -- that cache tracks whichever program is current. */
-    glUseProgram(prog);
+    use_program(prog);
     if (sh->tex_uniform >= 0) glUniform1i(sh->tex_uniform, 0);
     GLint screen = glGetUniformLocation(prog, "love_ScreenSize");
     if (screen >= 0) glUniform2f(screen, (float)width, (float)height);
-    glUseProgram(active_shader >= 0 ? shaders[active_shader].program : program);
+    use_program(active_shader >= 0 ? shaders[active_shader].program : program);
     return slot;
 }
 
@@ -1357,7 +1406,7 @@ void wcl_r2d_shader_use(int handle) {
     flush_batches();
     active_shader = handle;
     shader_t *sh = shader_by_handle(handle);
-    glUseProgram(sh ? sh->program : program);
+    use_program(sh ? sh->program : program);
     /* u_textured lives in the program object, so the cached value from the
      * program we just left says nothing about this one. */
     textured_enabled = -1;
@@ -1411,11 +1460,36 @@ static GLint shader_uniform(int handle, const char *name, shader_t **out) {
     shader_t *sh = shader_by_handle(handle);
     if (!sh) return -1;
     *out = sh;
-    return glGetUniformLocation(sh->program, name);
+
+    for (int i = 0; i < sh->ucount; i++) {
+        if (strcmp(sh->ucache[i].name, name) == 0) return sh->ucache[i].loc;
+    }
+
+    GLint loc = glGetUniformLocation(sh->program, name);
+
+    /* A MISS is cached too, including a -1 "no such uniform".
+     *
+     * Caching only hits would leave the common case of a shader that does not
+     * declare an optional uniform paying the driver lookup forever, which is
+     * exactly the case a renderer hits most (it sends what it has; the shader
+     * uses what it needs). The cache fills once and then answers everything.
+     *
+     * An overfull cache degrades to the old behaviour rather than evicting:
+     * a wrong location would draw silently wrong, and no cache is merely
+     * slow. */
+    if (sh->ucount < MAX_UNIFORM_CACHE &&
+        strlen(name) < UNIFORM_NAME_MAX) {
+        uniform_slot_t *slot = &sh->ucache[sh->ucount++];
+        snprintf(slot->name, UNIFORM_NAME_MAX, "%s", name);
+        slot->loc = loc;
+    }
+    return loc;
 }
 
+void wcl_r2d__program_changed_externally(unsigned int p) { bound_program = (GLuint)p; }
+
 static void shader_restore_program(void) {
-    glUseProgram(active_shader >= 0 ? shaders[active_shader].program : program);
+    use_program(active_shader >= 0 ? shaders[active_shader].program : program);
 }
 
 int wcl_r2d_shader_has_uniform(int handle, const char *name) {
@@ -1427,7 +1501,7 @@ int wcl_r2d_shader_send_float(int handle, const char *name, const float *v, int 
     shader_t *sh = NULL;
     GLint loc = shader_uniform(handle, name, &sh);
     if (!sh || loc < 0) return 0;
-    glUseProgram(sh->program);
+    use_program(sh->program);
     switch (n) {
         case 1: glUniform1f(loc, v[0]); break;
         case 2: glUniform2f(loc, v[0], v[1]); break;
@@ -1481,7 +1555,7 @@ int wcl_r2d_shader_send_float(int handle, const char *name, const float *v, int 
                 glUniformMatrix4fv(loc, n / 16, 1, v);
                 break;
             }
-            glUseProgram(program); shader_restore_program(); return 0;
+            use_program(program); shader_restore_program(); return 0;
     }
     shader_restore_program();
     return 1;
@@ -1491,7 +1565,7 @@ int wcl_r2d_shader_send_int(int handle, const char *name, const int *v, int n) {
     shader_t *sh = NULL;
     GLint loc = shader_uniform(handle, name, &sh);
     if (!sh || loc < 0) return 0;
-    glUseProgram(sh->program);
+    use_program(sh->program);
     switch (n) {
         case 1: glUniform1i(loc, v[0]); break;
         case 2: glUniform2i(loc, v[0], v[1]); break;
@@ -1588,7 +1662,7 @@ int wcl_r2d_shader_send_image(int handle, const char *name,
 
 
     flush_batches();   /* a pending batch was queued with the old binding */
-    glUseProgram(sh->program);
+    use_program(sh->program);
     glUniform1i(loc, s->unit);
     glActiveTexture((GLenum)(GL_TEXTURE0 + s->unit));
     glBindTexture(GL_TEXTURE_2D, tex);
@@ -1770,7 +1844,7 @@ int wcl_r2d_init(int w, int h) {
     glAttachShader(program, fs);
     bind_attribs_and_link(program);
     log_obj(program, "gl2d program link failed", 0);
-    glUseProgram(program);
+    use_program(program);
 
     /* Pinned by bind_attribs_and_link, so these are the same indices every
      * cart shader gets and the one shared VAO stays valid across programs. */
@@ -1913,7 +1987,7 @@ void wcl_r2d_end(const uint32_t *fb) {
         bound_texture = 0;
         textured_enabled = -1;
         blend_enabled = -1;
-        glUseProgram(active_shader >= 0 ? shaders[active_shader].program : program);
+        use_program(active_shader >= 0 ? shaders[active_shader].program : program);
     }
     wcl_r2d_stats = frame_stats;
 }

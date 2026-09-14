@@ -34,6 +34,10 @@
 
 /* The seam into render2d_gl.c. Not in a header: nothing else may call it. */
 extern void   wcl_r2d__flush_for_3d(void);
+/* The 2D side tracks which GL program is bound so it can skip redundant
+ * glUseProgram calls. This file binds one directly below, so it has to say
+ * so or that tracking goes stale and a later send skips a bind it needed. */
+extern void   wcl_r2d__program_changed_externally(unsigned int p);
 extern GLuint wcl_r2d__active_program(void);
 extern void   wcl_r2d__rebind_2d_state(void);
 extern void   wcl_r2d__rebind_samplers(void);
@@ -799,6 +803,10 @@ int wcl_r3d_target_send(int shader_handle, const char *name, int target, int uni
 
     wcl_r2d__flush_for_3d();
     glUseProgram(prog);
+    /* Tell the 2D side, which tracks the bound program to skip redundant
+     * binds. Without this its cache would still name the previous program and
+     * the next send would skip a bind it actually needed. */
+    wcl_r2d__program_changed_externally(prog);
     glUniform1i(loc, u);
     glActiveTexture((GLenum)(GL_TEXTURE0 + u));
     glBindTexture(tt, t->tex);

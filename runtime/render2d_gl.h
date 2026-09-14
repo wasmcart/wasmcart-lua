@@ -232,6 +232,10 @@ int  wcl_r2d_glyph(const unsigned char *atlas, int aw, int ah,
                    int sx, int sy, int srcw, int srch,
                    uint32_t color, int alpha);
 
+/* Tell the 2D renderer that something else bound a GL program, so its
+ * redundant-bind tracking cannot go stale. */
+void wcl_r2d__program_changed_externally(unsigned int p);
+
 #else
 
 static inline int wcl_r2d_init(int width, int height) {
@@ -316,6 +320,8 @@ static inline int wcl_r2d_mesh(const float *v, int c, const void *p, int tw, int
                                uint32_t tint, int a) {
     (void)v; (void)c; (void)p; (void)tw; (void)th; (void)tint; (void)a; return 0;
 }
+
+static inline void wcl_r2d__program_changed_externally(unsigned int p) { (void)p; }
 
 #endif /* WCL_ENABLE_GL2D */
 #endif /* WCL_RENDER2D_GL_H */
