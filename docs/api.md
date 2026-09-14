@@ -229,15 +229,26 @@ and a `main()` are synthesized by the engine, so the shader applies to
 | `Shader:hasUniform(name)` | |
 
 `send` accepts numbers, a table of 1-4 numbers (a vector), a 4x4
-table-of-tables (a `mat4`), booleans, and an `Image` or `Canvas` for a
-`sampler2D`:
+table-of-tables (a `mat4`), a LIST of those (a `mat4[N]`), booleans, and an
+`Image` or `Canvas` for a `sampler2D`:
 
 ```lua
 s:send("u_time", t)                    -- float
 s:send("u_tint", { 0.2, 1.0, 0.4 })    -- vec3
 s:send("u_on", true)                   -- bool
 s:send("u_lut", myCanvas)              -- sampler2D
+s:send("u_bones", { m1, m2, m3 })      -- mat4[3], one upload
 ```
+
+The `mat4[N]` form exists for **instanced rendering**, where per-instance
+data has to reach the shader as a uniform array indexed by `gl_InstanceID`
+(there are no per-instance vertex attributes). Sending the elements
+individually as `"u_bones[0]"`, `"u_bones[1]"`, ... also works, but costs a
+call and a uniform lookup per element: for a 600-instance cart that was the
+difference between 1.39ms and 0.82ms a frame. Up to 256 matrices per call.
+
+Note the shapes are told apart by nesting depth, so a list of ONE matrix is
+`{ m }` and not `m`.
 
 Predefined for you, matching LÖVE: `Image`, `Texel(tex, uv)`,
 `love_ScreenSize`, `VaryingColor`, `number`, and `extern` as an alias for
@@ -556,7 +567,9 @@ Two compatibility layers make that possible and are worth knowing about:
   draw from one pool of 15 per shader, so they can never collide.
 - **Instancing carries no per-instance attributes.** Pass per-instance data
   as a uniform array indexed by `gl_InstanceID`, which is what LÖVE's own
-  `drawInstanced` gives you.
+  `drawInstanced` gives you. `Shader:send` takes a whole `mat4[N]` in one
+  call (see [Shaders](#shaders)); sending elements one at a time works too
+  but costs a uniform lookup each.
 - **Limits:** 32 GPU targets, 64 shaders, 8 render targets per pass (query
   `getSystemLimits().multicanvas`).
 

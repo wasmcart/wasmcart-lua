@@ -1461,7 +1461,27 @@ int wcl_r2d_shader_send_float(int handle, const char *name, const float *v, int 
 #endif
             glUniformMatrix4fv(loc, 1, 1, v);
             break;
-        default: glUseProgram(program); shader_restore_program(); return 0;
+        default:
+            /* A mat4 ARRAY: any exact multiple of 16 uploads that many
+             * matrices in ONE call. This is what instanced rendering needs.
+             *
+             * Without it, per-instance data has to go up one element at a
+             * time as "name[3]", which costs an FFI call plus a
+             * glGetUniformLocation per instance per frame. Measured with a
+             * 600-instance cart: 600 separate sends dominated the frame at
+             * 1.39ms, against 0.96ms with nothing moving. One array upload
+             * replaces all of them.
+             *
+             * TRANSPOSE stays TRUE for the same reason as the single-matrix
+             * case above: LOVE hands over row-major and GL reads
+             * column-major. Uploading an array untransposed fails exactly
+             * the way one matrix does, silently and with no GL error, which
+             * is why it is spelled out rather than left to the reader. */
+            if (n > 16 && (n % 16) == 0) {
+                glUniformMatrix4fv(loc, n / 16, 1, v);
+                break;
+            }
+            glUseProgram(program); shader_restore_program(); return 0;
     }
     shader_restore_program();
     return 1;

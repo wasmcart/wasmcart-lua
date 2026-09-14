@@ -1867,8 +1867,54 @@ static int l_shader_send(lua_State *S) {
          * is accepted, which is the one LOVE shaders actually send. */
         lua_rawgeti(S, 3, 1);
         int nested = lua_istable(S, -1);
+        /* An ARRAY OF MATRICES is nested one level deeper: t[1][1] is itself
+         * a table (a row) rather than a number. Distinguishing them here is
+         * what lets a caller send 64 instance matrices in one call instead
+         * of 64. */
+        int nested2 = 0;
+        if (nested) {
+            lua_rawgeti(S, -1, 1);
+            nested2 = lua_istable(S, -1);
+            lua_pop(S, 1);
+        }
         lua_pop(S, 1);
         int len = (int)lua_rawlen(S, 3);
+
+        /* mat4[N]: a table of N tables of 4 rows of 4. Flattened row-major
+         * and uploaded in a single glUniformMatrix4fv, which is the whole
+         * point -- the per-element "name[i]" path costs an FFI call and a
+         * glGetUniformLocation per matrix per frame.
+         *
+         * Bounded by a fixed buffer rather than allocating: a cart deciding
+         * how much scratch this function mallocs is not a knob worth
+         * offering, and 256 matrices is past what any uniform array on this
+         * target can hold anyway. */
+        if (nested2) {
+            enum { MAX_MAT4 = 256 };
+            if (len < 1 || len > MAX_MAT4) { lua_pushboolean(S, 0); return 1; }
+            static float ms[MAX_MAT4 * 16];
+            for (int k = 0; k < len; k++) {
+                lua_rawgeti(S, 3, k + 1);
+                if (!lua_istable(S, -1) || (int)lua_rawlen(S, -1) != 4) {
+                    lua_pop(S, 1);
+                    lua_pushboolean(S, 0);
+                    return 1;
+                }
+                for (int r = 0; r < 4; r++) {
+                    lua_rawgeti(S, -1, r + 1);
+                    for (int c = 0; c < 4; c++) {
+                        lua_rawgeti(S, -1, c + 1);
+                        ms[k * 16 + r * 4 + c] = (float)lua_tonumber(S, -1);
+                        lua_pop(S, 1);
+                    }
+                    lua_pop(S, 1);
+                }
+                lua_pop(S, 1);
+            }
+            lua_pushboolean(S, wcl_r2d_shader_send_float(h, name, ms, len * 16));
+            return 1;
+        }
+
         if (nested) {
             if (len != 4) {
                 lua_pushboolean(S, 0);
