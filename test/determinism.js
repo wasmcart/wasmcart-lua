@@ -109,7 +109,10 @@ async function frameHash(appDir, seed, frames) {
   const RIGHT = 1 << 11, LEFT = 1 << 10, A = 1 << 0;
   for (let i = 0; i < frames; i++) {
     const btn = (i % 40 < 20 ? RIGHT : LEFT) | (i % 30 === 0 ? A : 0);
-    new DataView(mem.buffer).setUint16(inputPtr, btn, true);
+    // setUint32, not setUint16: wc_pad_t.buttons is a u32 as of ABI v4, and a
+    // 16-bit store leaves the high half of the field at whatever was there
+    // before, so the bits above SELECT are both unwritable and unreliable.
+    new DataView(mem.buffer).setUint32(inputPtr, btn, true);
     e.wc_render();
   }
   return crypto.createHash('sha256')

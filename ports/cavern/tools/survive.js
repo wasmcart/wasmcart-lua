@@ -67,7 +67,7 @@ end
 
     let btn=0,mx=640,my=400,click=false;
     const tick=(n=1)=>{for(let i=0;i<n;i++){const d=D();
-      d.setUint16(inputPtr,btn,true);
+      d.setUint32(inputPtr,btn,true);   // buttons is u32 as of ABI v4
       d.setInt16(ptrPtr,mx,true);d.setInt16(ptrPtr+2,my,true);
       d.setUint8(ptrPtr+4,click?1:0);d.setUint8(ptrPtr+5,1);
       e.wc_render();}};
