@@ -1839,6 +1839,10 @@ static void flush_solid_batch(void) {
 
 static void flush_textured_batch(void) {
     if (!textured_batch_count) return;
+    /* Same reclaim as flush_solid_batch. Without it a sprite drawn right
+     * after a 3D mesh uploads into the 2D buffer but draws through the 3D
+     * VAO, whose attributes point at another buffer and layout. */
+    wcl_r3d__restore_for_2d();
     set_blend(1);
     glBindBuffer(GL_ARRAY_BUFFER, buffer);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(vertex_t) * textured_batch_count),
@@ -2002,6 +2006,11 @@ static uint32_t blit_rgba[WCL_MAX_PIXELS];
 void wcl_r2d_end(const uint32_t *fb) {
     if (wcl_r2d_active()) {
         flush_batches();
+        /* Never end a frame in 3D state. Before the restore was deferred, the
+         * last 3D draw always put the 2D VAO back; a frame whose final draw is
+         * 3D would otherwise hand the next frame (and anything the host does
+         * between frames) depth test, culling and the 3D VAO. */
+        wcl_r3d__restore_for_2d();
         /* leave the screen bound for the next frame */
         if (current_target) wcl_r2d_target(NULL, 0, 0);
     } else if (ready && frame_disabled && fb) {
@@ -2507,6 +2516,7 @@ int wcl_r2d_poly(const double *xs, const double *ys, int n,
         v[vc].r = r; v[vc].g = g; v[vc].b = b; v[vc].a = a;
         vc++;
     }
+    wcl_r3d__restore_for_2d();   /* draws outside the batch: reclaim here too */
     set_blend(alpha < 255);
     glBindBuffer(GL_ARRAY_BUFFER, buffer);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(vertex_t) * vc), v, GL_DYNAMIC_DRAW);
@@ -2520,6 +2530,7 @@ int wcl_r2d_poly(const double *xs, const double *ys, int n,
 int wcl_r2d_line(int x0, int y0, int x1, int y1, uint32_t color, int alpha) {
     if (!wcl_r2d_active()) return 0;
     flush_batches();
+    wcl_r3d__restore_for_2d();   /* draws outside the batch: reclaim here too */
     set_blend(1);
     vertex_t v[2];
     /* +0.5 puts the endpoints at pixel centres. GL_LINES is half-open -- the
@@ -2816,6 +2827,7 @@ int wcl_r2d_mesh(const float *verts, int count,
         for (int i = 0; i < count; i++)
             if (verts[i * 8 + 7] < 1.0f) { opaque = 0; break; }
     }
+    wcl_r3d__restore_for_2d();   /* draws outside the batch: reclaim here too */
     set_blend(!opaque);
     if (mode) bind_texture(tex);
     set_textured(mode);
