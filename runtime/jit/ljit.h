@@ -34,10 +34,15 @@ LUAI_DDEC(int luaJ_threshold);
 /* compiled-code frames currently on the wasm stack (bounded: they are not
    counted by nCcalls, and the host's stack is finite) */
 LUAI_DDEC(int luaJ_depth);
+/* 0 once the host turned out not to link: the interpreter then skips every
+   JIT check with a single test */
+LUAI_DDEC(int luaJ_on);
 
 /* true when compiled code may be entered at 'pc' (compiling when hot) */
 #define luaJ_ready(L,p,pc) \
-	(!(L)->hookmask && ((p)->jitslot > 0 || luaJ_hot(L, p, pc)))
+	(luaJ_on && !(L)->hookmask && ((p)->jitslot > 0 || \
+	  ((((p)->jitslot == LUAJ_COLD && (pc) == (p)->code) || \
+	    (p)->jitslot == LUAJ_PENDING) && luaJ_hot(L, p, pc))))
 
 LUAI_FUNC int luaJ_hot (lua_State *L, Proto *p, const Instruction *pc);
 LUAI_FUNC int luaJ_enter (lua_State *L, CallInfo *ci, const Instruction *pc);

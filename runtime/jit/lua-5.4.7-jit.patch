@@ -119,7 +119,7 @@
 +** any 'updatetrap', which would overwrite the local 'trap'.
 +*/
 +#define jitbackedge()	{ Proto *jp_ = cl->p; \
-+  if (jp_->jitslot >= 0 && !L->hookmask && \
++  if (luaJ_on && jp_->jitslot >= 0 && !L->hookmask && \
 +      (jp_->jitslot > 0 || ++jp_->jitcount > luaJ_threshold)) trap = 1; }
 +
  #define vmdispatch(o)	switch(o)

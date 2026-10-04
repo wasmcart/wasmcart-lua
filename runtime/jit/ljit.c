@@ -70,6 +70,7 @@ static int wc_jit_config (int key) { (void)key; return -1; }
 
 int luaJ_threshold = LUAJ_DEFAULT_THRESHOLD;
 int luaJ_depth = 0;
+int luaJ_on = 1;
 
 static int jit_state = 0;  /* 0 = not initialized, 1 = on, -1 = off */
 static int jit_userthreshold = -1;  /* threshold set from Lua, if any */
@@ -148,7 +149,7 @@ static int cell_alloc (Proto *p) {
 static void jit_init (void) {
   int v;
   jit_state = 1;
-  if (wc_jit_config(1) == 1) jit_state = -1;
+  if (wc_jit_config(1) == 1) jit_state = -1, luaJ_on = 0;
   v = wc_jit_config(0);
   if (v >= 0 && jit_userthreshold < 0) luaJ_threshold = v;
   v = wc_jit_config(2);
@@ -2736,7 +2737,7 @@ static void compile (lua_State *L, Proto *p) {
     jst.failed++;
     jst.lasterr = "host refused the module";
     if (jst.compiled == 0 && jst.pending == 0)
-      jit_state = -1;  /* the host does not link: stop trying */
+      jit_state = -1, luaJ_on = 0;  /* the host does not link: stop trying */
   }
 }
 
