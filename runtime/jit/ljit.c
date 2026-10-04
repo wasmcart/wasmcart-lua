@@ -61,6 +61,8 @@ static int wc_jit_config (int key) { (void)key; return -1; }
 /* functions larger than this are left to the interpreter */
 #define MAXJITCODE	12000
 #define MAXJITBLOCKS	4000
+/* direct compiled-to-compiled calls nest at most this deep on the wasm stack */
+#define MAXJITDEPTH	100
 
 int luaJ_threshold = LUAJ_DEFAULT_THRESHOLD;
 
@@ -327,15 +329,23 @@ JIT_EXPORT int luaJ_h_rawequal (TValue *a, TValue *b) {
   return luaV_rawequalobj(a, b);
 }
 
-/* OP_CALL: returns 1 when a Lua call was set up (L->ci is the callee) */
+/*
+** OP_CALL. Returns 0 when a C function ran to completion; otherwise a Lua
+** call was set up (L->ci is the callee) and the result is the callee's
+** compiled slot, for a direct call, or 1 when the interpreter must run it.
+*/
 JIT_EXPORT int luaJ_h_call (lua_State *L, CallInfo *ci, int a, int b,
                             int nresults) {
   StkId ra = hbase(ci) + a;
-  (void)ci;
+  CallInfo *nci;
+  int slot;
   if (b != 0)  /* fixed number of arguments? */
     L->top.p = ra + b;  /* top signals number of arguments */
   /* else previous instruction set top */
-  return luaD_precall(L, ra, nresults) != NULL;
+  nci = luaD_precall(L, ra, nresults);
+  if (nci == NULL) return 0;
+  slot = ci_func(nci)->p->jitslot;
+  return (slot > 1 && !L->hookmask) ? slot : 1;
 }
 
 /* OP_TAILCALL: returns LUAJ_CALL or LUAJ_RETURN */
@@ -568,6 +578,7 @@ static void bsection (Buf *M, int id, Buf *S) {
 #define W_BRTABLE	0x0e
 #define W_RETURN	0x0f
 #define W_CALL		0x10
+#define W_CALLINDIRECT	0x11
 #define W_DROP		0x1a
 #define W_SELECT	0x1b
 #define W_LGET		0x20
@@ -695,9 +706,10 @@ static const struct { const char *name; const char *sig; } helpers[H__N] = {
 #define LV_L	0
 #define LV_CI	1
 #define LV_PC	2
-#define LV_BASE	3
-#define LV_CL	4
-#define LV_T0	5	/* i32 temps T0..T5 */
+#define LV_DEPTH	3	/* nesting of direct compiled-to-compiled calls */
+#define LV_BASE	4
+#define LV_CL	5
+#define LV_T0	6	/* i32 temps T0..T5 */
 #define NI32TMP	6
 #define LV_X0	(LV_T0 + NI32TMP)	/* i64 temps X0..X3 */
 #define NI64TMP	4
@@ -716,6 +728,7 @@ static const struct { const char *name; const char *sig; } helpers[H__N] = {
 
 typedef struct J {
   Buf c;  /* function body */
+  lua_State *L;
   Proto *p;
   int n;  /* number of instructions */
   int *blk;  /* block index of a leader pc, -1 elsewhere */
@@ -1068,22 +1081,74 @@ static void e_bitwise (J *j, int op, int a, NOp b, NOp c) {
 }
 
 /*
-** Table read with a constant short-string key: hash lookup through the
-** helper, copy on a hit, the full interpreter path otherwise.
+** Inline luaH_getshortstr: find short string 'key' in the Table* held in
+** local 'tloc'. On a hit with a non-empty value the node (its value is a
+** TValue at offset 0) is left in local 'sloc' and control falls through;
+** otherwise it branches 'missdepth' levels out, counted from the level
+** where this is emitted. Same walk as ltable.c: main position, then 'next'.
+*/
+static void e_hfind (J *j, int tloc, TString *key, int sloc, int missdepth) {
+  int nx = LV_T0 + 4;
+  e_lget(j, tloc); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(Table, node));
+  e_i32(j, (int32_t)key->hash);
+  e_i32(j, 1);
+  e_lget(j, tloc); e_mem(j, W_I32LOAD8U, 0, (uint32_t)offsetof(Table, lsizenode));
+  E(j, W_I32SHL); e_i32(j, 1); E(j, W_I32SUB);
+  E(j, W_I32AND);
+  e_i32(j, (int32_t)sizeof(Node)); E(j, W_I32MUL);
+  E(j, W_I32ADD);
+  e_lset(j, sloc);
+  e_block(j);  /* found */
+  E(j, W_LOOP); E(j, T_VOID); j->extra++;
+  e_block(j);  /* next */
+  e_lget(j, sloc); e_mem(j, W_I32LOAD8U, 0, (uint32_t)offsetof(Node, u.key_tt));
+  e_i32(j, TAG_SSTR); E(j, W_I32NE); e_brif(j, 0);
+  e_lget(j, sloc); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(Node, u.key_val));
+  e_i32(j, (int32_t)(uintptr_t)key); E(j, W_I32NE); e_brif(j, 0);
+  /* the key is here: an empty value is a miss */
+  e_lget(j, sloc); e_mem(j, W_I32LOAD8U, 0, TTOFF);
+  e_i32(j, 0x0f); E(j, W_I32AND); E(j, W_I32EQZ); e_brif(j, missdepth + 3);
+  e_br(j, 2);
+  e_end(j);
+  e_lget(j, sloc); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(Node, u.next));
+  e_ltee(j, nx);
+  E(j, W_I32EQZ); e_brif(j, missdepth + 2);
+  e_lget(j, sloc); e_lget(j, nx); e_i32(j, (int32_t)sizeof(Node)); E(j, W_I32MUL);
+  E(j, W_I32ADD); e_lset(j, sloc);
+  e_br(j, 0);
+  e_end(j);  /* loop */
+  e_end(j);  /* found */
+}
+
+/*
+** Table read with a constant short-string key: inline lookup in the table,
+** then (on a miss) in its metatable's __index when that is a table, which is
+** the method lookup of an object; anything else takes the full interpreter
+** path in a helper.
 */
 static void e_getstr (J *j, int pc, Ad t, const TValue *key, int a) {
+  TString *k = tsvalue(key);
   e_block(j);  /* done */
   e_block(j);  /* slow */
-  e_ldtag(j, t); e_i32(j, TAG_TAB); E(j, W_I32NE); e_brif(j, 0);
-  e_ldptr(j, t);
-  e_i32(j, (int32_t)(uintptr_t)tsvalue(key));
-  e_call(j, H_GETSHORTSTR);
-  e_ltee(j, LV_T0 + 1);
-  e_mem(j, W_I32LOAD8U, 0, TTOFF);
-  e_i32(j, 0x0f); E(j, W_I32AND); E(j, W_I32EQZ); e_brif(j, 0);
+  e_block(j);  /* miss */
+  e_ldtag(j, t); e_i32(j, TAG_TAB); E(j, W_I32NE); e_brif(j, 1);
+  e_ldptr(j, t); e_lset(j, LV_T0 + 2);
+  e_hfind(j, LV_T0 + 2, k, LV_T0 + 1, 0);
+  e_copy(j, R(a), LA(LV_T0 + 1));
+  e_br(j, 2);
+  e_end(j);  /* miss: try metatable.__index as a plain table */
+  e_lget(j, LV_T0 + 2); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(Table, metatable));
+  e_ltee(j, LV_T0 + 3); E(j, W_I32EQZ); e_brif(j, 0);
+  e_lget(j, LV_T0 + 3); e_mem(j, W_I32LOAD8U, 0, (uint32_t)offsetof(Table, flags));
+  e_i32(j, 1u << TM_INDEX); E(j, W_I32AND); e_brif(j, 0);  /* cached: no __index */
+  e_hfind(j, LV_T0 + 3, G(j->L)->tmname[TM_INDEX], LV_T0 + 1, 0);
+  e_lget(j, LV_T0 + 1); e_mem(j, W_I32LOAD8U, 0, TTOFF);
+  e_i32(j, TAG_TAB); E(j, W_I32NE); e_brif(j, 0);
+  e_lget(j, LV_T0 + 1); e_mem(j, W_I32LOAD, 2, 0); e_lset(j, LV_T0 + 2);
+  e_hfind(j, LV_T0 + 2, k, LV_T0 + 1, 0);
   e_copy(j, R(a), LA(LV_T0 + 1));
   e_br(j, 1);
-  e_end(j);
+  e_end(j);  /* slow */
   e_savepc(j, pc + 1);
   e_lget(j, LV_L); e_lget(j, LV_CI); e_ptr(j, t); e_ptr(j, KA(key)); e_ptr(j, R(a));
   e_call(j, H_GET);
@@ -1091,18 +1156,13 @@ static void e_getstr (J *j, int pc, Ad t, const TValue *key, int a) {
   e_end(j);
 }
 
-/* table write with a constant short-string key */
+/* table write with a constant short-string key (existing key: raw store) */
 static void e_setstr (J *j, int pc, Ad t, const TValue *key, Ad v) {
   e_block(j);  /* done */
   e_block(j);  /* slow */
   e_ldtag(j, t); e_i32(j, TAG_TAB); E(j, W_I32NE); e_brif(j, 0);
-  e_ldptr(j, t);
-  e_ltee(j, LV_T0 + 2);
-  e_i32(j, (int32_t)(uintptr_t)tsvalue(key));
-  e_call(j, H_GETSHORTSTR);
-  e_ltee(j, LV_T0 + 1);
-  e_mem(j, W_I32LOAD8U, 0, TTOFF);
-  e_i32(j, 0x0f); E(j, W_I32AND); E(j, W_I32EQZ); e_brif(j, 0);
+  e_ldptr(j, t); e_lset(j, LV_T0 + 2);
+  e_hfind(j, LV_T0 + 2, tsvalue(key), LV_T0 + 1, 0);
   e_copy(j, LA(LV_T0 + 1), v);
   /* luaC_barrierback when storing a collectable value */
   e_ldtag(j, v); e_i32(j, BIT_ISCOLLECTABLE); E(j, W_I32AND);
@@ -1440,8 +1500,8 @@ static void e_instr (J *j, int pc) {
       e_end(j);
       break;
     case OP_GETTABUP:
-      e_upval(j, GETARG_B(i), LV_T0 + 3, -1);
-      e_getstr(j, pc, LA(LV_T0 + 3), p->k + GETARG_C(i), a);
+      e_upval(j, GETARG_B(i), LV_T0, -1);
+      e_getstr(j, pc, LA(LV_T0), p->k + GETARG_C(i), a);
       break;
     case OP_GETTABLE:
       e_getint(j, pc, R(GETARG_B(i)), GETARG_C(i), 0, a);
@@ -1453,8 +1513,8 @@ static void e_instr (J *j, int pc) {
       e_getstr(j, pc, R(GETARG_B(i)), p->k + GETARG_C(i), a);
       break;
     case OP_SETTABUP:
-      e_upval(j, a, LV_T0 + 3, -1);
-      e_setstr(j, pc, LA(LV_T0 + 3), p->k + GETARG_B(i), rkc(j, i));
+      e_upval(j, a, LV_T0, -1);
+      e_setstr(j, pc, LA(LV_T0), p->k + GETARG_B(i), rkc(j, i));
       break;
     case OP_SETTABLE:
       e_setint(j, pc, R(a), GETARG_B(i), 0, rkc(j, i));
@@ -1704,8 +1764,23 @@ static void e_instr (J *j, int pc) {
       e_lget(j, LV_L); e_lget(j, LV_CI); e_i32(j, a); e_i32(j, GETARG_B(i));
       e_i32(j, GETARG_C(i) - 1);
       e_call(j, H_CALL);
-      e_if(j);
-      e_return(j, LUAJ_CALL);
+      e_ltee(j, LV_T0);
+      e_if(j);  /* a Lua function was called */
+      /* not compiled, or nested too deep: the interpreter runs it */
+      e_lget(j, LV_T0); e_i32(j, 1); E(j, W_I32EQ);
+      e_lget(j, LV_DEPTH); e_i32(j, MAXJITDEPTH); E(j, W_I32GEU);
+      E(j, W_I32OR);
+      e_if(j); e_return(j, LUAJ_CALL); e_end(j);
+      /* direct call of the callee's compiled code */
+      e_lget(j, LV_L);
+      e_lget(j, LV_L); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(lua_State, ci));
+      e_i32(j, 0);
+      e_lget(j, LV_DEPTH); e_i32(j, 1); E(j, W_I32ADD);
+      e_lget(j, LV_T0);
+      E(j, W_CALLINDIRECT); bu(&j->c, 0); bu(&j->c, 0);
+      /* anything but a finished return: the interpreter takes over L->ci */
+      e_i32(j, LUAJ_RETURN); E(j, W_I32NE);
+      e_if(j); e_return(j, LUAJ_CALL); e_end(j);
       e_end(j);
       e_reloadbase(j);
       e_hookcheck(j, pc + 1);
@@ -1826,13 +1901,14 @@ static void e_instr (J *j, int pc) {
 }
 
 /* emit the whole module for 'p' into 'M'; returns 1 on success */
-static int emit_module (Proto *p, Buf *M, const char **err) {
+static int emit_module (lua_State *L, Proto *p, Buf *M, const char **err) {
   J j;
   Buf S, F;
   int pc, h;
   memset(&j, 0, sizeof(j));
   memset(&S, 0, sizeof(S));
   memset(&F, 0, sizeof(F));
+  j.L = L;
   j.p = p;
   j.n = p->sizecode;
   j.skipdepth = -1;
@@ -1891,7 +1967,7 @@ static int emit_module (Proto *p, Buf *M, const char **err) {
   /* types: 0 = the compiled function, 1 + h = helper h */
   S.n = 0;
   bu(&S, 1 + H__N);
-  b1(&S, 0x60); bu(&S, 3); b1(&S, T_I32); b1(&S, T_I32); b1(&S, T_I32);
+  b1(&S, 0x60); bu(&S, 4); b1(&S, T_I32); b1(&S, T_I32); b1(&S, T_I32); b1(&S, T_I32);
   bu(&S, 1); b1(&S, T_I32);
   for (h = 0; h < H__N; h++) {
     const char *s = helpers[h].sig;
@@ -1909,13 +1985,15 @@ static int emit_module (Proto *p, Buf *M, const char **err) {
   bsection(M, 1, &S);
   /* imports: helpers, then memory */
   S.n = 0;
-  bu(&S, H__N + 1);
+  bu(&S, H__N + 2);
   for (h = 0; h < H__N; h++) {
     bname(&S, "cart"); bname(&S, helpers[h].name);
     b1(&S, 0x00); bu(&S, 1 + h);
   }
   bname(&S, "cart"); bname(&S, "memory");
   b1(&S, 0x02); b1(&S, 0x00); bu(&S, 0);
+  bname(&S, "cart"); bname(&S, "__indirect_function_table");
+  b1(&S, 0x01); b1(&S, 0x70); b1(&S, 0x00); bu(&S, 0);
   bsection(M, 2, &S);
   /* function section */
   S.n = 0;
@@ -1950,7 +2028,7 @@ static int emit_module (Proto *p, Buf *M, const char **err) {
 ** 5. Compile / enter / trap
 ** =================================================================== */
 
-typedef int (*JitFn) (lua_State *L, CallInfo *ci, int pc);
+typedef int (*JitFn) (lua_State *L, CallInfo *ci, int pc, int depth);
 
 static void compile (lua_State *L, Proto *p) {
   Buf M;
@@ -1958,7 +2036,7 @@ static void compile (lua_State *L, Proto *p) {
   int cell, r;
   (void)L;
   memset(&M, 0, sizeof(M));
-  if (!emit_module(p, &M, &err)) {
+  if (!emit_module(L, p, &M, &err)) {
     p->jitslot = LUAJ_FAILED;
     jst.rejected++;
     jst.lasterr = err;
@@ -2019,7 +2097,7 @@ int luaJ_hot (lua_State *L, Proto *p, const Instruction *pc) {
 
 int luaJ_enter (lua_State *L, CallInfo *ci, const Instruction *pc) {
   Proto *p = ci_func(ci)->p;
-  int r = ((JitFn)(uintptr_t)p->jitslot)(L, ci, (int)(pc - p->code));
+  int r = ((JitFn)(uintptr_t)p->jitslot)(L, ci, (int)(pc - p->code), 0);
   if (r == LUAJ_BAIL) jst.bails++;
   return r;
 }
@@ -2128,7 +2206,7 @@ static int jl_dump (lua_State *L) {
   Buf M;
   const char *err = NULL;
   memset(&M, 0, sizeof(M));
-  if (!emit_module(p, &M, &err)) {
+  if (!emit_module(L, p, &M, &err)) {
     free(M.b);
     luaL_pushfail(L);
     lua_pushstring(L, err ? err : "?");
