@@ -15,6 +15,7 @@
 #include "lprefix.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,6 +91,7 @@ typedef struct JitInfo {
   int genslot;  /* generic code */
   int specslot;  /* specialized code, 0 if none */
   int state;  /* SPEC_* */
+  int respecs;  /* times the specialized code was rebuilt after bailing */
   int cell;  /* asynchronous specialized compile, or -1 */
 } JitInfo;
 
@@ -102,8 +104,10 @@ typedef struct JitInfo {
    (a power of two; the host may lower it, wc_jit_config key 2) */
 #define SPEC_EVERY	1024
 static uint32_t jit_specevery = SPEC_EVERY;
-/* specialized code falls back to generic after this many bails */
+/* specialized code falls back to generic after this many bails, and is
+   rebuilt (from the feedback the bails added) at most SPEC_MAXRESPECS times */
 #define SPEC_MAXBAILS	64
+#define SPEC_MAXRESPECS	3
 
 static int jit_spec = 1;  /* specialization enabled (wc.jit.spec) */
 
@@ -739,7 +743,7 @@ static const struct { const char *name; const char *sig; } helpers[H__N] = {
   {"luaJ_h_close", "iii:"},
   {"luaJ_h_tbc", "iii:"},
   {"luaJ_h_upgrade", "ii:i"},
-  {"luaJ_h_specbail", "ii:"},
+  {"luaJ_h_specbail", "iii:"},
 };
 
 /* locals of the generated function */
@@ -1003,7 +1007,7 @@ static void sp_kill (J *j, int r) {
 /* guard failed at 'pc': store the cache, count, interpret from 'pc' */
 static void sp_bailcode (J *j, int pc) {
   sp_flushcode(j);
-  e_lget(j, LV_L); e_lget(j, LV_CI); e_call(j, H_SPECBAIL);
+  e_lget(j, LV_L); e_lget(j, LV_CI); e_i32(j, pc); e_call(j, H_SPECBAIL);
   e_bail(j, pc);
 }
 
@@ -1843,6 +1847,67 @@ static void sp_killwritten (J *j, Instruction i) {
 
 static void e_instr_generic (J *j, int pc);
 
+/*
+** OP_CALL with a fixed argument count whose callee is a compiled Lua function
+** taking exactly those arguments and no varargs, with a CallInfo and stack
+** room ready: luaD_precall's work inline, then a direct call. Anything else
+** branches to the generic sequence that follows (inside the 'after' block).
+*/
+static void e_inlinecall (J *j, Instruction i) {
+  int a = GETARG_A(i), b = GETARG_B(i);
+  int tcl = LV_T0 + 1, tp = LV_T0 + 2, tslot = LV_T0 + 3, tnci = LV_T0 + 4;
+  e_block(j);  /* generic */
+  e_lget(j, LV_L); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(lua_State, hookmask));
+  e_lget(j, LV_DEPTH); e_i32(j, MAXJITDEPTH); E(j, W_I32GEU);
+  E(j, W_I32OR); e_brif(j, 0);
+  e_ldtag(j, R(a)); e_i32(j, ctb(LUA_VLCL)); E(j, W_I32NE); e_brif(j, 0);
+  e_ldptr(j, R(a)); e_ltee(j, tcl);
+  e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(LClosure, p)); e_lset(j, tp);
+  e_lget(j, tp); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(Proto, jitslot)); e_ltee(j, tslot);
+  e_i32(j, 1); E(j, 0x4c /* i32.le_s */); e_brif(j, 0);
+  e_lget(j, tp); e_mem(j, W_I32LOAD8U, 0, (uint32_t)offsetof(Proto, is_vararg)); e_brif(j, 0);
+  e_lget(j, tp); e_mem(j, W_I32LOAD8U, 0, (uint32_t)offsetof(Proto, numparams));
+  e_i32(j, b - 1); E(j, W_I32NE); e_brif(j, 0);
+  /* stack room: stack_last - top > maxstacksize (in slots) */
+  e_lget(j, LV_L); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(lua_State, stack_last));
+  e_lget(j, LV_BASE); e_i32(j, (int32_t)((a + b) * SV)); E(j, W_I32ADD);
+  E(j, W_I32SUB);
+  e_lget(j, tp); e_mem(j, W_I32LOAD8U, 0, (uint32_t)offsetof(Proto, maxstacksize));
+  e_i32(j, 4); E(j, W_I32SHL);  /* * sizeof(StackValue) */
+  E(j, 0x4c /* i32.le_s */); e_brif(j, 0);
+  /* the next CallInfo must already exist */
+  e_lget(j, LV_CI); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(CallInfo, next));
+  e_ltee(j, tnci); E(j, W_I32EQZ); e_brif(j, 0);
+  /* L->top = ra + b */
+  e_lget(j, LV_L); e_lget(j, LV_BASE); e_i32(j, (int32_t)((a + b) * SV)); E(j, W_I32ADD);
+  e_mem(j, W_I32STORE, 2, (uint32_t)offsetof(lua_State, top));
+  /* prepCallInfo + savedpc */
+  e_lget(j, tnci); e_lget(j, LV_BASE); e_i32(j, (int32_t)(a * SV)); E(j, W_I32ADD);
+  e_mem(j, W_I32STORE, 2, (uint32_t)offsetof(CallInfo, func));
+  e_lget(j, tnci); e_i32(j, GETARG_C(i) - 1);
+  E(j, 0x3b /* i32.store16 */); bu(&j->c, 1); bu(&j->c, (uint32_t)offsetof(CallInfo, nresults));
+  e_lget(j, tnci); e_i32(j, 0);
+  E(j, 0x3b); bu(&j->c, 1); bu(&j->c, (uint32_t)offsetof(CallInfo, callstatus));
+  e_lget(j, tnci);
+  e_lget(j, LV_BASE); e_i32(j, (int32_t)((a + 1) * SV)); E(j, W_I32ADD);
+  e_lget(j, tp); e_mem(j, W_I32LOAD8U, 0, (uint32_t)offsetof(Proto, maxstacksize));
+  e_i32(j, 4); E(j, W_I32SHL); E(j, W_I32ADD);
+  e_mem(j, W_I32STORE, 2, (uint32_t)offsetof(CallInfo, top));
+  e_lget(j, tnci);
+  e_lget(j, tp); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(Proto, code));
+  e_mem(j, W_I32STORE, 2, (uint32_t)offsetof(CallInfo, u.l.savedpc));
+  e_lget(j, LV_L); e_lget(j, tnci); e_mem(j, W_I32STORE, 2, (uint32_t)offsetof(lua_State, ci));
+  /* direct call */
+  e_lget(j, LV_L); e_lget(j, tnci); e_i32(j, 0);
+  e_lget(j, LV_DEPTH); e_i32(j, 1); E(j, W_I32ADD);
+  e_lget(j, tslot);
+  E(j, W_CALLINDIRECT); bu(&j->c, 0); bu(&j->c, 0);
+  e_i32(j, LUAJ_RETURN); E(j, W_I32NE);
+  e_if(j); e_return(j, LUAJ_CALL); e_end(j);
+  e_br(j, 1);  /* after */
+  e_end(j);  /* generic */
+}
+
 static void e_instr (J *j, int pc) {
   Instruction i = j->p->code[pc];
   if (!j->spec) { e_instr_generic(j, pc); return; }
@@ -2168,6 +2233,8 @@ static void e_instr_generic (J *j, int pc) {
     }
     case OP_CALL:
       e_savepc(j, pc + 1);
+      e_block(j);  /* after */
+      if (GETARG_B(i) != 0) e_inlinecall(j, i);
       e_lget(j, LV_L); e_lget(j, LV_CI); e_i32(j, a); e_i32(j, GETARG_B(i));
       e_i32(j, GETARG_C(i) - 1);
       e_call(j, H_CALL);
@@ -2189,6 +2256,7 @@ static void e_instr_generic (J *j, int pc) {
       e_i32(j, LUAJ_RETURN); E(j, W_I32NE);
       e_if(j); e_return(j, LUAJ_CALL); e_end(j);
       e_end(j);
+      e_end(j);  /* after */
       e_reloadbase(j);
       e_hookcheck(j, pc + 1);
       break;
@@ -2208,14 +2276,35 @@ static void e_instr_generic (J *j, int pc) {
       e_return(j, LUAJ_RETURN);
       j->dead = 1;
       break;
-    case OP_RETURN0: case OP_RETURN1:
+    case OP_RETURN0: case OP_RETURN1: {
+      /* the common case inline: exactly as many results as the caller
+         wants (1 for RETURN1, 0 for RETURN0); the rest in the helper */
+      int want = GET_OPCODE(i) == OP_RETURN1 ? 1 : 0;
       e_hookcheck(j, pc);  /* hooks: let the interpreter return */
+      e_lget(j, LV_CI); E(j, 0x2e); bu(&j->c, 1); bu(&j->c, (uint32_t)offsetof(CallInfo, nresults));  /* i32.load16_s */
+      e_i32(j, want); E(j, W_I32EQ);
+      e_if(j);
+      if (want) {  /* base - 1 (the function's slot) := R[A] */
+        e_lget(j, LV_BASE); e_i32(j, -(int32_t)SV); E(j, W_I32ADD); e_lset(j, LV_T0 + 1);
+        e_copy(j, LA(LV_T0 + 1), R(a));
+      }
+      /* L->top = base - 1 + want */
+      e_lget(j, LV_L);
+      e_lget(j, LV_BASE); e_i32(j, (int32_t)SV * (want - 1)); E(j, W_I32ADD);
+      e_mem(j, W_I32STORE, 2, (uint32_t)offsetof(lua_State, top));
+      /* L->ci = ci->previous */
+      e_lget(j, LV_L);
+      e_lget(j, LV_CI); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(CallInfo, previous));
+      e_mem(j, W_I32STORE, 2, (uint32_t)offsetof(lua_State, ci));
+      e_return(j, LUAJ_RETURN);
+      e_end(j);
       e_lget(j, LV_L); e_lget(j, LV_CI);
-      if (GET_OPCODE(i) == OP_RETURN1) { e_i32(j, a); e_call(j, H_RETURN1); }
+      if (want) { e_i32(j, a); e_call(j, H_RETURN1); }
       else e_call(j, H_RETURN0);
       e_return(j, LUAJ_RETURN);
       j->dead = 1;
       break;
+    }
     case OP_FORLOOP: {
       int target = pc + 1 - GETARG_Bx(i);
       e_ldtag(j, R(a + 2)); e_i32(j, TAG_INT); E(j, W_I32EQ);
@@ -2428,6 +2517,20 @@ static int emit_module (lua_State *L, Proto *p, Buf *M, const char **err,
   bu(&S, j.c.n);
   bmem(&S, j.c.b, j.c.n);
   bsection(M, 10, &S);
+  /* name section: profilers show "lua:<source>:<line>" for this code */
+  {
+    char nm[160];
+    Buf N;
+    memset(&N, 0, sizeof(N));
+    snprintf(nm, sizeof(nm), "lua%s:%s:%d", j.spec ? "+" : "",
+             p->source ? getstr(p->source) : "?", p->linedefined);
+    S.n = 0;
+    bname(&S, "name");
+    bu(&N, 1); bu(&N, H__N); bname(&N, nm);  /* function names */
+    b1(&S, 1); bu(&S, N.n); bmem(&S, N.b, N.n);
+    bsection(M, 0, &S);
+    free(N.b);
+  }
   free(S.b);
   free(j.c.b);
   free(j.blk);
@@ -2553,16 +2656,43 @@ JIT_EXPORT int luaJ_h_upgrade (lua_State *L, CallInfo *ci) {
   return 1;
 }
 
-/* a guard in specialized code failed: back to generic code if it keeps on */
-JIT_EXPORT void luaJ_h_specbail (lua_State *L, CallInfo *ci) {
+/*
+** A guard in specialized code failed at 'pc'. Record the operand types that
+** broke the guess (so a rebuild will not make it again); after too many
+** bails go back to the generic code, which keeps collecting types and asks
+** for a new specialized version, a bounded number of times.
+*/
+JIT_EXPORT void luaJ_h_specbail (lua_State *L, CallInfo *ci, int pc) {
   Proto *p = ci_func(ci)->p;
   JitInfo *info = (JitInfo *)p->jitinfo;
   (void)L;
   jst.specbails++;
-  if (info && info->state == SPEC_ON && ++info->bails > SPEC_MAXBAILS) {
-    info->state = SPEC_NEVER;
+  if (info == NULL) return;
+  if (pc >= 0 && pc < p->sizecode) {
+    Instruction i = p->code[pc];
+    StkId base = ci->func.p + 1;
+    int r1 = -1, r2 = -1;
+    switch (GET_OPCODE(i)) {
+      case OP_ADD: case OP_SUB: case OP_MUL: case OP_MOD: case OP_POW:
+      case OP_DIV: case OP_IDIV:
+        r1 = GETARG_B(i); r2 = GETARG_C(i); break;
+      case OP_ADDK: case OP_SUBK: case OP_MULK: case OP_MODK: case OP_POWK:
+      case OP_DIVK: case OP_IDIVK: case OP_ADDI: case OP_UNM:
+        r1 = GETARG_B(i); break;
+      case OP_EQ: case OP_LT: case OP_LE:
+        r1 = GETARG_A(i); r2 = GETARG_B(i); break;
+      case OP_EQK: case OP_EQI: case OP_LTI: case OP_LEI: case OP_GTI: case OP_GEI:
+        r1 = GETARG_A(i); break;
+      default: break;
+    }
+    if (r1 >= 0) info->fb[2 * pc] |= 1u << (rawtt(s2v(base + r1)) & 31);
+    if (r2 >= 0) info->fb[2 * pc + 1] |= 1u << (rawtt(s2v(base + r2)) & 31);
+  }
+  if (info->state == SPEC_ON && ++info->bails > SPEC_MAXBAILS) {
     p->jitslot = info->genslot;
     jst.despecialized++;
+    if (++info->respecs <= SPEC_MAXRESPECS) info->state = SPEC_NONE;
+    else info->state = SPEC_NEVER;
   }
 }
 
