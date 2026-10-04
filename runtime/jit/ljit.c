@@ -111,6 +111,11 @@ static uint32_t jit_specevery = SPEC_EVERY;
 
 static int jit_spec = 1;  /* specialization enabled (wc.jit.spec) */
 
+/* math library functions the specialized code computes inline */
+enum { INTR_SQRT, INTR_ABS, INTR_FLOOR, INTR_SIN, INTR_COS, INTR__N };
+static const char *const intr_names[INTR__N] = {"sqrt", "abs", "floor", "sin", "cos"};
+static int32_t intr_fn[INTR__N];  /* their function pointers (table indices) */
+
 /* asynchronous compiles report through these cells (see wc_jit_link) */
 #define NCELLS	1024
 static int jit_cells[NCELLS];
@@ -274,6 +279,9 @@ JIT_EXPORT lua_Number luaJ_h_fmod (lua_Number a, lua_Number b) {
 JIT_EXPORT lua_Number luaJ_h_pow (lua_Number a, lua_Number b) {
   return luai_numpow(NULL, a, b);
 }
+
+JIT_EXPORT lua_Number luaJ_h_sin (lua_Number x) { return l_mathop(sin)(x); }
+JIT_EXPORT lua_Number luaJ_h_cos (lua_Number x) { return l_mathop(cos)(x); }
 
 JIT_EXPORT lua_Integer luaJ_h_shiftl (lua_Integer x, lua_Integer y) {
   return luaV_shiftl(x, y);
@@ -695,7 +703,7 @@ typedef enum {
   H_BITOP, H_BITOPI, H_UNM, H_BNOT, H_LEN, H_CONCAT, H_EQ, H_LT, H_LE,
   H_ORDERI, H_RAWEQUAL, H_CALL, H_TAILCALL, H_RETURN, H_RETURN0, H_RETURN1,
   H_FORPREP, H_FLOATFORLOOP, H_TFORPREP, H_TFORCALL, H_NEWTABLE, H_SETLIST,
-  H_CLOSURE, H_VARARG, H_VARARGPREP, H_CLOSE, H_TBC, H_UPGRADE, H_SPECBAIL,
+  H_CLOSURE, H_VARARG, H_VARARGPREP, H_CLOSE, H_TBC, H_UPGRADE, H_SPECBAIL, H_SIN, H_COS,
   H__N
 } HelperId;
 
@@ -744,6 +752,8 @@ static const struct { const char *name; const char *sig; } helpers[H__N] = {
   {"luaJ_h_tbc", "iii:"},
   {"luaJ_h_upgrade", "ii:i"},
   {"luaJ_h_specbail", "iii:"},
+  {"luaJ_h_sin", "d:d"},
+  {"luaJ_h_cos", "d:d"},
 };
 
 /* locals of the generated function */
@@ -1045,6 +1055,42 @@ static void sp_def (J *j, int r, int kind) {
   e_lset(j, sp_local(j, r, kind));
   j->rk[r] = (unsigned char)kind;
   j->rd[r] = 1;
+}
+
+/* the math intrinsic the CALL at 'pc' always called (one arg, one result) */
+static int sp_intrinsic (J *j, int pc) {
+  Instruction i = j->p->code[pc];
+  uint32_t f;
+  int k;
+  if (j->info == NULL || GET_OPCODE(i) != OP_CALL || GETARG_B(i) != 2 || GETARG_C(i) != 2)
+    return -1;
+  f = j->info->fb[2 * pc];
+  if (f <= 1) return -1;
+  for (k = 0; k < INTR__N; k++)
+    if (intr_fn[k] != 0 && (uint32_t)intr_fn[k] == f) return k;
+  return -1;
+}
+
+/* generic code: which light C function a one-arg CALL calls (1 = varies) */
+static void e_fbcall (J *j, int pc, int a) {
+  uint32_t addr;
+  if (j->info == NULL || j->spec) return;
+  addr = (uint32_t)(uintptr_t)(j->info->fb + 2 * pc);
+  /* new = (tag == LCF) ? fn : 1; fb = old == 0 ? new : (old == new ? old : 1) */
+  e_ldtag(j, R(a)); e_i32(j, LUA_VLCF); E(j, W_I32EQ);
+  e_ift(j, T_I32); e_ldptr(j, R(a)); e_else(j); e_i32(j, 1); e_end(j);
+  e_lset(j, LV_T0 + 5);
+  e_i32(j, 0);
+  e_i32(j, 0); e_mem(j, W_I32LOAD, 2, addr); e_lset(j, LV_T0 + 4);
+  e_lget(j, LV_T0 + 4); E(j, W_I32EQZ);
+  e_ift(j, T_I32);
+  e_lget(j, LV_T0 + 5);
+  e_else(j);
+  e_lget(j, LV_T0 + 4); e_i32(j, 1); e_lget(j, LV_T0 + 4); e_lget(j, LV_T0 + 5); E(j, W_I32EQ);
+  E(j, W_SELECT);
+  e_end(j);
+  e_mem(j, W_I32STORE, 2, addr);
+  e_fb(j, pc, 1, R(a + 1));
 }
 
 /* }------------------------------------------------------------------ */
@@ -1597,7 +1643,9 @@ static int findleaders (J *j) {
       case OP_FORLOOP: MARK(pc + 1 - GETARG_Bx(i)); MARK(pc + 1); break;
       case OP_TFORPREP: MARK(pc + 1 + GETARG_Bx(i)); break;
       case OP_TFORLOOP: MARK(pc + 1 - GETARG_Bx(i)); MARK(pc + 1); break;
-      case OP_CALL: MARK(pc + 1); break;  /* resume point after a Lua call */
+      case OP_CALL:  /* resume point after a Lua call */
+        if (!(j->spec && sp_intrinsic(j, pc) >= 0)) MARK(pc + 1);
+        break;
       case OP_ADD: case OP_SUB: case OP_MUL: case OP_MOD: case OP_POW:
       case OP_DIV: case OP_IDIV: case OP_BAND: case OP_BOR: case OP_BXOR:
       case OP_SHL: case OP_SHR: case OP_ADDI: case OP_ADDK: case OP_SUBK:
@@ -1821,6 +1869,50 @@ static int sp_instr (J *j, int pc) {
     case OP_EQ: case OP_LT: case OP_LE: case OP_EQK: case OP_EQI:
     case OP_LTI: case OP_LEI: case OP_GTI: case OP_GEI:
       return sp_compare(j, pc, i);
+    case OP_CALL: {
+      int k = sp_intrinsic(j, pc), ka;
+      if (k < 0) return 0;
+      ka = sp_kindof(j, pc, 1, a + 1);
+      if (ka == RK_NONE) {  /* no type seen yet (or several): stays a guess */
+        e_bail(j, pc);  /* unreachable in practice; keeps the code valid */
+        return 1;
+      }
+      /* guard: R[A] is still that light C function */
+      e_ldtag(j, R(a)); e_i32(j, LUA_VLCF); E(j, W_I32NE);
+      e_ldptr(j, R(a)); e_i32(j, intr_fn[k]); E(j, W_I32NE);
+      E(j, W_I32OR);
+      e_if(j); sp_bailcode(j, pc); e_end(j);
+      sp_load(j, pc, a + 1, ka);
+      switch (k) {
+        case INTR_SQRT: sp_push(j, a + 1, RK_F); E(j, 0x9f /* f64.sqrt */); sp_def(j, a, RK_F); break;
+        case INTR_SIN: sp_push(j, a + 1, RK_F); e_call(j, H_SIN); sp_def(j, a, RK_F); break;
+        case INTR_COS: sp_push(j, a + 1, RK_F); e_call(j, H_COS); sp_def(j, a, RK_F); break;
+        case INTR_ABS:
+          if (ka == RK_F) { sp_push(j, a + 1, RK_F); E(j, 0x99 /* f64.abs */); sp_def(j, a, RK_F); }
+          else {  /* (n < 0) ? 0u - n : n, wrapping */
+            sp_push(j, a + 1, RK_I); e_lset(j, LV_X0);
+            e_i64(j, 0); e_lget(j, LV_X0); E(j, W_I64SUB);
+            e_lget(j, LV_X0);
+            e_lget(j, LV_X0); e_i64(j, 0); E(j, W_I64LTS);
+            E(j, W_SELECT);
+            sp_def(j, a, RK_I);
+          }
+          break;
+        case INTR_FLOOR:
+          if (ka == RK_I) { sp_push(j, a + 1, RK_I); sp_def(j, a, RK_I); }
+          else {  /* floor, then lua_numbertointeger: in range or bail */
+            sp_push(j, a + 1, RK_F); E(j, W_F64FLOOR); e_lset(j, LV_D0);
+            e_lget(j, LV_D0); e_f64(j, -9223372036854775808.0); E(j, W_F64GE);
+            e_lget(j, LV_D0); e_f64(j, 9223372036854775808.0); E(j, W_F64LT);
+            E(j, W_I32AND); E(j, W_I32EQZ);
+            e_if(j); sp_bailcode(j, pc); e_end(j);
+            e_lget(j, LV_D0); E(j, 0xb0 /* i64.trunc_f64_s */);
+            sp_def(j, a, RK_I);
+          }
+          break;
+      }
+      return 1;
+    }
     default:
       return 0;
   }
@@ -2232,6 +2324,7 @@ static void e_instr_generic (J *j, int pc) {
       break;
     }
     case OP_CALL:
+      if (GETARG_B(i) == 2 && GETARG_C(i) == 2) e_fbcall(j, pc, a);
       e_savepc(j, pc + 1);
       e_block(j);  /* after */
       if (GETARG_B(i) != 0) e_inlinecall(j, i);
@@ -2876,6 +2969,17 @@ static const luaL_Reg jitlib[] = {
 };
 
 int luaopen_wcljit (lua_State *L) {
+  int k;
+  /* the math library is open by now: note its functions for intrinsics */
+  if (lua_getglobal(L, "math") == LUA_TTABLE) {
+    for (k = 0; k < INTR__N; k++) {
+      lua_getfield(L, -1, intr_names[k]);
+      if (lua_iscfunction(L, -1) && !lua_getupvalue(L, -1, 1))
+        intr_fn[k] = (int32_t)(uintptr_t)lua_tocfunction(L, -1);
+      lua_pop(L, 1);
+    }
+  }
+  lua_pop(L, 1);
   luaL_newlib(L, jitlib);
   return 1;
 }
