@@ -17,6 +17,8 @@
  */
 import fs from 'fs';
 import path from 'path';
+import __makeJit from '../test/jit-host.js';
+const __jit = await __makeJit();
 
 const W = 1280, H = 720;
 const args = process.argv.slice(2);
@@ -95,6 +97,7 @@ const env = {
   wc_peer_transport: () => 0,
   wc_debug_mark: () => {},
   emscripten_notify_memory_growth: () => {},
+  ...__jit.imports,
 };
 
 const raw = createWebGLImports({ getMemory: () => mem, ctx: gl });
@@ -109,6 +112,7 @@ const glImports = new Proxy(raw, {
 
 const { instance } = await WebAssembly.instantiate(fs.readFileSync(enginePath),
   { env, gl: glImports, wasi_snapshot_preview1: new Proxy({}, { get: () => () => 0 }) });
+__jit.bind(instance);
 const e = instance.exports;
 mem = e.memory;
 e.wc_get_info();
