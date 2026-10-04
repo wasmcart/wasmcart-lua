@@ -12,6 +12,7 @@
  *     --dir DIR[=PFX]    serve every file under DIR as a cart asset (under PFX/)
  *     --jit N            force the JIT hotness threshold to N (0 = everything)
  *     --nojit            the host refuses to link (pure interpreter)
+ *     --tierup N         request specialized code every N entries/back-edges
  *     --async            compile asynchronously (the browser path)
  *     --frames N         also run N frames after the main chunk (default 0)
  *     --pre CODE         Lua run before the script (e.g. "_soft=true")
@@ -35,6 +36,7 @@ function parseArgs(argv) {
     else if (a === '--dir') o.dirs.push(argv[++i]);
     else if (a === '--jit') o.jit = Number(argv[++i]);
     else if (a === '--nojit') o.nojit = true;
+    else if (a === '--tierup') o.tierUp = Number(argv[++i]);
     else if (a === '--async') o.async = true;
     else if (a === '--frames') o.frames = Number(argv[++i]);
     else if (a === '--pre') o.pre += argv[++i] + '\n';
@@ -79,8 +81,8 @@ if not ok and type(err) == "table" and err.__luarun_exit ~= nil then
 end
 if ok then wc.log("LUARUN OK") else wc.log("LUARUN FAIL: " .. tostring(err)) end
 local s = wc.jit.stats()
-wc.log(string.format("LUARUN JIT compiled=%d failed=%d rejected=%d modules=%d bytes=%d bails=%d pending=%d threshold=%d lasterr=%s",
-  s.compiled, s.failed, s.rejected, s.modules, s.bytes, s.bails, s.pending, s.threshold, s.lasterr))
+wc.log(string.format("LUARUN JIT compiled=%d failed=%d rejected=%d modules=%d bytes=%d bails=%d pending=%d threshold=%d spec=%d specbails=%d despec=%d specrej=%d lasterr=%s",
+  s.compiled, s.failed, s.rejected, s.modules, s.bytes, s.bails, s.pending, s.threshold, s.specialized, s.specbails, s.despecialized, s.specrejected, s.lasterr))
 `;
 
 export async function runLua(opts) {
@@ -107,6 +109,7 @@ export async function runLua(opts) {
     mode: opts.async ? 'async' : 'sync',
     disabled: opts.nojit,
     threshold: Number.isInteger(opts.jit) ? opts.jit : undefined,
+    tierUp: Number.isInteger(opts.tierUp) ? opts.tierUp : undefined,
   });
   const mem = () => instance.exports.memory;
   const env = {

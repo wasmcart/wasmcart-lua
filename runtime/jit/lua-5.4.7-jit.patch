@@ -1,6 +1,6 @@
 --- a/src/lobject.h
 +++ b/src/lobject.h
-@@ -570,6 +570,10 @@
+@@ -570,6 +570,11 @@
    LocVar *locvars;  /* information about local variables (debug information) */
    TString  *source;  /* used for debug information */
    GCObject *gclist;
@@ -8,6 +8,7 @@
 +  int jitslot;  /* >0: table slot of compiled code; 0: none yet; <0: LUAJ_* */
 +  int jitcount;  /* hotness: calls + loop back-edges */
 +  int jitcell;  /* pending asynchronous compile, or -1 */
++  void *jitinfo;  /* type feedback and specialization state */
  } Proto;
  
  /* }================================================================== */
@@ -41,13 +42,14 @@
  #include "lmem.h"
  #include "lobject.h"
  #include "lstate.h"
-@@ -260,11 +261,15 @@
+@@ -260,11 +261,16 @@
    f->linedefined = 0;
    f->lastlinedefined = 0;
    f->source = NULL;
 +  f->jitslot = 0;
 +  f->jitcount = 0;
 +  f->jitcell = -1;
++  f->jitinfo = NULL;
    return f;
  }
  

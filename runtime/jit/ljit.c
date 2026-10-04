@@ -71,9 +71,41 @@ static int jit_userthreshold = -1;  /* threshold set from Lua, if any */
 
 static struct {
   lu_mem compiled, failed, modules, bytes, rejected, bails, pending;
+  lu_mem specialized, specbails, despecialized, specrejected;
   const char *lasterr;
 } jst;
 
+
+/*
+** Per-Proto JIT state beyond the slot (Proto.jitinfo). Generic compiled code
+** records operand types per instruction in 'fb' and counts its own entries
+** and loop back-edges; past a count it asks for a specialized recompile that
+** speculates on those types, keeps numbers unboxed in wasm locals within a
+** basic block, and bails to the interpreter when a guess is wrong.
+*/
+typedef struct JitInfo {
+  uint32_t *fb;  /* 2 words per instruction: tag masks of operands 1 and 2 */
+  uint32_t count;  /* entries + back-edges seen by the generic code */
+  int bails;  /* guard failures of the specialized code */
+  int genslot;  /* generic code */
+  int specslot;  /* specialized code, 0 if none */
+  int state;  /* SPEC_* */
+  int cell;  /* asynchronous specialized compile, or -1 */
+} JitInfo;
+
+#define SPEC_NONE	0	/* generic code installed, collecting types */
+#define SPEC_PENDING	1	/* specialized compile in flight (async host) */
+#define SPEC_ON		2	/* specialized code installed */
+#define SPEC_NEVER	3	/* specialization failed or bailed too often */
+
+/* generic code asks for a specialized version every this many events
+   (a power of two; the host may lower it, wc_jit_config key 2) */
+#define SPEC_EVERY	1024
+static uint32_t jit_specevery = SPEC_EVERY;
+/* specialized code falls back to generic after this many bails */
+#define SPEC_MAXBAILS	64
+
+static int jit_spec = 1;  /* specialization enabled (wc.jit.spec) */
 
 /* asynchronous compiles report through these cells (see wc_jit_link) */
 #define NCELLS	1024
@@ -104,6 +136,12 @@ static void jit_init (void) {
   if (wc_jit_config(1) == 1) jit_state = -1;
   v = wc_jit_config(0);
   if (v >= 0 && jit_userthreshold < 0) luaJ_threshold = v;
+  v = wc_jit_config(2);
+  if (v >= 1) {  /* round down to a power of two */
+    uint32_t e = 1;
+    while (e * 2 <= (uint32_t)v && e < (1u << 30)) e *= 2;
+    jit_specevery = e;
+  }
 }
 
 /* }================================================================== */
@@ -653,7 +691,7 @@ typedef enum {
   H_BITOP, H_BITOPI, H_UNM, H_BNOT, H_LEN, H_CONCAT, H_EQ, H_LT, H_LE,
   H_ORDERI, H_RAWEQUAL, H_CALL, H_TAILCALL, H_RETURN, H_RETURN0, H_RETURN1,
   H_FORPREP, H_FLOATFORLOOP, H_TFORPREP, H_TFORCALL, H_NEWTABLE, H_SETLIST,
-  H_CLOSURE, H_VARARG, H_VARARGPREP, H_CLOSE, H_TBC,
+  H_CLOSURE, H_VARARG, H_VARARGPREP, H_CLOSE, H_TBC, H_UPGRADE, H_SPECBAIL,
   H__N
 } HelperId;
 
@@ -700,6 +738,8 @@ static const struct { const char *name; const char *sig; } helpers[H__N] = {
   {"luaJ_h_varargprep", "iii:"},
   {"luaJ_h_close", "iii:"},
   {"luaJ_h_tbc", "iii:"},
+  {"luaJ_h_upgrade", "ii:i"},
+  {"luaJ_h_specbail", "ii:"},
 };
 
 /* locals of the generated function */
@@ -738,7 +778,20 @@ typedef struct J {
   int dead;  /* code is unreachable until the next leader */
   int skipdepth;  /* 'extra' just inside an arith op's skip block, or -1 */
   const char *err;
+  JitInfo *info;  /* type feedback (NULL: none) */
+  int spec;  /* emitting the specialized version */
+  int skipmm;  /* the next MMBIN belongs to a specialized arith op */
+  int lvri, lvrf;  /* first i64 / f64 local caching a Lua register */
+  unsigned char rk[256];  /* register cache: RK_* */
+  unsigned char rd[256];  /* cached value not yet stored to the stack */
 } J;
+
+#define RK_NONE	0
+#define RK_I	1	/* integer in local lvri + r */
+#define RK_F	2	/* float in local lvrf + r */
+
+#define FB_INT	(1u << (LUA_VNUMINT & 31))
+#define FB_FLT	(1u << (LUA_VNUMFLT & 31))
 
 /* an addressable TValue: register, absolute address, or local + offset */
 typedef struct Ad {
@@ -840,9 +893,14 @@ static void e_hookcheck (J *j, int pc) {
 }
 
 /* unconditional jump to the leader at 'target' */
+static void sp_flush (J *j);
+static void e_upgradecheck (J *j, int resumepc);
+
 static void e_goto (J *j, int target) {
   int t = j->blk[target];
   lua_assert(t >= 0);
+  if (j->spec) sp_flush(j);
+  else if (j->info && t <= j->cur) e_upgradecheck(j, target);
   if (t > j->cur)
     e_br(j, t - j->cur - 1 + j->extra);
   else {  /* backward: through the dispatch loop */
@@ -856,6 +914,7 @@ static void e_goto (J *j, int target) {
 static void e_goto_if (J *j, int target) {
   int t = j->blk[target];
   lua_assert(t >= 0);
+  if (j->spec) sp_flush(j);  /* stores leave the condition on the stack */
   if (t > j->cur)
     e_brif(j, t - j->cur - 1 + j->extra);
   else {
@@ -864,6 +923,128 @@ static void e_goto_if (J *j, int target) {
     e_end(j);
   }
 }
+
+/*
+** {------------------------------------------------------------------
+** Type feedback (generic code) and the register cache (specialized code)
+** -------------------------------------------------------------------
+*/
+
+/* generic code: fb[2*pc + which] |= 1 << (tag of reg & 31) */
+static void e_fb (J *j, int pc, int which, Ad reg) {
+  uint32_t addr;
+  if (j->info == NULL || j->spec) return;
+  addr = (uint32_t)(uintptr_t)(j->info->fb + 2 * pc + which);
+  e_i32(j, 0);
+  e_i32(j, 0); e_mem(j, W_I32LOAD, 2, addr);
+  e_i32(j, 1); e_ldtag(j, reg); e_i32(j, 31); E(j, W_I32AND); E(j, W_I32SHL);
+  E(j, W_I32OR);
+  e_mem(j, W_I32STORE, 2, addr);
+}
+
+/* generic code: count an entry/back-edge; every SPEC_EVERY ask for the
+   specialized version, and when it was just installed continue there by
+   bailing at 'resumepc' (>= 0) */
+static void e_upgradecheck (J *j, int resumepc) {
+  uint32_t addr = (uint32_t)(uintptr_t)&j->info->count;
+  e_i32(j, 0);
+  e_i32(j, 0); e_mem(j, W_I32LOAD, 2, addr);
+  e_i32(j, 1); E(j, W_I32ADD);
+  e_ltee(j, LV_T0 + 5);
+  e_mem(j, W_I32STORE, 2, addr);
+  e_lget(j, LV_T0 + 5); e_i32(j, (int32_t)(jit_specevery - 1)); E(j, W_I32AND); E(j, W_I32EQZ);
+  e_if(j);
+  e_lget(j, LV_L); e_lget(j, LV_CI); e_call(j, H_UPGRADE);
+  if (resumepc >= 0) {
+    e_if(j);
+    e_bail(j, resumepc);
+    e_end(j);
+  }
+  else E(j, W_DROP);
+  e_end(j);
+}
+
+static int sp_local (J *j, int r, int kind) {
+  return (kind == RK_I ? j->lvri : j->lvrf) + r;
+}
+
+/* store cached register 'r' to the stack (code only; state unchanged) */
+static void sp_store (J *j, int r) {
+  int k = j->rk[r];
+  e_adbase(j, R(r));
+  e_lget(j, sp_local(j, r, k));
+  e_mem(j, k == RK_I ? W_I64STORE : W_F64STORE, 3, R(r).off);
+  e_settag(j, R(r), k == RK_I ? TAG_INT : TAG_FLT);
+}
+
+static void sp_flushcode (J *j) {
+  int r;
+  for (r = 0; r < j->p->maxstacksize; r++)
+    if (j->rk[r] != RK_NONE && j->rd[r]) sp_store(j, r);
+}
+
+/* make the stack current; cached values stay usable */
+static void sp_flush (J *j) {
+  int r;
+  if (!j->spec) return;
+  for (r = 0; r < j->p->maxstacksize; r++)
+    if (j->rk[r] != RK_NONE && j->rd[r]) { sp_store(j, r); j->rd[r] = 0; }
+}
+
+static void sp_reset (J *j) {
+  memset(j->rk, 0, sizeof(j->rk));
+  memset(j->rd, 0, sizeof(j->rd));
+}
+
+static void sp_kill (J *j, int r) {
+  if (r >= 0 && r < 256) { j->rk[r] = RK_NONE; j->rd[r] = 0; }
+}
+
+/* guard failed at 'pc': store the cache, count, interpret from 'pc' */
+static void sp_bailcode (J *j, int pc) {
+  sp_flushcode(j);
+  e_lget(j, LV_L); e_lget(j, LV_CI); e_call(j, H_SPECBAIL);
+  e_bail(j, pc);
+}
+
+/* kind a register will have when read here: the cache is exact, otherwise
+   the feedback mask decides (RK_NONE: polymorphic or never seen) */
+static int sp_kindof (J *j, int pc, int which, int r) {
+  uint32_t m;
+  if (j->rk[r] != RK_NONE) return j->rk[r];
+  m = j->info->fb[2 * pc + which];
+  return m == FB_INT ? RK_I : m == FB_FLT ? RK_F : RK_NONE;
+}
+
+/* make sure register 'r' is cached as 'kind' (guarding its tag) */
+static void sp_load (J *j, int pc, int r, int kind) {
+  if (j->rk[r] != RK_NONE) { lua_assert(j->rk[r] == kind); return; }
+  e_ldtag(j, R(r)); e_i32(j, kind == RK_I ? TAG_INT : TAG_FLT); E(j, W_I32NE);
+  e_if(j);
+  sp_bailcode(j, pc);
+  e_end(j);
+  if (kind == RK_I) e_ldi64(j, R(r)); else e_ldf64(j, R(r));
+  e_lset(j, sp_local(j, r, kind));
+  j->rk[r] = (unsigned char)kind;
+  j->rd[r] = 0;
+}
+
+/* push register 'r' (already loaded) as 'want' */
+static void sp_push (J *j, int r, int want) {
+  int k = j->rk[r];
+  e_lget(j, sp_local(j, r, k));
+  if (want == RK_F && k == RK_I) E(j, W_F64CVTI64S);
+}
+
+/* the value on the stack becomes register 'r' (dirty) */
+static void sp_def (J *j, int r, int kind) {
+  e_lset(j, sp_local(j, r, kind));
+  j->rk[r] = (unsigned char)kind;
+  j->rd[r] = 1;
+}
+
+/* }------------------------------------------------------------------ */
+
 
 /* push l_isfalse(a) as i32 */
 static void e_isfalse (J *j, Ad a) {
@@ -953,6 +1134,8 @@ static int e_isint (J *j, NOp o) {
 
 static void e_arith (J *j, int pc, int a, NOp b, NOp c, int iop, int fop) {
   int bothint;
+  if (!b.isk) e_fb(j, pc, 0, b.ad);
+  if (!c.isk) e_fb(j, pc, 1, c.ad);
   e_block(j);  /* skip block, closed by the MMBIN */
   j->skipdepth = j->extra;
   /* integer path */
@@ -1261,6 +1444,8 @@ static void e_condjump (J *j, int pc) {
 
 /* push (R[a] < / <= R[b]) with int/float fast paths, helper otherwise */
 static void e_order (J *j, int pc, int a, int b, int lt) {
+  e_fb(j, pc, 0, R(a));
+  e_fb(j, pc, 1, R(b));
   e_blockt(j, T_I32);
   /* both integers */
   e_ldtag(j, R(a)); e_i32(j, TAG_INT); E(j, W_I32EQ);
@@ -1287,6 +1472,8 @@ static void e_order (J *j, int pc, int a, int b, int lt) {
 
 /* push (R[a] == R[b]) */
 static void e_eq (J *j, int pc, int a, int b) {
+  e_fb(j, pc, 0, R(a));
+  e_fb(j, pc, 1, R(b));
   e_blockt(j, T_I32);
   e_ldtag(j, R(a)); e_ltee(j, LV_T0);
   e_ldtag(j, R(b));
@@ -1313,8 +1500,9 @@ static void e_eq (J *j, int pc, int a, int b) {
 }
 
 /* push (R[a] == K) for OP_EQK: raw equality */
-static void e_eqk (J *j, int a, const TValue *k) {
+static void e_eqk (J *j, int pc, int a, const TValue *k) {
   int kt = ttypetag(k);
+  e_fb(j, pc, 0, R(a));
   e_blockt(j, T_I32);
   e_ldtag(j, R(a)); e_ltee(j, LV_T0);
   e_i32(j, rawtt(k)); E(j, W_I32EQ);  /* full tag, collectable bit included */
@@ -1348,6 +1536,7 @@ static void e_cmpi (J *j, int pc, Instruction i) {
   int a = GETARG_A(i);
   int im = GETARG_sB(i);
   int iop, fop;
+  e_fb(j, pc, 0, R(a));
   switch (op) {
     case OP_EQI: iop = W_I64EQ; fop = W_F64EQ; break;
     case OP_LTI: iop = W_I64LTS; fop = W_F64LT; break;
@@ -1449,7 +1638,224 @@ static int findleaders (J *j) {
   return 0;
 }
 
+/*
+** Specialized arithmetic: operands in locals per their (cached or observed)
+** kind, result kind known statically, no metamethod path (guards bail).
+** Returns 0 when the operation cannot be specialized here.
+*/
+static int sp_arith (J *j, int pc, int a, int rb, NOp c, int op) {
+  int kb = sp_kindof(j, pc, 0, rb);
+  int kc = c.isk ? (c.kint ? RK_I : RK_F) : sp_kindof(j, pc, 1, c.ad.off / SV);
+  int rc = c.isk ? -1 : (int)(c.ad.off / SV);
+  int kr;
+  if (kb == RK_NONE || kc == RK_NONE) return 0;
+  switch (op) {
+    case OP_DIV: case OP_POW: kr = RK_F; break;
+    case OP_ADD: case OP_SUB: case OP_MUL: case OP_MOD: case OP_IDIV:
+      kr = (kb == RK_I && kc == RK_I) ? RK_I : RK_F; break;
+    default: return 0;
+  }
+  if (kr == RK_I && (op == OP_MOD || op == OP_IDIV) &&
+      !(c.isk && c.ki != 0 && c.ki != -1))
+    return 0;  /* integer division by a variable: keep the generic path */
+  sp_load(j, pc, rb, kb);
+  if (rc >= 0) sp_load(j, pc, rc, kc);
+#define PUSHC(want) do { if (rc >= 0) sp_push(j, rc, want); \
+    else if ((want) == RK_I) e_i64(j, c.ki); \
+    else e_f64(j, c.kint ? cast_num(c.ki) : c.kf); } while (0)
+  if (kr == RK_I) {
+    switch (op) {
+      case OP_ADD: sp_push(j, rb, RK_I); PUSHC(RK_I); E(j, W_I64ADD); break;
+      case OP_SUB: sp_push(j, rb, RK_I); PUSHC(RK_I); E(j, W_I64SUB); break;
+      case OP_MUL: sp_push(j, rb, RK_I); PUSHC(RK_I); E(j, W_I64MUL); break;
+      case OP_MOD:  /* luaV_mod, constant divisor not 0/-1 */
+        sp_push(j, rb, RK_I); e_i64(j, c.ki); E(j, W_I64REMS); e_lset(j, LV_X1);
+        e_lget(j, LV_X1); E(j, W_I64EQZ); E(j, W_I32EQZ);
+        e_lget(j, LV_X1); e_i64(j, c.ki); E(j, W_I64XOR); e_i64(j, 0); E(j, W_I64LTS);
+        E(j, W_I32AND);
+        e_if(j);
+        e_lget(j, LV_X1); e_i64(j, c.ki); E(j, W_I64ADD); e_lset(j, LV_X1);
+        e_end(j);
+        e_lget(j, LV_X1);
+        break;
+      case OP_IDIV:  /* luaV_idiv, constant divisor not 0/-1 */
+        sp_push(j, rb, RK_I); e_lset(j, LV_X0);
+        e_lget(j, LV_X0); e_i64(j, c.ki); E(j, W_I64DIVS); e_lset(j, LV_X1);
+        e_lget(j, LV_X0); e_i64(j, c.ki); E(j, W_I64XOR); e_i64(j, 0); E(j, W_I64LTS);
+        e_lget(j, LV_X0); e_i64(j, c.ki); E(j, W_I64REMS); E(j, W_I64EQZ); E(j, W_I32EQZ);
+        E(j, W_I32AND);
+        e_if(j);
+        e_lget(j, LV_X1); e_i64(j, 1); E(j, W_I64SUB); e_lset(j, LV_X1);
+        e_end(j);
+        e_lget(j, LV_X1);
+        break;
+    }
+    sp_def(j, a, RK_I);
+  }
+  else {
+    sp_push(j, rb, RK_F); PUSHC(RK_F);
+    switch (op) {
+      case OP_ADD: E(j, W_F64ADD); break;
+      case OP_SUB: E(j, W_F64SUB); break;
+      case OP_MUL: E(j, W_F64MUL); break;
+      case OP_DIV: E(j, W_F64DIV); break;
+      case OP_POW: e_call(j, H_POW); break;
+      case OP_MOD: e_call(j, H_FMOD); break;
+      case OP_IDIV: E(j, W_F64DIV); E(j, W_F64FLOOR); break;
+    }
+    sp_def(j, a, RK_F);
+  }
+#undef PUSHC
+  j->skipmm = 1;  /* the MMBIN after this is never reached */
+  return 1;
+}
+
+/* specialized comparison: leaves (cond == k) for e_condjump; 0 if not */
+static int sp_compare (J *j, int pc, Instruction i) {
+  int op = GET_OPCODE(i);
+  int a = GETARG_A(i);
+  int ka = sp_kindof(j, pc, 0, a);
+  int cmp;
+  if (ka == RK_NONE) return 0;
+  switch (op) {
+    case OP_LT: case OP_LE: case OP_EQ: {
+      int b = GETARG_B(i);
+      int kb = sp_kindof(j, pc, 1, b);
+      if (kb != ka) return 0;  /* mixed int/float compares stay generic */
+      sp_load(j, pc, a, ka); sp_load(j, pc, b, kb);
+      sp_flush(j);
+      sp_push(j, a, ka); sp_push(j, b, kb);
+      if (ka == RK_I) cmp = op == OP_LT ? W_I64LTS : op == OP_LE ? W_I64LES : W_I64EQ;
+      else cmp = op == OP_LT ? W_F64LT : op == OP_LE ? W_F64LE : W_F64EQ;
+      E(j, cmp);
+      break;
+    }
+    case OP_EQK: {
+      const TValue *k = j->p->k + GETARG_B(i);
+      if (!(ttisinteger(k) && ka == RK_I) && !(ttisfloat(k) && ka == RK_F)) return 0;
+      sp_load(j, pc, a, ka);
+      sp_flush(j);
+      sp_push(j, a, ka);
+      if (ka == RK_I) { e_i64(j, ivalue(k)); E(j, W_I64EQ); }
+      else { e_f64(j, fltvalue(k)); E(j, W_F64EQ); }
+      break;
+    }
+    case OP_EQI: case OP_LTI: case OP_LEI: case OP_GTI: case OP_GEI: {
+      int im = GETARG_sB(i);
+      sp_load(j, pc, a, ka);
+      sp_flush(j);
+      sp_push(j, a, ka);
+      if (ka == RK_I) {
+        e_i64(j, im);
+        cmp = op == OP_EQI ? W_I64EQ : op == OP_LTI ? W_I64LTS : op == OP_LEI ? W_I64LES
+            : op == OP_GTI ? W_I64GTS : W_I64GES;
+      }
+      else {
+        e_f64(j, cast_num(im));
+        cmp = op == OP_EQI ? W_F64EQ : op == OP_LTI ? W_F64LT : op == OP_LEI ? W_F64LE
+            : op == OP_GTI ? W_F64GT : W_F64GE;
+      }
+      E(j, cmp);
+      break;
+    }
+    default: return 0;
+  }
+  if (!GETARG_k(i)) E(j, W_I32EQZ);
+  e_condjump(j, pc);
+  return 1;
+}
+
+/* specialized version of instruction 'pc', or 0 to use the generic one */
+static int sp_instr (J *j, int pc) {
+  Proto *p = j->p;
+  Instruction i = p->code[pc];
+  int a = GETARG_A(i);
+  switch (GET_OPCODE(i)) {
+    case OP_MMBIN: case OP_MMBINI: case OP_MMBINK:
+      if (!j->skipmm) return 0;
+      j->skipmm = 0;
+      return 1;
+    case OP_MOVE: {
+      int b = GETARG_B(i);
+      if (j->rk[b] == RK_NONE) return 0;
+      if (a == b) return 1;
+      sp_push(j, b, j->rk[b]);
+      sp_def(j, a, j->rk[b]);
+      return 1;
+    }
+    case OP_LOADI:
+      e_i64(j, GETARG_sBx(i)); sp_def(j, a, RK_I); return 1;
+    case OP_LOADF:
+      e_f64(j, cast_num(GETARG_sBx(i))); sp_def(j, a, RK_F); return 1;
+    case OP_LOADK: {
+      const TValue *k = p->k + GETARG_Bx(i);
+      if (ttisinteger(k)) { e_i64(j, ivalue(k)); sp_def(j, a, RK_I); return 1; }
+      if (ttisfloat(k)) { e_f64(j, fltvalue(k)); sp_def(j, a, RK_F); return 1; }
+      return 0;
+    }
+    case OP_ADD: case OP_SUB: case OP_MUL: case OP_MOD: case OP_POW:
+    case OP_DIV: case OP_IDIV:
+      return sp_arith(j, pc, a, GETARG_B(i), nreg(GETARG_C(i)), GET_OPCODE(i));
+    case OP_ADDK: case OP_SUBK: case OP_MULK: case OP_MODK: case OP_POWK:
+    case OP_DIVK: case OP_IDIVK: {
+      static const int base[] = {OP_ADD, OP_SUB, OP_MUL, OP_MOD, OP_POW, OP_DIV, OP_IDIV};
+      return sp_arith(j, pc, a, GETARG_B(i), nk(p->k + GETARG_C(i)),
+                      base[GET_OPCODE(i) - OP_ADDK]);
+    }
+    case OP_ADDI:
+      return sp_arith(j, pc, a, GETARG_B(i), nimm(GETARG_sC(i)), OP_ADD);
+    case OP_UNM: {
+      int b = GETARG_B(i);
+      int kb = sp_kindof(j, pc, 0, b);
+      if (kb == RK_NONE) return 0;
+      sp_load(j, pc, b, kb);
+      if (kb == RK_I) { e_i64(j, 0); sp_push(j, b, RK_I); E(j, W_I64SUB); }
+      else { sp_push(j, b, RK_F); E(j, W_F64NEG); }
+      sp_def(j, a, kb);
+      return 1;
+    }
+    case OP_EQ: case OP_LT: case OP_LE: case OP_EQK: case OP_EQI:
+    case OP_LTI: case OP_LEI: case OP_GTI: case OP_GEI:
+      return sp_compare(j, pc, i);
+    default:
+      return 0;
+  }
+}
+
+/* registers a generic instruction may write: drop them from the cache */
+static void sp_killwritten (J *j, Instruction i) {
+  int a = GETARG_A(i), r;
+  switch (GET_OPCODE(i)) {
+    case OP_CALL: case OP_TAILCALL: case OP_VARARG: case OP_TFORCALL:
+    case OP_TFORLOOP: case OP_FORLOOP: case OP_FORPREP: case OP_TFORPREP:
+    case OP_CONCAT: case OP_LOADNIL: case OP_SELF: case OP_CLOSE: case OP_TBC:
+    case OP_RETURN: case OP_RETURN0: case OP_RETURN1:
+      for (r = a; r < 256; r++) sp_kill(j, r);
+      break;
+    case OP_VARARGPREP:
+      sp_reset(j);
+      break;
+    default:
+      if (testAMode(GET_OPCODE(i))) sp_kill(j, a);
+      break;
+  }
+}
+
+static void e_instr_generic (J *j, int pc);
+
 static void e_instr (J *j, int pc) {
+  Instruction i = j->p->code[pc];
+  if (!j->spec) { e_instr_generic(j, pc); return; }
+  if (sp_instr(j, pc)) return;
+  sp_flush(j);
+  e_instr_generic(j, pc);
+  if (GET_OPCODE(i) >= OP_MMBIN && GET_OPCODE(i) <= OP_MMBINK)
+    sp_kill(j, GETARG_A(j->p->code[pc - 1]));  /* the arith op's result */
+  else
+    sp_killwritten(j, i);
+}
+
+static void e_instr_generic (J *j, int pc) {
   Proto *p = j->p;
   Instruction i = p->code[pc];
   int a = GETARG_A(i);
@@ -1644,6 +2050,7 @@ static void e_instr (J *j, int pc) {
     }
     case OP_UNM: {
       int b = GETARG_B(i);
+      e_fb(j, pc, 0, R(b));
       e_block(j);
       e_ldtag(j, R(b)); e_ltee(j, LV_T0); e_i32(j, TAG_INT); E(j, W_I32EQ);
       e_if(j);
@@ -1730,7 +2137,7 @@ static void e_instr (J *j, int pc) {
       e_condjump(j, pc);
       break;
     case OP_EQK:
-      e_eqk(j, a, p->k + GETARG_B(i));
+      e_eqk(j, pc, a, p->k + GETARG_B(i));
       if (!GETARG_k(i)) E(j, W_I32EQZ);
       e_condjump(j, pc);
       break;
@@ -1901,7 +2308,8 @@ static void e_instr (J *j, int pc) {
 }
 
 /* emit the whole module for 'p' into 'M'; returns 1 on success */
-static int emit_module (lua_State *L, Proto *p, Buf *M, const char **err) {
+static int emit_module (lua_State *L, Proto *p, Buf *M, const char **err,
+                        JitInfo *info, int spec) {
   J j;
   Buf S, F;
   int pc, h;
@@ -1910,6 +2318,8 @@ static int emit_module (lua_State *L, Proto *p, Buf *M, const char **err) {
   memset(&F, 0, sizeof(F));
   j.L = L;
   j.p = p;
+  j.info = info;
+  j.spec = spec && info != NULL;
   j.n = p->sizecode;
   j.skipdepth = -1;
   if (j.n <= 0 || j.n > MAXJITCODE) { *err = "function too large"; return 0; }
@@ -1918,10 +2328,16 @@ static int emit_module (lua_State *L, Proto *p, Buf *M, const char **err) {
   if (!findleaders(&j)) { *err = j.err; free(j.blk); return 0; }
 
   /* function body */
-  b1(&j.c, 3);  /* local groups */
+  j.lvri = LV_D0 + NF64TMP;
+  j.lvrf = j.lvri + p->maxstacksize;
+  b1(&j.c, j.spec ? 5 : 3);  /* local groups */
   bu(&j.c, 2 + NI32TMP); b1(&j.c, T_I32);
   bu(&j.c, NI64TMP); b1(&j.c, T_I64);
   bu(&j.c, NF64TMP); b1(&j.c, T_F64);
+  if (j.spec) {  /* the register cache */
+    bu(&j.c, p->maxstacksize); b1(&j.c, T_I64);
+    bu(&j.c, p->maxstacksize); b1(&j.c, T_F64);
+  }
   /* prologue: base, closure */
   e_reloadbase(&j);
   e_lget(&j, LV_CI);
@@ -1946,11 +2362,14 @@ static int emit_module (lua_State *L, Proto *p, Buf *M, const char **err) {
   for (pc = 0; pc < j.n; pc++) {
     if (pc > 0 && j.blk[pc] >= 0) {
       if (j.extra != 0) { *err = "internal: open construct at leader"; goto fail; }
+      if (!j.dead) sp_flush(&j);  /* fall through into the next block */
+      sp_reset(&j);
       E(&j, W_END);
       j.cur = j.blk[pc];
       j.dead = 0;
     }
     if (j.dead) continue;
+    if (pc == 0 && j.info && !j.spec) e_upgradecheck(&j, -1);
     e_instr(&j, pc);
   }
   if (j.extra != 0) { *err = "internal: open construct at end"; goto fail; }
@@ -2030,13 +2449,26 @@ static int emit_module (lua_State *L, Proto *p, Buf *M, const char **err) {
 
 typedef int (*JitFn) (lua_State *L, CallInfo *ci, int pc, int depth);
 
+static JitInfo *getinfo (Proto *p) {
+  JitInfo *info = (JitInfo *)p->jitinfo;
+  if (info == NULL && jit_spec) {
+    info = (JitInfo *)calloc(1, sizeof(JitInfo));
+    if (info == NULL) return NULL;
+    info->fb = (uint32_t *)calloc((size_t)p->sizecode * 2, sizeof(uint32_t));
+    if (info->fb == NULL) { free(info); return NULL; }
+    info->cell = -1;
+    p->jitinfo = info;
+  }
+  return info;
+}
+
 static void compile (lua_State *L, Proto *p) {
   Buf M;
   const char *err = NULL;
   int cell, r;
-  (void)L;
+  JitInfo *info = getinfo(p);
   memset(&M, 0, sizeof(M));
-  if (!emit_module(L, p, &M, &err)) {
+  if (!emit_module(L, p, &M, &err, info, 0)) {
     p->jitslot = LUAJ_FAILED;
     jst.rejected++;
     jst.lasterr = err;
@@ -2054,6 +2486,7 @@ static void compile (lua_State *L, Proto *p) {
   free(M.b);
   if (r > 0) {
     p->jitslot = r;
+    if (info) info->genslot = r;
     jit_cellused[cell] = 0;
     jst.compiled++;
     jst.modules++;
@@ -2073,6 +2506,66 @@ static void compile (lua_State *L, Proto *p) {
   }
 }
 
+/*
+** Generic code asks for its specialized version (every SPEC_EVERY entries
+** and back-edges). Returns 1 when the specialized code was just installed.
+*/
+JIT_EXPORT int luaJ_h_upgrade (lua_State *L, CallInfo *ci) {
+  Proto *p = ci_func(ci)->p;
+  JitInfo *info = (JitInfo *)p->jitinfo;
+  if (info == NULL || !jit_spec) return 0;
+  if (info->state == SPEC_NONE) {
+    Buf M;
+    const char *err = NULL;
+    int cell, r;
+    memset(&M, 0, sizeof(M));
+    if (!emit_module(L, p, &M, &err, info, 1)) {
+      info->state = SPEC_NEVER;
+      jst.specrejected++;
+      jst.lasterr = err;
+      free(M.b);
+      return 0;
+    }
+    cell = cell_alloc(p);
+    if (cell < 0) { free(M.b); return 0; }
+    jst.bytes += M.n;
+    r = wc_jit_link(M.b, (unsigned int)M.n, &jit_cells[cell]);
+    free(M.b);
+    if (r == -2) { info->state = SPEC_PENDING; info->cell = cell; return 0; }
+    jit_cellused[cell] = 0;
+    if (r <= 0) { info->state = SPEC_NEVER; jst.specrejected++; return 0; }
+    info->specslot = r;
+  }
+  else if (info->state == SPEC_PENDING) {
+    int v = jit_cells[info->cell];
+    if (v == -2) return 0;
+    jit_cellused[info->cell] = 0;
+    info->cell = -1;
+    if (v <= 0) { info->state = SPEC_NEVER; jst.specrejected++; return 0; }
+    info->specslot = v;
+  }
+  else return 0;
+  info->state = SPEC_ON;
+  info->bails = 0;
+  p->jitslot = info->specslot;
+  jst.specialized++;
+  jst.modules++;
+  return 1;
+}
+
+/* a guard in specialized code failed: back to generic code if it keeps on */
+JIT_EXPORT void luaJ_h_specbail (lua_State *L, CallInfo *ci) {
+  Proto *p = ci_func(ci)->p;
+  JitInfo *info = (JitInfo *)p->jitinfo;
+  (void)L;
+  jst.specbails++;
+  if (info && info->state == SPEC_ON && ++info->bails > SPEC_MAXBAILS) {
+    info->state = SPEC_NEVER;
+    p->jitslot = info->genslot;
+    jst.despecialized++;
+  }
+}
+
 int luaJ_hot (lua_State *L, Proto *p, const Instruction *pc) {
   if (p->jitslot == LUAJ_COLD) {
     if (pc != p->code) return 0;  /* count calls only at entry */
@@ -2089,7 +2582,11 @@ int luaJ_hot (lua_State *L, Proto *p, const Instruction *pc) {
     jit_cellused[p->jitcell] = 0;
     p->jitcell = -1;
     jst.pending--;
-    if (v > 0) { p->jitslot = v; jst.compiled++; jst.modules++; }
+    if (v > 0) {
+      p->jitslot = v;
+      if (p->jitinfo) ((JitInfo *)p->jitinfo)->genslot = v;
+      jst.compiled++; jst.modules++;
+    }
     else { p->jitslot = LUAJ_FAILED; jst.failed++; }
   }
   return p->jitslot > 0;
@@ -2127,7 +2624,15 @@ int luaJ_trap (lua_State *L, CallInfo *ci, const Instruction *pc) {
 }
 
 void luaJ_freeproto (lua_State *L, Proto *p) {
+  JitInfo *info = (JitInfo *)p->jitinfo;
   (void)L;
+  if (info) {
+    if (info->state == SPEC_PENDING && info->cell >= 0)
+      jit_cellowner[info->cell] = NULL;
+    free(info->fb);
+    free(info);
+    p->jitinfo = NULL;
+  }
   if (p->jitslot == LUAJ_PENDING && p->jitcell >= 0) {
     jit_cellowner[p->jitcell] = NULL;  /* the host may still answer */
     jst.pending--;
@@ -2160,6 +2665,12 @@ static int jl_threshold (lua_State *L) {
   return 1;
 }
 
+static int jl_spec (lua_State *L) {
+  if (!lua_isnone(L, 1)) jit_spec = lua_toboolean(L, 1);
+  lua_pushboolean(L, jit_spec);
+  return 1;
+}
+
 static int jl_enabled (lua_State *L) {
   if (jit_state == 0) jit_init();
   lua_pushboolean(L, jit_state > 0);
@@ -2177,6 +2688,10 @@ static int jl_stats (lua_State *L) {
   F("bails", jst.bails);
   F("pending", jst.pending);
   F("threshold", luaJ_threshold);
+  F("specialized", jst.specialized);
+  F("specbails", jst.specbails);
+  F("despecialized", jst.despecialized);
+  F("specrejected", jst.specrejected);
 #undef F
   lua_pushstring(L, jst.lasterr ? jst.lasterr : "");
   lua_setfield(L, -2, "lasterr");
@@ -2185,7 +2700,9 @@ static int jl_stats (lua_State *L) {
 
 static int jl_status (lua_State *L) {
   Proto *p = argproto(L, 1);
-  const char *s = p->jitslot > 0 ? "compiled" : p->jitslot == LUAJ_COLD ? "cold"
+  JitInfo *info = (JitInfo *)p->jitinfo;
+  const char *s = (p->jitslot > 0 && info && info->state == SPEC_ON) ? "specialized"
+                : p->jitslot > 0 ? "compiled" : p->jitslot == LUAJ_COLD ? "cold"
                 : p->jitslot == LUAJ_PENDING ? "pending" : "failed";
   lua_pushstring(L, s);
   lua_pushinteger(L, p->jitcount);
@@ -2206,7 +2723,7 @@ static int jl_dump (lua_State *L) {
   Buf M;
   const char *err = NULL;
   memset(&M, 0, sizeof(M));
-  if (!emit_module(L, p, &M, &err)) {
+  if (!emit_module(L, p, &M, &err, (JitInfo *)p->jitinfo, lua_toboolean(L, 2))) {
     free(M.b);
     luaL_pushfail(L);
     lua_pushstring(L, err ? err : "?");
@@ -2220,6 +2737,7 @@ static int jl_dump (lua_State *L) {
 static const luaL_Reg jitlib[] = {
   {"threshold", jl_threshold},
   {"enabled", jl_enabled},
+  {"spec", jl_spec},
   {"stats", jl_stats},
   {"status", jl_status},
   {"compile", jl_compile},
