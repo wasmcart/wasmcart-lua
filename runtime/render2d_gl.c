@@ -1787,6 +1787,15 @@ void wcl_r2d_blend_mode(int mode, int premultiplied) {
     }
 }
 
+/* Blending for a 3D mesh draw: on for every mode except "replace", as LOVE
+ * draws meshes. The 2D batches switch GL_BLEND off for fully opaque batches,
+ * and wcl_r2d_blend_mode returns early when the mode is unchanged, so a 3D
+ * draw that followed an opaque 2D draw used to run with blending off and
+ * drew a transparent mesh opaque. */
+void wcl_r2d__blend_for_3d(void) {
+    set_blend(blend_mode_cur != WCL_BLEND_NONE);
+}
+
 /* Back-compat shim for the old binary toggle. */
 void wcl_r2d_blend_add(int on) {
     wcl_r2d_blend_mode(on ? WCL_BLEND_ADD : WCL_BLEND_ALPHA, 0);

@@ -34,6 +34,7 @@
 
 /* The seam into render2d_gl.c. Not in a header: nothing else may call it. */
 extern void   wcl_r2d__flush_for_3d(void);
+extern void   wcl_r2d__blend_for_3d(void);
 /* The 2D side tracks which GL program is bound so it can skip redundant
  * glUseProgram calls. This file binds one directly below, so it has to say
  * so or that tracking goes stale and a later send skips a bind it needed. */
@@ -1259,8 +1260,11 @@ static int mesh_draw_common(int handle, uint32_t tint, int alpha, int instances)
     apply_depth();
     apply_cull();
 
-    /* Blending stays on: a 3D cart may draw translucent geometry, and the
-     * depth test is what resolves occlusion for the opaque case. */
+    /* Blending follows the current blend mode (on unless "replace"): a 3D
+     * cart may draw translucent geometry, and the depth test is what
+     * resolves occlusion for the opaque case. It has to be set here because
+     * the 2D batches turn GL_BLEND off for opaque batches. */
+    wcl_r2d__blend_for_3d();
     if (m->tex) {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, m->tex);
