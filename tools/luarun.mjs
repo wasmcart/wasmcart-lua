@@ -9,7 +9,7 @@
  *
  *   node tools/luarun.mjs [options] script.lua [more files or dirs...]
  *     --engine PATH      engine wasm (default build/engine-cpu.wasm)
- *     --dir DIR          serve every file under DIR as a cart asset
+ *     --dir DIR[=PFX]    serve every file under DIR as a cart asset (under PFX/)
  *     --jit N            force the JIT hotness threshold to N (0 = everything)
  *     --nojit            the host refuses to link (pure interpreter)
  *     --async            compile asynchronously (the browser path)
@@ -67,7 +67,16 @@ loadfile = function(name, mode, env)
   return load(src, "@" .. name, mode, env)
 end
 ${pre}
-local ok, err = xpcall(dofile, debug.traceback, ${JSON.stringify(script)})
+local function handler(e)
+  if type(e) == "table" and e.__luarun_exit ~= nil then return e end
+  return debug.traceback(e)
+end
+local ok, err = xpcall(dofile, handler, ${JSON.stringify(script)})
+if not ok and type(err) == "table" and err.__luarun_exit ~= nil then
+  -- os.exit(code) from the script (the VM test prelude raises this)
+  ok = (err.__luarun_exit == 0 or err.__luarun_exit == true)
+  err = "os.exit(" .. tostring(err.__luarun_exit) .. ")"
+end
 if ok then wc.log("LUARUN OK") else wc.log("LUARUN FAIL: " .. tostring(err)) end
 local s = wc.jit.stats()
 wc.log(string.format("LUARUN JIT compiled=%d failed=%d rejected=%d modules=%d bytes=%d bails=%d pending=%d threshold=%d lasterr=%s",
@@ -77,7 +86,12 @@ wc.log(string.format("LUARUN JIT compiled=%d failed=%d rejected=%d modules=%d by
 export async function runLua(opts) {
   opts = { engine: path.join(ROOT, 'build', 'engine-cpu.wasm'), dirs: [], pre: '', frames: 0, ...opts };
   const assets = {};
-  for (const d of opts.dirs) addDir(assets, d);
+  // --dir DIR serves DIR's files at the root; --dir DIR=PREFIX under PREFIX/
+  for (const d of opts.dirs) {
+    const eq = d.indexOf('=');
+    if (eq > 0) addDir(assets, d.slice(0, eq), d.slice(eq + 1));
+    else addDir(assets, d);
+  }
   const script = opts.files[0];
   for (const f of opts.files) {
     if (fs.statSync(f).isDirectory()) addDir(assets, f);
