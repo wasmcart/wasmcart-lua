@@ -31,6 +31,9 @@
 #define LUAJ_PENDING	(-2)	/* asynchronous compile in flight */
 
 LUAI_DDEC(int luaJ_threshold);
+/* compiled-code frames currently on the wasm stack (bounded: they are not
+   counted by nCcalls, and the host's stack is finite) */
+LUAI_DDEC(int luaJ_depth);
 
 /* true when compiled code may be entered at 'pc' (compiling when hot) */
 #define luaJ_ready(L,p,pc) \

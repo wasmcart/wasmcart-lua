@@ -59,6 +59,32 @@
    luaM_freearray(L, f->code, f->sizecode);
    luaM_freearray(L, f->p, f->sizep);
    luaM_freearray(L, f->k, f->sizek);
+--- a/src/ldo.c
++++ b/src/ldo.c
+@@ -19,6 +19,7 @@
+ #include "lapi.h"
+ #include "ldebug.h"
+ #include "ldo.h"
++#include "ljit.h"
+ #include "lfunc.h"
+ #include "lgc.h"
+ #include "lmem.h"
+@@ -137,6 +138,7 @@
+ 
+ int luaD_rawrunprotected (lua_State *L, Pfunc f, void *ud) {
+   l_uint32 oldnCcalls = L->nCcalls;
++  int oldjitdepth = luaJ_depth;  /* LUA_JIT: compiled frames on the wasm stack */
+   struct lua_longjmp lj;
+   lj.status = LUA_OK;
+   lj.previous = L->errorJmp;  /* chain new error handler */
+@@ -146,6 +148,7 @@
+   );
+   L->errorJmp = lj.previous;  /* restore old error handler */
+   L->nCcalls = oldnCcalls;
++  luaJ_depth = oldjitdepth;  /* an error or yield unwound compiled frames */
+   return lj.status;
+ }
+ 
 --- a/src/lvm.c
 +++ b/src/lvm.c
 @@ -29,6 +29,7 @@

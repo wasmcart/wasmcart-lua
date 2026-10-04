@@ -62,10 +62,14 @@ static int wc_jit_config (int key) { (void)key; return -1; }
 /* functions larger than this are left to the interpreter */
 #define MAXJITCODE	12000
 #define MAXJITBLOCKS	4000
-/* direct compiled-to-compiled calls nest at most this deep on the wasm stack */
-#define MAXJITDEPTH	100
+/* compiled frames on the wasm stack, all C levels together, at most this
+   many (luaJ_enter and direct calls both count; beyond it the interpreter
+   runs the call, whose own stack use is bounded by LUAI_MAXCCALLS) */
+#define MAXJITDEPTH	64
+#define DEPTHADDR	((uint32_t)(uintptr_t)&luaJ_depth)
 
 int luaJ_threshold = LUAJ_DEFAULT_THRESHOLD;
+int luaJ_depth = 0;
 
 static int jit_state = 0;  /* 0 = not initialized, 1 = on, -1 = off */
 static int jit_userthreshold = -1;  /* threshold set from Lua, if any */
@@ -108,6 +112,8 @@ static uint32_t jit_specevery = SPEC_EVERY;
    rebuilt (from the feedback the bails added) at most SPEC_MAXRESPECS times */
 #define SPEC_MAXBAILS	64
 #define SPEC_MAXRESPECS	3
+/* unstored values the register cache may hold at once */
+#define SPEC_MAXDIRTY	6
 
 static int jit_spec = 1;  /* specialization enabled (wc.jit.spec) */
 
@@ -1052,7 +1058,17 @@ static void sp_push (J *j, int r, int want) {
 
 /* the value on the stack becomes register 'r' (dirty) */
 static void sp_def (J *j, int r, int kind) {
+  int q, ndirty = 0;
   e_lset(j, sp_local(j, r, kind));
+  /* every guard's bail path stores all dirty registers, so a long run of
+     unstored results would make the code quadratic: keep at most
+     SPEC_MAXDIRTY of them (always in straight-line code here) */
+  for (q = 0; q < j->p->maxstacksize; q++)
+    if (q != r && j->rk[q] != RK_NONE && j->rd[q]) ndirty++;
+  if (ndirty >= SPEC_MAXDIRTY) {
+    j->rk[r] = RK_NONE;  /* not yet: flush the others first */
+    sp_flush(j);
+  }
   j->rk[r] = (unsigned char)kind;
   j->rd[r] = 1;
 }
@@ -1987,6 +2003,7 @@ static void e_inlinecall (J *j, Instruction i) {
   int a = GETARG_A(i), b = GETARG_B(i);
   int tcl = LV_T0 + 1, tp = LV_T0 + 2, tslot = LV_T0 + 3, tnci = LV_T0 + 4;
   e_block(j);  /* generic */
+  e_i32(j, 0); e_mem(j, W_I32LOAD, 2, DEPTHADDR); e_lset(j, LV_DEPTH);
   e_lget(j, LV_L); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(lua_State, hookmask));
   e_lget(j, LV_DEPTH); e_i32(j, MAXJITDEPTH); E(j, W_I32GEU);
   E(j, W_I32OR); e_brif(j, 0);
@@ -2028,10 +2045,13 @@ static void e_inlinecall (J *j, Instruction i) {
   e_mem(j, W_I32STORE, 2, (uint32_t)offsetof(CallInfo, u.l.savedpc));
   e_lget(j, LV_L); e_lget(j, tnci); e_mem(j, W_I32STORE, 2, (uint32_t)offsetof(lua_State, ci));
   /* direct call */
+  e_i32(j, 0); e_lget(j, LV_DEPTH); e_i32(j, 1); E(j, W_I32ADD);
+  e_mem(j, W_I32STORE, 2, DEPTHADDR);
   e_lget(j, LV_L); e_lget(j, tnci); e_i32(j, 0);
-  e_lget(j, LV_DEPTH); e_i32(j, 1); E(j, W_I32ADD);
+  e_lget(j, LV_DEPTH);
   e_lget(j, tslot);
   E(j, W_CALLINDIRECT); bu(&j->c, 0); bu(&j->c, 0);
+  e_i32(j, 0); e_lget(j, LV_DEPTH); e_mem(j, W_I32STORE, 2, DEPTHADDR);
   e_i32(j, LUAJ_RETURN); E(j, W_I32NE);
   e_if(j); e_return(j, LUAJ_CALL); e_end(j);
   e_br(j, 1);  /* after */
@@ -2372,17 +2392,21 @@ static void e_instr_generic (J *j, int pc) {
       e_ltee(j, LV_T0);
       e_if(j);  /* a Lua function was called */
       /* not compiled, or nested too deep: the interpreter runs it */
+      e_i32(j, 0); e_mem(j, W_I32LOAD, 2, DEPTHADDR); e_lset(j, LV_DEPTH);
       e_lget(j, LV_T0); e_i32(j, 1); E(j, W_I32EQ);
       e_lget(j, LV_DEPTH); e_i32(j, MAXJITDEPTH); E(j, W_I32GEU);
       E(j, W_I32OR);
       e_if(j); e_return(j, LUAJ_CALL); e_end(j);
       /* direct call of the callee's compiled code */
+      e_i32(j, 0); e_lget(j, LV_DEPTH); e_i32(j, 1); E(j, W_I32ADD);
+      e_mem(j, W_I32STORE, 2, DEPTHADDR);
       e_lget(j, LV_L);
       e_lget(j, LV_L); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(lua_State, ci));
       e_i32(j, 0);
-      e_lget(j, LV_DEPTH); e_i32(j, 1); E(j, W_I32ADD);
+      e_lget(j, LV_DEPTH);
       e_lget(j, LV_T0);
       E(j, W_CALLINDIRECT); bu(&j->c, 0); bu(&j->c, 0);
+      e_i32(j, 0); e_lget(j, LV_DEPTH); e_mem(j, W_I32STORE, 2, DEPTHADDR);
       /* anything but a finished return: the interpreter takes over L->ci */
       e_i32(j, LUAJ_RETURN); E(j, W_I32NE);
       e_if(j); e_return(j, LUAJ_CALL); e_end(j);
@@ -2831,7 +2855,11 @@ int luaJ_hot (lua_State *L, Proto *p, const Instruction *pc) {
 
 int luaJ_enter (lua_State *L, CallInfo *ci, const Instruction *pc) {
   Proto *p = ci_func(ci)->p;
-  int r = ((JitFn)(uintptr_t)p->jitslot)(L, ci, (int)(pc - p->code), 0);
+  int saved = luaJ_depth, r;
+  if (saved >= MAXJITDEPTH) return LUAJ_NOENTRY;  /* deep: interpret */
+  luaJ_depth = saved + 1;
+  r = ((JitFn)(uintptr_t)p->jitslot)(L, ci, (int)(pc - p->code), 0);
+  luaJ_depth = saved;
   if (r == LUAJ_BAIL) jst.bails++;
   return r;
 }
