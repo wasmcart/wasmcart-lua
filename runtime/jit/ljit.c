@@ -1515,7 +1515,12 @@ static void e_instr (J *j, int pc) {
       e_arith(j, pc, a, nreg(GETARG_B(i)), nk(p->k + GETARG_C(i)), IOP_IDIV, FOP_IDIV);
       break;
     case OP_ADD:
+#if defined(LUAJ_CONTROL_MISCOMPILE)
+      /* must-fail control build: integer R+R addition subtracts */
+      e_arith(j, pc, a, nreg(GETARG_B(i)), nreg(GETARG_C(i)), W_I64SUB, W_F64ADD);
+#else
       e_arith(j, pc, a, nreg(GETARG_B(i)), nreg(GETARG_C(i)), W_I64ADD, W_F64ADD);
+#endif
       break;
     case OP_SUB:
       e_arith(j, pc, a, nreg(GETARG_B(i)), nreg(GETARG_C(i)), W_I64SUB, W_F64SUB);
