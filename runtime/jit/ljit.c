@@ -1062,10 +1062,13 @@ static int sp_intrinsic (J *j, int pc) {
   Instruction i = j->p->code[pc];
   uint32_t f;
   int k;
-  if (j->info == NULL || GET_OPCODE(i) != OP_CALL || GETARG_B(i) != 2 || GETARG_C(i) != 2)
-    return -1;
+  if (j->info == NULL || GETARG_B(i) != 2) return -1;
+  if (GET_OPCODE(i) == OP_CALL) { if (GETARG_C(i) != 2) return -1; }
+  else if (GET_OPCODE(i) != OP_TAILCALL || GETARG_C(i) != 0 || TESTARG_k(i)) return -1;
   f = j->info->fb[2 * pc];
   if (f <= 1) return -1;
+  /* the argument must have been only integers or only floats */
+  if (j->info->fb[2 * pc + 1] != FB_INT && j->info->fb[2 * pc + 1] != FB_FLT) return -1;
   for (k = 0; k < INTR__N; k++)
     if (intr_fn[k] != 0 && (uint32_t)intr_fn[k] == f) return k;
   return -1;
@@ -1818,6 +1821,8 @@ static int sp_compare (J *j, int pc, Instruction i) {
 }
 
 /* specialized version of instruction 'pc', or 0 to use the generic one */
+static void e_return01 (J *j, int pc, int a, int want);
+
 static int sp_instr (J *j, int pc) {
   Proto *p = j->p;
   Instruction i = p->code[pc];
@@ -1869,14 +1874,11 @@ static int sp_instr (J *j, int pc) {
     case OP_EQ: case OP_LT: case OP_LE: case OP_EQK: case OP_EQI:
     case OP_LTI: case OP_LEI: case OP_GTI: case OP_GEI:
       return sp_compare(j, pc, i);
-    case OP_CALL: {
+    case OP_CALL: case OP_TAILCALL: {
       int k = sp_intrinsic(j, pc), ka;
       if (k < 0) return 0;
       ka = sp_kindof(j, pc, 1, a + 1);
-      if (ka == RK_NONE) {  /* no type seen yet (or several): stays a guess */
-        e_bail(j, pc);  /* unreachable in practice; keeps the code valid */
-        return 1;
-      }
+      lua_assert(ka != RK_NONE);  /* sp_intrinsic checked the feedback */
       /* guard: R[A] is still that light C function */
       e_ldtag(j, R(a)); e_i32(j, LUA_VLCF); E(j, W_I32NE);
       e_ldptr(j, R(a)); e_i32(j, intr_fn[k]); E(j, W_I32NE);
@@ -1911,6 +1913,11 @@ static int sp_instr (J *j, int pc) {
           }
           break;
       }
+      if (GET_OPCODE(i) == OP_TAILCALL) {  /* return the result */
+        sp_flush(j);
+        e_return01(j, pc, a, 1);
+        j->dead = 1;
+      }
       return 1;
     }
     default:
@@ -1938,6 +1945,37 @@ static void sp_killwritten (J *j, Instruction i) {
 }
 
 static void e_instr_generic (J *j, int pc);
+
+/*
+** RETURN0/RETURN1 of register 'a': the common case inline (the caller wants
+** exactly 'want' results), the rest in the helper. Hooks: the interpreter
+** executes the instruction at 'pc' instead.
+*/
+static void e_return01 (J *j, int pc, int a, int want) {
+  e_hookcheck(j, pc);
+  e_lget(j, LV_CI); E(j, 0x2e /* i32.load16_s */); bu(&j->c, 1);
+  bu(&j->c, (uint32_t)offsetof(CallInfo, nresults));
+  e_i32(j, want); E(j, W_I32EQ);
+  e_if(j);
+  if (want) {  /* base - 1 (the function's slot) := R[A] */
+    e_lget(j, LV_BASE); e_i32(j, -(int32_t)SV); E(j, W_I32ADD); e_lset(j, LV_T0 + 1);
+    e_copy(j, LA(LV_T0 + 1), R(a));
+  }
+  /* L->top = base - 1 + want */
+  e_lget(j, LV_L);
+  e_lget(j, LV_BASE); e_i32(j, (int32_t)SV * (want - 1)); E(j, W_I32ADD);
+  e_mem(j, W_I32STORE, 2, (uint32_t)offsetof(lua_State, top));
+  /* L->ci = ci->previous */
+  e_lget(j, LV_L);
+  e_lget(j, LV_CI); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(CallInfo, previous));
+  e_mem(j, W_I32STORE, 2, (uint32_t)offsetof(lua_State, ci));
+  e_return(j, LUAJ_RETURN);
+  e_end(j);
+  e_lget(j, LV_L); e_lget(j, LV_CI);
+  if (want) { e_i32(j, a); e_call(j, H_RETURN1); }
+  else e_call(j, H_RETURN0);
+  e_return(j, LUAJ_RETURN);
+}
 
 /*
 ** OP_CALL with a fixed argument count whose callee is a compiled Lua function
@@ -2354,6 +2392,7 @@ static void e_instr_generic (J *j, int pc) {
       e_hookcheck(j, pc + 1);
       break;
     case OP_TAILCALL:
+      if (GETARG_B(i) == 2) e_fbcall(j, pc, a);
       e_savepc(j, pc + 1);
       e_lget(j, LV_L); e_lget(j, LV_CI); e_i32(j, a); e_i32(j, GETARG_B(i));
       e_i32(j, GETARG_C(i)); e_i32(j, GETARG_k(i));
@@ -2369,35 +2408,10 @@ static void e_instr_generic (J *j, int pc) {
       e_return(j, LUAJ_RETURN);
       j->dead = 1;
       break;
-    case OP_RETURN0: case OP_RETURN1: {
-      /* the common case inline: exactly as many results as the caller
-         wants (1 for RETURN1, 0 for RETURN0); the rest in the helper */
-      int want = GET_OPCODE(i) == OP_RETURN1 ? 1 : 0;
-      e_hookcheck(j, pc);  /* hooks: let the interpreter return */
-      e_lget(j, LV_CI); E(j, 0x2e); bu(&j->c, 1); bu(&j->c, (uint32_t)offsetof(CallInfo, nresults));  /* i32.load16_s */
-      e_i32(j, want); E(j, W_I32EQ);
-      e_if(j);
-      if (want) {  /* base - 1 (the function's slot) := R[A] */
-        e_lget(j, LV_BASE); e_i32(j, -(int32_t)SV); E(j, W_I32ADD); e_lset(j, LV_T0 + 1);
-        e_copy(j, LA(LV_T0 + 1), R(a));
-      }
-      /* L->top = base - 1 + want */
-      e_lget(j, LV_L);
-      e_lget(j, LV_BASE); e_i32(j, (int32_t)SV * (want - 1)); E(j, W_I32ADD);
-      e_mem(j, W_I32STORE, 2, (uint32_t)offsetof(lua_State, top));
-      /* L->ci = ci->previous */
-      e_lget(j, LV_L);
-      e_lget(j, LV_CI); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(CallInfo, previous));
-      e_mem(j, W_I32STORE, 2, (uint32_t)offsetof(lua_State, ci));
-      e_return(j, LUAJ_RETURN);
-      e_end(j);
-      e_lget(j, LV_L); e_lget(j, LV_CI);
-      if (want) { e_i32(j, a); e_call(j, H_RETURN1); }
-      else e_call(j, H_RETURN0);
-      e_return(j, LUAJ_RETURN);
+    case OP_RETURN0: case OP_RETURN1:
+      e_return01(j, pc, a, GET_OPCODE(i) == OP_RETURN1 ? 1 : 0);
       j->dead = 1;
       break;
-    }
     case OP_FORLOOP: {
       int target = pc + 1 - GETARG_Bx(i);
       e_ldtag(j, R(a + 2)); e_i32(j, TAG_INT); E(j, W_I32EQ);
