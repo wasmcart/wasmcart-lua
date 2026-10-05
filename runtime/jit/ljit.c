@@ -1845,7 +1845,11 @@ static int sp_arith (J *j, int pc, int a, int rb, NOp c, int op) {
     else e_f64(j, c.kint ? cast_num(c.ki) : c.kf); } while (0)
   if (kr == RK_I) {
     switch (op) {
+#if defined(LUAJ_CONTROL_MISCOMPILE) && LUAJ_CONTROL_MISCOMPILE == 2
+      case OP_ADD: sp_push(j, rb, RK_I); PUSHC(RK_I); E(j, W_I64SUB); break;
+#else
       case OP_ADD: sp_push(j, rb, RK_I); PUSHC(RK_I); E(j, W_I64ADD); break;
+#endif
       case OP_SUB: sp_push(j, rb, RK_I); PUSHC(RK_I); E(j, W_I64SUB); break;
       case OP_MUL: sp_push(j, rb, RK_I); PUSHC(RK_I); E(j, W_I64MUL); break;
       case OP_MOD:  /* luaV_mod, constant divisor not 0/-1 */
@@ -2305,8 +2309,8 @@ static void e_instr_generic (J *j, int pc) {
       e_arith(j, pc, a, nreg(GETARG_B(i)), nk(p->k + GETARG_C(i)), IOP_IDIV, FOP_IDIV);
       break;
     case OP_ADD:
-#if defined(LUAJ_CONTROL_MISCOMPILE)
-      /* must-fail control build: integer R+R addition subtracts */
+#if defined(LUAJ_CONTROL_MISCOMPILE) && LUAJ_CONTROL_MISCOMPILE == 1
+      /* must-fail control build 1: generic integer R+R addition subtracts */
       e_arith(j, pc, a, nreg(GETARG_B(i)), nreg(GETARG_C(i)), W_I64SUB, W_F64ADD);
 #else
       e_arith(j, pc, a, nreg(GETARG_B(i)), nreg(GETARG_C(i)), W_I64ADD, W_F64ADD);
