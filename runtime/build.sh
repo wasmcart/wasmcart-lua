@@ -225,7 +225,7 @@ if [ -f "$THREE_C/include/three.h" ]; then
     rm -f vendor/libthree_c.a
     emar rcs vendor/libthree_c.a vendor/three-c-obj/*.o
   fi
-  THREE_FLAGS="-DWCL_THREE_C -I $THREE_C/include vendor/libthree_c.a"
+  THREE_FLAGS="-DWCL_THREE_C -DT3_F64_MATH -I $THREE_C/include vendor/libthree_c.a"
   echo "three.c: ENABLED ($THREE_C)"
 else
   echo "three.c: not found at $THREE_C (THREE_C=<checkout> ./build.sh); three.lua renders in Lua"

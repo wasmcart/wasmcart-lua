@@ -2103,6 +2103,10 @@ void wcl_r2d__rebind_2d_state(void) {
     glBindVertexArray(vao);
     glBindBuffer(GL_ARRAY_BUFFER, buffer);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, index_buffer);
+    /* the batches draw with whatever program is bound, and an outside
+     * renderer (three_c.c) leaves its own: put the 2D one back (free when it
+     * already is, through the cache) */
+    use_program(active_shader >= 0 ? shaders[active_shader].program : program);
 }
 
 void wcl_r2d__invalidate_texture_binding(void) {

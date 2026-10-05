@@ -551,6 +551,15 @@ static image_t *image_by_id(int id) {
     return &images[id];
 }
 
+/* An image's pixels (RGBA8, row 0 at the top), for three_c.c to make a
+ * texture of without a copy through Lua. NULL for a GPU-only canvas. */
+const uint8_t *wcl_image_rgba(int id, int *w, int *h) {
+    image_t *im = image_by_id(id);
+    if (!im || !im->rgba) return NULL;
+    *w = im->w; *h = im->h;
+    return im->rgba;
+}
+
 static int image_load(const char *path) {
     for (int i = 0; i < MAX_IMAGES; i++)
         if (images[i].active && !images[i].is_canvas && strcmp(images[i].path, path) == 0)

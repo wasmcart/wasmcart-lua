@@ -474,12 +474,10 @@ static int l_visible(lua_State *L) { ((t3_object *)P(L, 1))->visible = B(2); ret
  * (column-major, as Matrix4.elements). Marks the world matrix for update. */
 static int l_matrix(lua_State *L) {
     t3_object *o = (t3_object *)P(L, 1);
-    for (int i = 0; i < 16; i++) {
-        lua_rawgeti(L, 2, i + 1);
-        o->matrix.e[i] = (float)lua_tonumber(L, -1);
-        lua_pop(L, 1);
-    }
-    o->matrix_world_needs_update = true;
+    double e[16];
+    Table *tb = tab_at(L, 2);
+    for (int i = 0; i < 16; i++) e[i] = tab_num(tb, i + 1);
+    t3_object_set_matrix_d(o, e);
     return 0;
 }
 
@@ -496,14 +494,36 @@ static void fill(lua_State *L, int t, const float *e, int n) {
     }
 }
 
+static void fill_d(lua_State *L, int t, const double *e, int n) {
+    Table *tb = tab_at(L, t);
+    if (tb && tb->alimit >= (unsigned)n) {
+        for (int i = 0; i < n; i++) setfltvalue(&tb->array[i], e[i]);
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        lua_pushnumber(L, e[i]);
+        lua_rawseti(L, t, i + 1);
+    }
+}
+
 /* t3.world(h, elements) / t3.local(h, elements): copy matrixWorld / matrix
- * into a Lua array (Matrix4.elements). */
+ * into a Lua array (Matrix4.elements): the double-precision ones (three.c
+ * built with T3_F64_MATH keeps them), so Lua reads three.js's numbers. */
+#ifdef T3_F64_MATH
+static int l_world(lua_State *L) { fill_d(L, 2, ((t3_object *)P(L, 1))->_mwd, 16); return 0; }
+static int l_local(lua_State *L) { fill_d(L, 2, ((t3_object *)P(L, 1))->_md, 16); return 0; }
+#else
 static int l_world(lua_State *L) { fill(L, 2, ((t3_object *)P(L, 1))->matrix_world.e, 16); return 0; }
 static int l_local(lua_State *L) { fill(L, 2, ((t3_object *)P(L, 1))->matrix.e, 16); return 0; }
+#endif
 /* t3.camera_matrices(cam, worldInverse, projection, projectionInverse) */
 static int l_camera_matrices(lua_State *L) {
     t3_camera *c = (t3_camera *)P(L, 1);
+#ifdef T3_F64_MATH
+    if (lua_istable(L, 2)) fill_d(L, 2, c->_mwid, 16);
+#else
     if (lua_istable(L, 2)) fill(L, 2, c->matrix_world_inverse.e, 16);
+#endif
     if (lua_istable(L, 3)) fill(L, 3, c->projection_matrix.e, 16);
     if (lua_istable(L, 4)) fill(L, 4, c->projection_matrix_inverse.e, 16);
     return 0;
@@ -525,7 +545,11 @@ static int l_update_world_matrix(lua_State *L) {
 }
 /* t3.world_position(h) -> x, y, z (no update: call update_world_matrix first) */
 static int l_world_position(lua_State *L) {
+#ifdef T3_F64_MATH
+    const double *e = ((t3_object *)P(L, 1))->_mwd;
+#else
     const float *e = ((t3_object *)P(L, 1))->matrix_world.e;
+#endif
     lua_pushnumber(L, e[12]); lua_pushnumber(L, e[13]); lua_pushnumber(L, e[14]);
     return 3;
 }
@@ -784,7 +808,10 @@ enum {
 
 /* t3.mat_set(h, cr,cg,cb, er,eg,eb, sr,sg,sb, opacity, shininess, roughness,
  *            metalness, emissiveIntensity, side, flags, alphaTest,
- *            aoMapIntensity, normalScaleX, normalScaleY)
+ *            aoMapIntensity, normalScaleX, normalScaleY,
+ *            blending, premultipliedAlpha, blendSrc, blendDst, blendEquation,
+ *            blendSrcAlpha, blendDstAlpha, blendEquationAlpha, depthFunc)
+ * (the alpha factors -1 = null)
  * flags: MF_* bits. Bumps version (three.js needsUpdate) only when a field
  * that selects the program changed; colours and scalars are uniforms. */
 static int l_mat_set(lua_State *L) {
@@ -816,6 +843,13 @@ static int l_mat_set(lua_State *L) {
         m->version++;
     }
     m->visible = vis;
+    if (!lua_isnoneornil(L, 22)) {
+        m->blending = I(22);
+        m->premultiplied_alpha = B(23);
+        m->blend_src = I(24); m->blend_dst = I(25); m->blend_equation = I(26);
+        m->blend_src_alpha = I(27); m->blend_dst_alpha = I(28); m->blend_equation_alpha = I(29);
+        m->depth_func = I(30);
+    }
     return 0;
 }
 
@@ -849,6 +883,31 @@ static int l_texture(lua_State *L) {
     if (len < (size_t)w * (size_t)h * 4) return luaL_error(L, "t3.texture: %d bytes for %dx%d", (int)len, w, h);
     t3_texture *t = B(4) ? t3_data_texture_new(w, h, (const uint8_t *)px) : t3_texture_new(w, h, (const uint8_t *)px);
     return push_owned(L, t);
+}
+
+const uint8_t *wcl_image_rgba(int id, int *w, int *h);
+
+/* t3.texture_image(imageId, isData) -> h | nil: a texture of an engine
+ * image's pixels (love Image / ImageData), read in place */
+static int l_texture_image(lua_State *L) {
+    int w = 0, h = 0;
+    const uint8_t *px = wcl_image_rgba(I(1), &w, &h);
+    if (!px) { lua_pushnil(L); return 1; }
+    t3_texture *t = B(2) ? t3_data_texture_new(w, h, px) : t3_texture_new(w, h, px);
+    return push_owned(L, t);
+}
+
+/* t3.tex_update_image(h, imageId) -> ok: new pixels from the image (same
+ * size; false when it changed size, to make the texture anew) */
+static int l_tex_update_image(lua_State *L) {
+    t3_texture *t = (t3_texture *)P(L, 1);
+    int w = 0, h = 0;
+    const uint8_t *px = wcl_image_rgba(I(2), &w, &h);
+    if (!px || w != t->width || h != t->height) { lua_pushboolean(L, 0); return 1; }
+    memcpy(t->pixels, px, (size_t)w * (size_t)h * 4);
+    t->version++;
+    lua_pushboolean(L, 1);
+    return 1;
 }
 
 /* t3.tex_set(h, wrapS, wrapT, magFilter, minFilter, flipY, generateMipmaps,
@@ -1161,6 +1220,7 @@ static const luaL_Reg t3_lib[] = {
     { "geo_morph", l_geo_morph }, { "morph_influences", l_morph_influences },
     { "material", l_material }, { "mat_set", l_mat_set }, { "mat_map", l_mat_map },
     { "texture", l_texture }, { "tex_set", l_tex_set }, { "tex_update", l_tex_update },
+    { "texture_image", l_texture_image }, { "tex_update_image", l_tex_update_image },
     { "instance_matrices", l_instance_matrices }, { "instance_count", l_instance_count },
     { "instance_colors", l_instance_colors }, { "instance_rows", l_instance_rows },
     { "instance_set", l_instance_set }, { "instance_trs", l_instance_trs }, { "instance_euler", l_instance_euler },
