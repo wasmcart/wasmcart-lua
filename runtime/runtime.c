@@ -25,6 +25,9 @@
 #include "render2d_gl.h"
 #include "render3d_gl.h"
 #include "wc_cart.h"
+#ifdef WCL_USE_GL
+#include "gl_hooks.h"   /* the engine's GL calls, noted (after the GL declarations) */
+#endif
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
@@ -64,6 +67,11 @@ extern int wcl_decode_opus(const unsigned char *data, int size,
 void wcl_open_physics(lua_State *L);
 /* physics3d.c: Box3D bound as the global `b3` */
 void wcl_open_physics3d(lua_State *L);
+#ifdef WCL_THREE_C
+/* three_c.c: three.c (the three.js r128 API in C) as the global `t3`, which
+ * three.lua renders through when it is present */
+void wcl_open_three_c(lua_State *L);
+#endif
 
 #include <stdlib.h>
 #include <string.h>
@@ -3580,6 +3588,9 @@ WC_EXPORT_INIT void wc_init(void) {
      * windfield-shaped collider API on top of it */
     wcl_open_physics(L);
     wcl_open_physics3d(L);
+#ifdef WCL_THREE_C
+    wcl_open_three_c(L);
+#endif
 
     /* the cart's resolution choice, before anything captures the dims */
     apply_conf();
@@ -3655,8 +3666,20 @@ WC_EXPORT_RENDER void wc_render(void) {
         }
 
         /* GC at the frame boundary only: a budgeted incremental step keeps
-         * collection off the critical path instead of spiking mid-frame. */
-        lua_gc(L, LUA_GCSTEP, 4);
+         * collection off the critical path instead of spiking mid-frame.
+         * Only after a frame that allocated: LUA_GCSTEP adds its 4KB to the
+         * collector's debt whether or not anything was allocated, so a frame
+         * that made no garbage still paid for a step through the whole heap
+         * (a sixth of a static three.lua frame). */
+        {
+            static int gc_last_b = -1;
+            int b = lua_gc(L, LUA_GCCOUNT) * 1024 + lua_gc(L, LUA_GCCOUNTB);
+            if (b != gc_last_b) {
+                lua_gc(L, LUA_GCSTEP, 4);
+                b = lua_gc(L, LUA_GCCOUNT) * 1024 + lua_gc(L, LUA_GCCOUNTB);
+            }
+            gc_last_b = b;
+        }
         dbg_gc_kb = (uint32_t)lua_gc(L, LUA_GCCOUNT);
     }
 

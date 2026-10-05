@@ -19,6 +19,7 @@
 
 #define WC_USE_GL
 #include "wasmcart.h"
+#include "gl_hooks.h"   /* the engine's GL calls, noted (after the GL declarations) */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1052,6 +1053,39 @@ void wcl_r3d__forget_depth_cull_state(void) {
     gl_front_face_cw_set = -1;
 }
 
+/* GL calls made outside the engine (three.c's renderer, bound as `t3`) leave
+ * every mirror in this file stale: the shared VAO may hold another layout,
+ * and depth, cull and the colour mask are whatever that renderer left. Put
+ * GL back to what the mirrors describe with nothing 3D in flight, which is
+ * also the state a 2D draw expects. */
+/* The lazy form (wcl_r2d__after_external): record what the outside renderer
+ * left (-1 = unknown, so assume on) and let the next 2D draw's
+ * wcl_r3d__restore_for_2d put it back. */
+static int external_dirty;
+void wcl_r3d__after_external(int depth_test, int cull) {
+    attribs_bound_mesh = NULL;
+    depth_test_on = depth_test != 0;
+    cull_on = cull != 0;
+    wcl_r3d__forget_depth_cull_state();
+    r3d_state_dirty = 1;
+    external_dirty = 1;
+}
+/* the 3D-state restore pending is the outside renderer's (no engine 3D
+ * since): the frame end leaves it to the next 2D draw */
+int wcl_r3d__external_dirty(void) { return external_dirty && r3d_state_dirty; }
+
+void wcl_r3d__after_external_gl(void) {
+    attribs_bound_mesh = NULL;
+    glDisable(GL_DEPTH_TEST);
+    depth_test_on = 0;
+    glDisable(GL_CULL_FACE);
+    cull_on = 0;
+    wcl_r3d__forget_depth_cull_state();
+    glDepthMask(1);
+    glColorMask((GLboolean)!!mask_r, (GLboolean)!!mask_g, (GLboolean)!!mask_b, (GLboolean)!!mask_a);
+    r3d_state_dirty = 0;
+}
+
 static void apply_depth(void) {
     int want = depth_compare != 0;
     if (want != depth_test_on) {
@@ -1154,6 +1188,7 @@ int wcl_r3d_used_this_frame(void) { return used_this_frame; }
 void wcl_r3d__restore_for_2d(void) {
     if (!r3d_state_dirty) return;
     r3d_state_dirty = 0;
+    external_dirty = 0;
     wcl_r3d_leave();
 }
 
@@ -1353,6 +1388,7 @@ static int mesh_draw_common(int handle, uint32_t tint, int alpha, int instances)
      * vertices at the wrong stride, which renders garbage rather than
      * failing. */
     r3d_state_dirty = 1;
+    external_dirty = 0;   /* the pending restore is the engine's own now */
     return 1;
 }
 

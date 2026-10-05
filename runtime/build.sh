@@ -197,6 +197,40 @@ else
   echo "Opus: disabled (WCL_OPUS=1 ./build.sh to fetch and enable)"
 fi
 
+# ── three.c (the three.js r128 API in C), bound as the global `t3` ──
+# three.lua renders through it when the engine has it: the scene graph,
+# matrices, culling and drawing run in C behind three.lua's Lua API. A
+# sibling checkout by default ($THREE_C overrides). Rebuilt whenever a three.c
+# source or header is newer than the archive, since it is developed alongside
+# this engine. stb_image is compiled STATIC there: runtime.c has its own copy.
+THREE_C="${THREE_C:-../../three.c}"
+THREE_FLAGS=""
+if [ -f "$THREE_C/include/three.h" ]; then
+  T3_SRC="math core geometry curves animation raycaster loaders gltf program renderer gen/shaderlib"
+  newest=$(ls -t "$THREE_C"/src/*.c "$THREE_C"/src/*.h "$THREE_C"/src/gen/*.c "$THREE_C"/include/*.h | head -1)
+  if [ ! -f vendor/libthree_c.a ] || [ "$newest" -nt vendor/libthree_c.a ]; then
+    mkdir -p vendor/three-c-obj && rm -f vendor/three-c-obj/*.o
+    pids=()
+    for s in $T3_SRC; do
+      emcc -c "$THREE_C/src/$s.c" -o "vendor/three-c-obj/${s//\//_}.o" \
+        -O2 -DNDEBUG -flto -msimd128 -msse2 -std=c99 -DT3_WASMCART -DSTB_IMAGE_STATIC -DT3_F64_MATH \
+        -I "$WASMCART_REPO/include" -I "$THREE_C/include" -I "$THREE_C/src" &
+      pids+=($!)
+    done
+    # every compile must succeed: a missing object would still link, its
+    # functions turned into imports by ERROR_ON_UNDEFINED_SYMBOLS=0
+    fail=0
+    for p in "${pids[@]}"; do wait "$p" || fail=1; done
+    [ $fail = 0 ] || { echo "three.c compile failed" >&2; exit 1; }
+    rm -f vendor/libthree_c.a
+    emar rcs vendor/libthree_c.a vendor/three-c-obj/*.o
+  fi
+  THREE_FLAGS="-DWCL_THREE_C -I $THREE_C/include vendor/libthree_c.a"
+  echo "three.c: ENABLED ($THREE_C)"
+else
+  echo "three.c: not found at $THREE_C (THREE_C=<checkout> ./build.sh); three.lua renders in Lua"
+fi
+
 # ── embed the Lua API surface (games ship ONLY their own Lua) ────────
 python3 - <<'PY'
 # The ffi shim is appended to the prelude as a PRELOADED MODULE rather than
@@ -233,7 +267,7 @@ mkdir -p ../build
 build_engine() {   # $1 = output, $2... = extra flags
   local out="$1"; shift
   emcc runtime.c vorbis.c decoders.c cartconf.c physics.c physics3d.c wc_taskpool.c \
-    render2d_gl.c render3d_gl.c \
+    render2d_gl.c render3d_gl.c three_c.c \
     vendor/liblua54.a vendor/libbox2d.a vendor/libbox3d.a \
     -O2 -msimd128 -msse2 -DWC_USE_NET_PEER -DWC_PHYSICS_SIMD='"wasm-simd128"' \
     $OPUS_FLAGS "$@" \
@@ -247,7 +281,13 @@ build_engine() {   # $1 = output, $2... = extra flags
   echo "built $out ($(wc -c < "$out") bytes)"
 }
 
-build_engine ../build/engine.wasm -DWCL_USE_GL -DWCL_ENABLE_GL2D
+# ENGINE_OUT=<path>: build only the GL engine, to that path (side-by-side
+# builds for before/after measurement; nothing in ../build is touched)
+if [ -n "${ENGINE_OUT:-}" ]; then
+  build_engine "$ENGINE_OUT" -DWCL_USE_GL -DWCL_ENABLE_GL2D $THREE_FLAGS ${ENGINE_EXTRA:-}
+  exit 0
+fi
+build_engine ../build/engine.wasm -DWCL_USE_GL -DWCL_ENABLE_GL2D $THREE_FLAGS
 
 # ── the CPU-only comparator ─────────────────────────────────────────
 # Imports nothing from the `gl` module, so it is what the GL build is

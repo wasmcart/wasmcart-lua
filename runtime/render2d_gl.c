@@ -30,6 +30,7 @@
 
 #define WC_USE_GL
 #include "wasmcart.h"
+#include "gl_hooks.h"   /* the engine's GL calls, noted (after the GL declarations) */
 #define WC_GL_BLIT_IMPLEMENTATION
 #include "wc_gl_blit.h"
 #include <string.h>
@@ -157,6 +158,7 @@ static void flush_batches(void);
  * 3D path used to restore this itself after every draw; it now defers here so
  * consecutive 3D draws do not pay for state nothing looks at in between. */
 void wcl_r3d__restore_for_2d(void);
+int wcl_r3d__external_dirty(void);
 /* Custom shaders (defined further down). Declared here because set_textured
  * and bind_texture, which sit above them, must consult the bound program. */
 /* 8 was sized for a 2D cart, where a shader is an effect and two or three is
@@ -1982,6 +1984,31 @@ int wcl_r2d_init(int w, int h) {
     return 1;
 }
 
+/* see gl_hooks.h: whether the engine issued GL since an outside renderer
+ * last handed the context back, and the frame-start clear, deferred */
+int wcl_gl_touched = 1;
+int wcl_clear_pending = 0;
+int wcl_clear_color_touched = 0;
+static uint32_t pending_clear_color;
+
+/* The frame-start clear, done at the frame's first GL call (gl_hooks.h) or
+ * at its end. Deferred so an outside renderer that clears the whole target
+ * anyway (three.c with autoClear) can drop it: the same pixels, two GL calls
+ * fewer per frame. Issued unhooked: it changes only the clear colour, which
+ * wcl_clear_color_touched reports. */
+void wcl__run_pending_clear(void) {
+    wcl_clear_pending = 0;
+    if (pending_clear_color != current_clear_color) {
+        glClearColor((float)((pending_clear_color >> 16) & 255) / 255.0f,
+                     (float)((pending_clear_color >> 8) & 255) / 255.0f,
+                     (float)(pending_clear_color & 255) / 255.0f, 1.0f);
+        current_clear_color = pending_clear_color;
+        wcl_clear_color_touched = 1;
+    }
+    glClear(GL_COLOR_BUFFER_BIT);
+}
+void wcl__drop_pending_clear(void) { wcl_clear_pending = 0; }
+
 int wcl_r2d_begin(uint32_t clear_color) {
     if (!ready) return 0;
     solid_batch_count = 0;
@@ -1994,13 +2021,8 @@ int wcl_r2d_begin(uint32_t clear_color) {
         return 0;
     }
     frame_disabled = 0;
-    if (clear_color != current_clear_color) {
-        glClearColor((float)((clear_color >> 16) & 255) / 255.0f,
-                     (float)((clear_color >> 8) & 255) / 255.0f,
-                     (float)(clear_color & 255) / 255.0f, 1.0f);
-        current_clear_color = clear_color;
-    }
-    glClear(GL_COLOR_BUFFER_BIT);
+    pending_clear_color = clear_color;
+    wcl_clear_pending = 1;
     return 1;
 }
 
@@ -2014,12 +2036,16 @@ static uint32_t blit_rgba[WCL_MAX_PIXELS];
 
 void wcl_r2d_end(const uint32_t *fb) {
     if (wcl_r2d_active()) {
+        /* a frame that drew nothing still shows its clear */
+        if (wcl_clear_pending) wcl__run_pending_clear();
         flush_batches();
         /* Never end a frame in 3D state. Before the restore was deferred, the
          * last 3D draw always put the 2D VAO back; a frame whose final draw is
          * 3D would otherwise hand the next frame (and anything the host does
-         * between frames) depth test, culling and the 3D VAO. */
-        wcl_r3d__restore_for_2d();
+         * between frames) depth test, culling and the 3D VAO. Except after an
+         * outside renderer: then the next 2D draw restores (it would anyway),
+         * and the outside renderer keeps its own state to the next frame. */
+        if (!wcl_r3d__external_dirty()) wcl_r3d__restore_for_2d();
         /* leave the screen bound for the next frame */
         if (current_target) wcl_r2d_target(NULL, 0, 0);
     } else if (ready && frame_disabled && fb) {
@@ -2081,6 +2107,135 @@ void wcl_r2d__rebind_2d_state(void) {
 
 void wcl_r2d__invalidate_texture_binding(void) {
     bound_texture = 0;
+}
+
+/* Before GL calls from outside the engine: nothing pending may land after
+ * them. Exposed for three_c.c, which renders a whole three.js scene through
+ * its own GL state between two 2D draws. */
+void wcl_r2d__flush_for_external_gl(void) {
+    if (!wcl_r2d_active()) return;
+    flush_batches();
+}
+
+/* defined with the host-viewport code below */
+static int host_vp_x, host_vp_y, host_vp_w, host_vp_h;
+
+/* The target the engine is drawing into: the screen (fbo 0, the host's
+ * viewport) or a canvas. An outside renderer draws where the cart would. */
+void wcl_r2d__current_target(unsigned *fbo, int *x, int *y, int *w, int *h) {
+    if (current_target) {
+        *fbo = current_target->fbo; *x = 0; *y = 0; *w = current_target->w; *h = current_target->h;
+    } else if (host_vp_w > 0 && host_vp_h > 0) {
+        *fbo = 0; *x = host_vp_x; *y = host_vp_y; *w = host_vp_w; *h = host_vp_h;
+    } else {
+        *fbo = 0; *x = 0; *y = 0; *w = width; *h = height;
+    }
+}
+
+void wcl_r3d__after_external_gl(void);
+void wcl_r3d__after_external(int depth_test, int cull);
+int wcl_r3d__external_dirty(void);
+static int stencil_test_on;   /* defined with the stencil code below */
+/* what wcl_r2d__after_external changed (three_c.c maps these to three.c's
+ * T3_FORGET_* bits) */
+#define WCL_EXT_FBO 1u
+#define WCL_EXT_VIEWPORT 2u
+#define WCL_EXT_VAO 4u
+#define WCL_EXT_UNIT 8u
+#define WCL_EXT_CAPS 16u
+#define WCL_EXT_SCISSOR 32u
+
+/* After an outside renderer that reports what it left GL in (three.c's
+ * t3_renderer_gl_state): put back only what differs from what this engine
+ * relies on, so a frame's handoff costs a few GL calls instead of a full
+ * reset. -1 means the outside renderer does not know (put it back).
+ *
+ * Eager: the framebuffer and viewport (a clear at the next frame start uses
+ * them), the 2D vertex array (an engine buffer bind with the outside VAO
+ * current would write into that VAO), the active texture unit (engine
+ * texture uploads assume unit 0), scissor enable and the blend function.
+ * Lazy, through the caches: program, texture binding, blend enable, clear
+ * colour, and the 3D pipeline's depth / cull state (wcl_r3d__restore_for_2d
+ * runs before every 2D draw). */
+/* Returns what it changed in GL, as WCL_EXT_* bits, so the outside renderer
+ * can forget exactly that (and keep the rest of its cache) next time. */
+unsigned wcl_r2d__after_external(int fbo, int vp_known, int vx, int vy, int vw, int vh,
+                                 int active_unit, int vao, int blend_func_set, int scissor,
+                                 int depth_test, int cull, float clear_r, float clear_g, float clear_b,
+                                 int clear_known) {
+    unsigned changed = 0;
+    if (!wcl_r2d_active()) return changed;
+    GLuint want = current_target ? current_target->fbo : 0;
+    if (fbo != (int)want) { glBindFramebuffer(GL_FRAMEBUFFER, want); changed |= WCL_EXT_FBO; }
+    int tx, ty, tw, th;
+    if (current_target) { tx = 0; ty = 0; tw = current_target->w; th = current_target->h; }
+    else if (host_vp_w > 0 && host_vp_h > 0) { tx = host_vp_x; ty = host_vp_y; tw = host_vp_w; th = host_vp_h; }
+    else { tx = 0; ty = 0; tw = width; th = height; }
+    if (!vp_known || vx != tx || vy != ty || vw != tw || vh != th) { glViewport(tx, ty, tw, th); changed |= WCL_EXT_VIEWPORT; }
+    /* the outside VAO unbound (one call): an engine buffer bind must not land
+     * in it. The 2D VAO comes back lazily (wcl_r3d__restore_for_2d) */
+    if (vao != 0) { glBindVertexArray(0); changed |= WCL_EXT_VAO; }
+    if (active_unit != 0) { glActiveTexture(GL_TEXTURE0); changed |= WCL_EXT_UNIT; }
+    bound_program = 0;
+    textured_enabled = -1;
+    bound_texture = 0;
+    if (blend_func_set) {
+        int mode = blend_mode_cur, premult = blend_premult_cur;
+        blend_mode_cur = -1;
+        wcl_r2d_blend_mode(mode, premult);
+        changed |= WCL_EXT_CAPS;
+    } else {
+        blend_enabled = -1;
+    }
+    if (scissor != scissor_on) {
+        if (scissor_on) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+        changed |= WCL_EXT_SCISSOR;
+    }
+    /* what the clear colour now is, so the next frame's clear knows */
+    if (clear_known && clear_r >= 0) {
+        uint32_t c = ((uint32_t)(clear_r * 255.0f + 0.5f) << 16) | ((uint32_t)(clear_g * 255.0f + 0.5f) << 8) |
+                     (uint32_t)(clear_b * 255.0f + 0.5f);
+        /* exact only when the outside colour is one this engine can say */
+        float back_r = (float)((c >> 16) & 255) / 255.0f, back_g = (float)((c >> 8) & 255) / 255.0f,
+              back_b = (float)(c & 255) / 255.0f;
+        current_clear_color = (back_r == clear_r && back_g == clear_g && back_b == clear_b) ? c : 0xFFFFFFFFu;
+    } else {
+        current_clear_color = 0xFFFFFFFFu;
+    }
+    wcl_r3d__after_external(depth_test, cull);
+    return changed;
+}
+
+/* After GL calls from outside the engine: every value this file caches may
+ * be stale. Re-issue the state a 2D draw relies on, from the mirrors, the
+ * way a frame starts. The outside renderer owns none of it: whatever it
+ * changed (program, textures, blending, framebuffer, viewport, clear colour)
+ * goes back to what the cart last set. */
+void wcl_r2d__after_external_gl(void) {
+    if (!wcl_r2d_active()) return;
+    wcl_r3d__after_external_gl();
+    if (current_target) {
+        glBindFramebuffer(GL_FRAMEBUFFER, current_target->fbo);
+        glViewport(0, 0, current_target->w, current_target->h);
+    } else {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        restore_screen_viewport();
+    }
+    bound_program = 0;
+    use_program(active_shader >= 0 ? shaders[active_shader].program : program);
+    textured_enabled = -1;
+    glActiveTexture(GL_TEXTURE0);
+    bound_texture = 0;
+    /* blend: re-apply the cart's mode in full (function, equation, enable) */
+    int mode = blend_mode_cur, premult = blend_premult_cur;
+    blend_mode_cur = -1;
+    wcl_r2d_blend_mode(mode, premult);
+    if (scissor_on) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    if (stencil_test_on) glEnable(GL_STENCIL_TEST); else glDisable(GL_STENCIL_TEST);
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    current_clear_color = 0xFFFFFFFFu;
+    wcl_r2d__rebind_2d_state();
 }
 
 /* Restore the screen's viewport and the clip-space scale derived from it.

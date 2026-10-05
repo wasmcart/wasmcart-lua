@@ -43,3 +43,8 @@ runtime/vendor/opus/
 runtime/vendor/ogg/
 runtime/vendor/opusfile/
 runtime/vendor/opus-obj/
+
+# side-by-side engine builds (runtime/build.sh ENGINE_OUT=...) and three.c objects
+/build-t3/
+/build-before-three-c/
+runtime/vendor/three-c-obj/
