@@ -1459,6 +1459,114 @@ static void e_arraykey (J *j, Ad t, int kreg, int kc) {
   e_i32(j, 0x0f); E(j, W_I32AND); E(j, W_I32EQZ); e_brif(j, 0);
 }
 
+/*
+** Inline getgeneric for a key held in local 'kloc' that is a short string
+** (keystr) or a table (otherwise): main position as ltable.c computes it
+** (hash & (size-1) for strings, pointer % ((size-1)|1) for objects), then
+** the 'next' chain, comparing tag and pointer (equalkey). Same contract as
+** e_hfind: hit leaves the node in 'sloc', miss branches 'missdepth' out.
+*/
+static void e_hfinddyn (J *j, int tloc, int kloc, int keystr, int sloc, int missdepth) {
+  int nx = LV_T0 + 4;
+  e_lget(j, tloc); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(Table, node));
+  if (keystr) {
+    e_lget(j, kloc); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(TString, hash));
+    e_i32(j, 1);
+    e_lget(j, tloc); e_mem(j, W_I32LOAD8U, 0, (uint32_t)offsetof(Table, lsizenode));
+    E(j, W_I32SHL); e_i32(j, 1); E(j, W_I32SUB);
+    E(j, W_I32AND);
+  }
+  else {
+    e_lget(j, kloc);
+    e_i32(j, 1);
+    e_lget(j, tloc); e_mem(j, W_I32LOAD8U, 0, (uint32_t)offsetof(Table, lsizenode));
+    E(j, W_I32SHL); e_i32(j, 1); E(j, W_I32SUB);
+    e_i32(j, 1); E(j, W_I32OR);
+    E(j, 0x70 /* i32.rem_u */);
+  }
+  e_i32(j, (int32_t)sizeof(Node)); E(j, W_I32MUL);
+  E(j, W_I32ADD);
+  e_lset(j, sloc);
+  e_block(j);  /* found */
+  E(j, W_LOOP); E(j, T_VOID); j->extra++;
+  e_block(j);  /* next */
+  e_lget(j, sloc); e_mem(j, W_I32LOAD8U, 0, (uint32_t)offsetof(Node, u.key_tt));
+  e_i32(j, keystr ? TAG_SSTR : TAG_TAB); E(j, W_I32NE); e_brif(j, 0);
+  e_lget(j, sloc); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(Node, u.key_val));
+  e_lget(j, kloc); E(j, W_I32NE); e_brif(j, 0);
+  e_lget(j, sloc); e_mem(j, W_I32LOAD8U, 0, TTOFF);
+  e_i32(j, 0x0f); E(j, W_I32AND); E(j, W_I32EQZ); e_brif(j, missdepth + 3);
+  e_br(j, 2);
+  e_end(j);
+  e_lget(j, sloc); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(Node, u.next));
+  e_ltee(j, nx);
+  E(j, W_I32EQZ); e_brif(j, missdepth + 2);
+  e_lget(j, sloc); e_lget(j, nx); e_i32(j, (int32_t)sizeof(Node)); E(j, W_I32MUL);
+  E(j, W_I32ADD); e_lset(j, sloc);
+  e_br(j, 0);
+  e_end(j);  /* loop */
+  e_end(j);  /* found */
+}
+
+/*
+** GETTABLE / SETTABLE with a register key: integer keys on the array part,
+** short-string and table keys through the hash part, all inline; misses,
+** other key types and metamethods in the helper. 'v' is the value to store
+** (setting) or the destination register is 'a' (getting).
+*/
+static void e_tablekey (J *j, int pc, int t, int k, int a, Ad v, int set) {
+  int tt = LV_T0 + 2, kt = LV_T0 + 5, kp = LV_T0 + 3, slot = LV_T0 + 1;
+  e_block(j);  /* done */
+  e_block(j);  /* slow */
+  e_block(j);  /* hit: falls out with the TValue in 'slot' */
+  e_ldtag(j, R(t)); e_i32(j, TAG_TAB); E(j, W_I32NE); e_brif(j, 1);
+  e_ldptr(j, R(t)); e_lset(j, tt);
+  e_ldtag(j, R(k)); e_lset(j, kt);
+  e_block(j);  /* integer key, array part (luaV_fastgeti) */
+  e_lget(j, kt); e_i32(j, TAG_INT); E(j, W_I32NE); e_brif(j, 0);
+  e_ldi64(j, R(k)); e_i64(j, 1); E(j, W_I64SUB); e_lset(j, LV_X0);
+  e_lget(j, LV_X0);
+  e_lget(j, tt); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(Table, alimit));
+  E(j, W_I64EXTI32U);
+  E(j, W_I64LTU); E(j, W_I32EQZ); e_brif(j, 2);
+  e_lget(j, tt); e_mem(j, W_I32LOAD, 2, (uint32_t)offsetof(Table, array));
+  e_lget(j, LV_X0); E(j, W_I32WRAPI64); e_i32(j, 4); E(j, W_I32SHL);
+  E(j, W_I32ADD);
+  e_ltee(j, slot);
+  e_mem(j, W_I32LOAD8U, 0, TTOFF);
+  e_i32(j, 0x0f); E(j, W_I32AND); E(j, W_I32EQZ); e_brif(j, 2);
+  e_br(j, 1);
+  e_end(j);
+  e_block(j);  /* short-string key */
+  e_lget(j, kt); e_i32(j, TAG_SSTR); E(j, W_I32NE); e_brif(j, 0);
+  e_ldptr(j, R(k)); e_lset(j, kp);
+  e_hfinddyn(j, tt, kp, 1, slot, 2);
+  e_br(j, 1);
+  e_end(j);
+  /* table key */
+  e_lget(j, kt); e_i32(j, TAG_TAB); E(j, W_I32NE); e_brif(j, 1);
+  e_ldptr(j, R(k)); e_lset(j, kp);
+  e_hfinddyn(j, tt, kp, 0, slot, 1);
+  e_end(j);  /* hit */
+  if (!set)
+    e_copy(j, R(a), LA(slot));
+  else {
+    e_copy(j, LA(slot), v);
+    e_ldtag(j, v); e_i32(j, BIT_ISCOLLECTABLE); E(j, W_I32AND);
+    e_if(j);
+    e_lget(j, LV_L); e_lget(j, tt); e_ptr(j, v); e_call(j, H_BARRIERBACK);
+    e_end(j);
+  }
+  e_br(j, 1);
+  e_end(j);  /* slow */
+  e_savepc(j, pc + 1);
+  e_lget(j, LV_L); e_lget(j, LV_CI); e_ptr(j, R(t)); e_ptr(j, R(k));
+  if (!set) { e_ptr(j, R(a)); e_call(j, H_GET); }
+  else { e_ptr(j, v); e_call(j, H_SET); }
+  e_reloadbase(j);
+  e_end(j);  /* done */
+}
+
 static void e_getint (J *j, int pc, Ad t, int kreg, int kc, int a) {
   e_block(j);
   e_block(j);
@@ -2126,7 +2234,7 @@ static void e_instr_generic (J *j, int pc) {
       e_getstr(j, pc, LA(LV_T0), p->k + GETARG_C(i), a);
       break;
     case OP_GETTABLE:
-      e_getint(j, pc, R(GETARG_B(i)), GETARG_C(i), 0, a);
+      e_tablekey(j, pc, GETARG_B(i), GETARG_C(i), a, R(0), 0);
       break;
     case OP_GETI:
       e_getint(j, pc, R(GETARG_B(i)), -1, GETARG_C(i), a);
@@ -2139,7 +2247,7 @@ static void e_instr_generic (J *j, int pc) {
       e_setstr(j, pc, LA(LV_T0), p->k + GETARG_B(i), rkc(j, i));
       break;
     case OP_SETTABLE:
-      e_setint(j, pc, R(a), GETARG_B(i), 0, rkc(j, i));
+      e_tablekey(j, pc, a, GETARG_B(i), 0, rkc(j, i), 1);
       break;
     case OP_SETI:
       e_setint(j, pc, R(a), -1, GETARG_B(i), rkc(j, i));
