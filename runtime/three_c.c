@@ -607,6 +607,160 @@ static int l_anim_apply(lua_State *L) {
     return 2;
 }
 
+/* ── Matrix4 kernels for three.lua ─────────────────────────────────────
+ * Ports of three.lua's Matrix4 methods, expression for expression (the
+ * affine fast paths included), so the doubles are the same. They work on
+ * a Matrix4's elements when it is a plain 16-number array; anything else
+ * (a matrixWorld stand-in, a missing slot) returns false and the Lua
+ * method runs instead. */
+
+static int m4_get(lua_State *L, int idx, double e[16], Table **out) {
+    if (!lua_istable(L, idx)) return 0;
+    Table *t = tab_at(L, idx);
+    if (t->alimit < 16) return 0;
+    for (int i = 0; i < 16; i++) {
+        const TValue *v = &t->array[i];
+        if (ttisfloat(v)) e[i] = fltvalue(v);
+        else if (ttisinteger(v)) e[i] = (double)ivalue(v);
+        else return 0;
+    }
+    if (out) *out = t;
+    return 1;
+}
+#define SETF(t, i, v) setfltvalue(&(t)->array[(i) - 1], (v))
+#define SETI(t, i, v) setivalue(&(t)->array[(i) - 1], (v))
+
+/* t3.m4_copy(te, me) -> ok: Matrix4:copy */
+static int l_m4_copy(lua_State *L) {
+    if (!lua_istable(L, 1) || !lua_istable(L, 2)) { lua_pushboolean(L, 0); return 1; }
+    Table *a = tab_at(L, 1), *b = tab_at(L, 2);
+    if (a->alimit < 16 || b->alimit < 16) { lua_pushboolean(L, 0); return 1; }
+    for (int i = 0; i < 16; i++) setobj(L, &a->array[i], &b->array[i]);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* t3.m4_mul(te, ae, be) -> ok: Matrix4:multiplyMatrices (te may be ae or be) */
+static int l_m4_mul(lua_State *L) {
+    double ae[16], be[16];
+    Table *te;
+    if (!m4_get(L, 2, ae, NULL) || !m4_get(L, 3, be, NULL) || !lua_istable(L, 1) ||
+        (te = tab_at(L, 1))->alimit < 16) { lua_pushboolean(L, 0); return 1; }
+    if (ae[3] == 0 && ae[7] == 0 && ae[11] == 0 && ae[15] == 1 && be[3] == 0 && be[7] == 0 && be[11] == 0 && be[15] == 1) {
+        double a11 = ae[0], a21 = ae[1], a31 = ae[2], a12 = ae[4], a22 = ae[5], a32 = ae[6];
+        double a13 = ae[8], a23 = ae[9], a33 = ae[10], a14 = ae[12], a24 = ae[13], a34 = ae[14];
+        double b11 = be[0], b21 = be[1], b31 = be[2], b12 = be[4], b22 = be[5], b32 = be[6];
+        double b13 = be[8], b23 = be[9], b33 = be[10], b14 = be[12], b24 = be[13], b34 = be[14];
+        SETF(te, 1, a11 * b11 + a12 * b21 + a13 * b31);
+        SETF(te, 2, a21 * b11 + a22 * b21 + a23 * b31);
+        SETF(te, 3, a31 * b11 + a32 * b21 + a33 * b31);
+        SETI(te, 4, 0);
+        SETF(te, 5, a11 * b12 + a12 * b22 + a13 * b32);
+        SETF(te, 6, a21 * b12 + a22 * b22 + a23 * b32);
+        SETF(te, 7, a31 * b12 + a32 * b22 + a33 * b32);
+        SETI(te, 8, 0);
+        SETF(te, 9, a11 * b13 + a12 * b23 + a13 * b33);
+        SETF(te, 10, a21 * b13 + a22 * b23 + a23 * b33);
+        SETF(te, 11, a31 * b13 + a32 * b23 + a33 * b33);
+        SETI(te, 12, 0);
+        SETF(te, 13, a11 * b14 + a12 * b24 + a13 * b34 + a14);
+        SETF(te, 14, a21 * b14 + a22 * b24 + a23 * b34 + a24);
+        SETF(te, 15, a31 * b14 + a32 * b24 + a33 * b34 + a34);
+        SETI(te, 16, 1);
+    } else {
+        double a11 = ae[0], a21 = ae[1], a31 = ae[2], a41 = ae[3], a12 = ae[4], a22 = ae[5], a32 = ae[6], a42 = ae[7];
+        double a13 = ae[8], a23 = ae[9], a33 = ae[10], a43 = ae[11], a14 = ae[12], a24 = ae[13], a34 = ae[14], a44 = ae[15];
+        double b11 = be[0], b21 = be[1], b31 = be[2], b41 = be[3], b12 = be[4], b22 = be[5], b32 = be[6], b42 = be[7];
+        double b13 = be[8], b23 = be[9], b33 = be[10], b43 = be[11], b14 = be[12], b24 = be[13], b34 = be[14], b44 = be[15];
+        SETF(te, 1, a11 * b11 + a12 * b21 + a13 * b31 + a14 * b41);
+        SETF(te, 2, a21 * b11 + a22 * b21 + a23 * b31 + a24 * b41);
+        SETF(te, 3, a31 * b11 + a32 * b21 + a33 * b31 + a34 * b41);
+        SETF(te, 4, a41 * b11 + a42 * b21 + a43 * b31 + a44 * b41);
+        SETF(te, 5, a11 * b12 + a12 * b22 + a13 * b32 + a14 * b42);
+        SETF(te, 6, a21 * b12 + a22 * b22 + a23 * b32 + a24 * b42);
+        SETF(te, 7, a31 * b12 + a32 * b22 + a33 * b32 + a34 * b42);
+        SETF(te, 8, a41 * b12 + a42 * b22 + a43 * b32 + a44 * b42);
+        SETF(te, 9, a11 * b13 + a12 * b23 + a13 * b33 + a14 * b43);
+        SETF(te, 10, a21 * b13 + a22 * b23 + a23 * b33 + a24 * b43);
+        SETF(te, 11, a31 * b13 + a32 * b23 + a33 * b33 + a34 * b43);
+        SETF(te, 12, a41 * b13 + a42 * b23 + a43 * b33 + a44 * b43);
+        SETF(te, 13, a11 * b14 + a12 * b24 + a13 * b34 + a14 * b44);
+        SETF(te, 14, a21 * b14 + a22 * b24 + a23 * b34 + a24 * b44);
+        SETF(te, 15, a31 * b14 + a32 * b24 + a33 * b34 + a34 * b44);
+        SETF(te, 16, a41 * b14 + a42 * b24 + a43 * b34 + a44 * b44);
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* t3.m4_invert(te) -> ok: Matrix4:invert (affine path, else the general
+ * cofactor inverse, zero on a singular matrix) */
+static int l_m4_invert(lua_State *L) {
+    double e[16];
+    Table *te;
+    if (!m4_get(L, 1, e, &te)) { lua_pushboolean(L, 0); return 1; }
+    if (e[3] == 0 && e[7] == 0 && e[11] == 0 && e[15] == 1) {
+        double a11 = e[0], a21 = e[1], a31 = e[2], a12 = e[4], a22 = e[5], a32 = e[6];
+        double a13 = e[8], a23 = e[9], a33 = e[10], tx = e[12], ty = e[13], tz = e[14];
+        double c11 = a22 * a33 - a23 * a32;
+        double c12 = a23 * a31 - a21 * a33;
+        double c13 = a21 * a32 - a22 * a31;
+        double det = a11 * c11 + a12 * c12 + a13 * c13;
+        if (det != 0) {
+            double d = 1 / det;
+            double i11 = c11 * d;
+            double i12 = (a13 * a32 - a12 * a33) * d;
+            double i13 = (a12 * a23 - a13 * a22) * d;
+            double i21 = c12 * d;
+            double i22 = (a11 * a33 - a13 * a31) * d;
+            double i23 = (a13 * a21 - a11 * a23) * d;
+            double i31 = c13 * d;
+            double i32 = (a12 * a31 - a11 * a32) * d;
+            double i33 = (a11 * a22 - a12 * a21) * d;
+            SETF(te, 1, i11); SETF(te, 2, i21); SETF(te, 3, i31); SETI(te, 4, 0);
+            SETF(te, 5, i12); SETF(te, 6, i22); SETF(te, 7, i32); SETI(te, 8, 0);
+            SETF(te, 9, i13); SETF(te, 10, i23); SETF(te, 11, i33); SETI(te, 12, 0);
+            SETF(te, 13, -(i11 * tx + i12 * ty + i13 * tz));
+            SETF(te, 14, -(i21 * tx + i22 * ty + i23 * tz));
+            SETF(te, 15, -(i31 * tx + i32 * ty + i33 * tz));
+            SETI(te, 16, 1);
+            lua_pushboolean(L, 1);
+            return 1;
+        }
+    }
+    double n11 = e[0], n21 = e[1], n31 = e[2], n41 = e[3], n12 = e[4], n22 = e[5], n32 = e[6], n42 = e[7];
+    double n13 = e[8], n23 = e[9], n33 = e[10], n43 = e[11], n14 = e[12], n24 = e[13], n34 = e[14], n44 = e[15];
+    double t11 = n23 * n34 * n42 - n24 * n33 * n42 + n24 * n32 * n43 - n22 * n34 * n43 - n23 * n32 * n44 + n22 * n33 * n44;
+    double t12 = n14 * n33 * n42 - n13 * n34 * n42 - n14 * n32 * n43 + n12 * n34 * n43 + n13 * n32 * n44 - n12 * n33 * n44;
+    double t13 = n13 * n24 * n42 - n14 * n23 * n42 + n14 * n22 * n43 - n12 * n24 * n43 - n13 * n22 * n44 + n12 * n23 * n44;
+    double t14 = n14 * n23 * n32 - n13 * n24 * n32 - n14 * n22 * n33 + n12 * n24 * n33 + n13 * n22 * n34 - n12 * n23 * n34;
+    double det = n11 * t11 + n21 * t12 + n31 * t13 + n41 * t14;
+    if (det == 0) {
+        for (int i = 1; i <= 16; i++) SETI(te, i, 0);
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+    double d = 1 / det;
+    SETF(te, 1, t11 * d);
+    SETF(te, 2, (n24 * n33 * n41 - n23 * n34 * n41 - n24 * n31 * n43 + n21 * n34 * n43 + n23 * n31 * n44 - n21 * n33 * n44) * d);
+    SETF(te, 3, (n22 * n34 * n41 - n24 * n32 * n41 + n24 * n31 * n42 - n21 * n34 * n42 - n22 * n31 * n44 + n21 * n32 * n44) * d);
+    SETF(te, 4, (n23 * n32 * n41 - n22 * n33 * n41 - n23 * n31 * n42 + n21 * n33 * n42 + n22 * n31 * n43 - n21 * n32 * n43) * d);
+    SETF(te, 5, t12 * d);
+    SETF(te, 6, (n13 * n34 * n41 - n14 * n33 * n41 + n14 * n31 * n43 - n11 * n34 * n43 - n13 * n31 * n44 + n11 * n33 * n44) * d);
+    SETF(te, 7, (n14 * n32 * n41 - n12 * n34 * n41 - n14 * n31 * n42 + n11 * n34 * n42 + n12 * n31 * n44 - n11 * n32 * n44) * d);
+    SETF(te, 8, (n12 * n33 * n41 - n13 * n32 * n41 + n13 * n31 * n42 - n11 * n33 * n42 - n12 * n31 * n43 + n11 * n32 * n43) * d);
+    SETF(te, 9, t13 * d);
+    SETF(te, 10, (n14 * n23 * n41 - n13 * n24 * n41 - n14 * n21 * n43 + n11 * n24 * n43 + n13 * n21 * n44 - n11 * n23 * n44) * d);
+    SETF(te, 11, (n12 * n24 * n41 - n14 * n22 * n41 + n14 * n21 * n42 - n11 * n24 * n42 - n12 * n21 * n44 + n11 * n22 * n44) * d);
+    SETF(te, 12, (n13 * n22 * n41 - n12 * n23 * n41 - n13 * n21 * n42 + n11 * n23 * n42 + n12 * n21 * n43 - n11 * n22 * n43) * d);
+    SETF(te, 13, t14 * d);
+    SETF(te, 14, (n13 * n24 * n31 - n14 * n23 * n31 + n14 * n21 * n33 - n11 * n24 * n33 - n13 * n21 * n34 + n11 * n23 * n34) * d);
+    SETF(te, 15, (n14 * n22 * n31 - n12 * n24 * n31 - n14 * n21 * n32 + n11 * n24 * n32 + n12 * n21 * n34 - n11 * n22 * n34) * d);
+    SETF(te, 16, (n12 * n23 * n31 - n13 * n22 * n31 + n13 * n21 * n32 - n11 * n23 * n32 - n12 * n21 * n33 + n11 * n22 * n33) * d);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
 /* t3.quat_from_euler(x, y, z, order) -> qx, qy, qz, qw (double precision) */
 static int l_quat_from_euler(lua_State *L) {
     double x = lua_tonumber(L, 1), y = lua_tonumber(L, 2), z = lua_tonumber(L, 3);
@@ -1472,7 +1626,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "anim_apply", l_anim_apply }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
     { "matrix", l_matrix },
     { "world", l_world }, { "local_matrix", l_local }, { "camera_matrices", l_camera_matrices },
     { "update_world", l_update_world }, { "update_world_matrix", l_update_world_matrix },
