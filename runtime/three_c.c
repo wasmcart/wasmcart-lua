@@ -38,6 +38,7 @@
 #include "lgc.h"
 #include "lvm.h"
 #include "three.h"
+#include "simd_trig.h"
 #include "wasmcart.h"
 #include <string.h>
 #include <stdlib.h>
@@ -1972,7 +1973,22 @@ static int l_f64a_fill(lua_State *L) {
     f64a_t *a = f64a_check(L, 1);
     double v[16];
     for (int k = 0; k < a->stride; k++) v[k] = luaL_checknumber(L, 2 + k);
-    for (int i = 0; i < a->n; i++) memcpy(a->d + i * a->stride, v, sizeof(double) * a->stride);
+    int st = a->stride;
+    double *d = a->d;
+    if (st == 3) {
+        /* two items are three 16-byte stores */
+        v128_t p0 = wasm_f64x2_make(v[0], v[1]), p1 = wasm_f64x2_make(v[2], v[0]), p2 = wasm_f64x2_make(v[1], v[2]);
+        int i = 0;
+        for (; i + 1 < a->n; i += 2, d += 6) {
+            wasm_v128_store(d, p0); wasm_v128_store(d + 2, p1); wasm_v128_store(d + 4, p2);
+        }
+        if (i < a->n) { d[0] = v[0]; d[1] = v[1]; d[2] = v[2]; }
+    } else if (st % 2 == 0) {
+        for (int i = 0; i < a->n; i++, d += st)
+            for (int k = 0; k < st; k += 2) wasm_v128_store(d + k, wasm_f64x2_make(v[k], v[k + 1]));
+    } else {
+        for (int i = 0; i < a->n; i++) memcpy(a->d + i * st, v, sizeof(double) * st);
+    }
     return 0;
 }
 /* t3.f64a_copy(dst, src) */
@@ -2018,9 +2034,16 @@ static int l_v3a_apply_m4a(lua_State *L) {
         double x = p[0], y = p[1], z = p[2];
         double w = e[3] * x + e[7] * y + e[11] * z + e[15];
         w = (w == 0) ? 1 : (1 / w);
-        p[0] = (e[0] * x + e[4] * y + e[8] * z + e[12]) * w;
-        p[1] = (e[1] * x + e[5] * y + e[9] * z + e[13]) * w;
-        p[2] = (e[2] * x + e[6] * y + e[10] * z + e[14]) * w;
+        /* x and y two lanes at once: each lane the same sum in the same order */
+        v128_t vx = wasm_f64x2_splat(x), vy = wasm_f64x2_splat(y), vz = wasm_f64x2_splat(z);
+        v128_t xy = wasm_f64x2_add(wasm_f64x2_add(wasm_f64x2_add(wasm_f64x2_mul(wasm_v128_load(e), vx),
+                                                                 wasm_f64x2_mul(wasm_v128_load(e + 4), vy)),
+                                                  wasm_f64x2_mul(wasm_v128_load(e + 8), vz)),
+                                   wasm_v128_load(e + 12));
+        xy = wasm_f64x2_mul(xy, wasm_f64x2_splat(w));
+        double zz = (e[2] * x + e[6] * y + e[10] * z + e[14]) * w;
+        wasm_v128_store(p, xy);
+        p[2] = zz;
     }
     return 0;
 }
@@ -2052,14 +2075,55 @@ static void quat_from_euler_lua(double x, double y, double z, int order, double 
     case 5: r[0] = s1c2c3 - c1s2s3; r[1] = c1s2c3 - s1c2s3; r[2] = c1c2s3 + s1s2c3; r[3] = c1c2c3 + s1s2s3; break;
     }
 }
+/* Two items per pass: sin and cos two lanes at a time (simd_trig.h, within
+ * an ulp of the scalar functions), the products as in quat_from_euler_lua */
 static int l_qa_from_euler_scaled(lua_State *L) {
     f64a_t *q = f64a_of(L, 1, 4), *e = f64a_of(L, 2, 3);
     f64a_same_n(L, q, e);
     double s = luaL_checknumber(L, 3);
     int order = (int)luaL_optinteger(L, 4, 0);
-    double *o = q->d;
-    const double *a = e->d;
-    for (int i = 0; i < q->n; i++, o += 4, a += 3) quat_from_euler_lua(a[0] * s, a[1] * s, a[2] * s, order, o);
+    if (order < 0 || order > 5) order = 0;
+    const v128_t vs = wasm_f64x2_splat(s), half = wasm_f64x2_splat(0.5);
+    for (int i = 0; i < q->n; i += 2) {
+        int j = i + 1 < q->n ? i + 1 : i;
+        const double *a0 = e->d + i * 3, *a1 = e->d + j * 3;
+        v128_t hx = wasm_f64x2_mul(wasm_f64x2_mul(wasm_f64x2_make(a0[0], a1[0]), vs), half);
+        v128_t hy = wasm_f64x2_mul(wasm_f64x2_mul(wasm_f64x2_make(a0[1], a1[1]), vs), half);
+        v128_t hz = wasm_f64x2_mul(wasm_f64x2_mul(wasm_f64x2_make(a0[2], a1[2]), vs), half);
+        v128_t s1, c1, s2, c2, s3, c3;
+        sincos_f64x2(hx, &s1, &c1);
+        sincos_f64x2(hy, &s2, &c2);
+        sincos_f64x2(hz, &s3, &c3);
+        v128_t c1c2 = wasm_f64x2_mul(c1, c2), s1s2 = wasm_f64x2_mul(s1, s2);
+        v128_t s1c2 = wasm_f64x2_mul(s1, c2), c1s2 = wasm_f64x2_mul(c1, s2);
+        v128_t c1c2c3 = wasm_f64x2_mul(c1c2, c3), s1s2s3 = wasm_f64x2_mul(s1s2, s3);
+        v128_t s1c2c3 = wasm_f64x2_mul(s1c2, c3), c1s2s3 = wasm_f64x2_mul(c1s2, s3);
+        v128_t c1s2c3 = wasm_f64x2_mul(c1s2, c3), s1c2s3 = wasm_f64x2_mul(s1c2, s3);
+        v128_t c1c2s3 = wasm_f64x2_mul(c1c2, s3), s1s2c3 = wasm_f64x2_mul(s1s2, c3);
+        v128_t r0, r1, r2, r3;
+#define A wasm_f64x2_add
+#define S wasm_f64x2_sub
+        switch (order) {
+        default:
+        case 0: r0 = A(s1c2c3, c1s2s3); r1 = S(c1s2c3, s1c2s3); r2 = A(c1c2s3, s1s2c3); r3 = S(c1c2c3, s1s2s3); break;
+        case 1: r0 = A(s1c2c3, c1s2s3); r1 = S(c1s2c3, s1c2s3); r2 = S(c1c2s3, s1s2c3); r3 = A(c1c2c3, s1s2s3); break;
+        case 2: r0 = S(s1c2c3, c1s2s3); r1 = A(c1s2c3, s1c2s3); r2 = A(c1c2s3, s1s2c3); r3 = S(c1c2c3, s1s2s3); break;
+        case 3: r0 = S(s1c2c3, c1s2s3); r1 = A(c1s2c3, s1c2s3); r2 = S(c1c2s3, s1s2c3); r3 = A(c1c2c3, s1s2s3); break;
+        case 4: r0 = A(s1c2c3, c1s2s3); r1 = A(c1s2c3, s1c2s3); r2 = S(c1c2s3, s1s2c3); r3 = S(c1c2c3, s1s2s3); break;
+        case 5: r0 = S(s1c2c3, c1s2s3); r1 = S(c1s2c3, s1c2s3); r2 = A(c1c2s3, s1s2c3); r3 = A(c1c2c3, s1s2s3); break;
+        }
+#undef A
+#undef S
+        double *o0 = q->d + i * 4;
+        /* lanes 0 to item i, (x, y) and (z, w) of it as two stores */
+        wasm_v128_store(o0, wasm_i64x2_shuffle(r0, r1, 0, 2));
+        wasm_v128_store(o0 + 2, wasm_i64x2_shuffle(r2, r3, 0, 2));
+        if (j != i) {
+            double *o1 = q->d + j * 4;
+            wasm_v128_store(o1, wasm_i64x2_shuffle(r0, r1, 1, 3));
+            wasm_v128_store(o1 + 2, wasm_i64x2_shuffle(r2, r3, 1, 3));
+        }
+    }
     return 0;
 }
 /* t3.m4a_compose(ma, pa, qa, sa | nil, sx, sy, sz): ma[i]:compose(pa[i],
@@ -2094,7 +2158,13 @@ static int l_m4a_to_instanced(lua_State *L) {
     int first = (int)luaL_optinteger(L, 3, 0);
     if (!im || first < 0 || first + m->n > im->instance_matrix->count) return luaL_error(L, "t3.m4a_to_instanced: range");
     float *dst = (float *)im->instance_matrix->array + first * 16;
-    for (int i = 0; i < m->n * 16; i++) dst[i] = (float)m->d[i];
+    const double *src = m->d;
+    /* four doubles to four floats per store (round to nearest, as a cast) */
+    for (int i = 0; i < m->n * 16; i += 4) {
+        v128_t lo = wasm_f32x4_demote_f64x2_zero(wasm_v128_load(src + i));
+        v128_t hi = wasm_f32x4_demote_f64x2_zero(wasm_v128_load(src + i + 2));
+        wasm_v128_store(dst + i, wasm_i32x4_shuffle(lo, hi, 0, 1, 4, 5));
+    }
     im->instance_matrix->version++;
     return 0;
 }
