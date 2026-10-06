@@ -2628,6 +2628,94 @@ static void wk_mark(lua_State *L, Table *rec, int dirty_idx) {
     L->top.p++;
     lua_rawseti(L, dirty_idx, n);
 }
+/* wk_mark on a Table* dirty list, internals only */
+static void wk_mark_t(lua_State *L, Table *rec, Table *d) {
+    TValue *flag = tab_slot(rec, 7);
+    if (isabstkey(flag) || !l_isfalse(flag)) return;
+    setbtvalue(flag);
+    TValue *nv = (TValue *)luaH_getshortstr(d, wkey[WK_N]);
+    lua_Integer n = (ttisinteger(nv) ? ivalue(nv) : 0) + 1;
+    setivalue(nv, n);
+    TValue rv;
+    sethvalue(L, &rv, rec);
+    TValue *slot = (TValue *)tab_geti(d, (int)n);
+    if (!isabstkey(slot)) { setobj(L, slot, &rv); luaC_barrierback(L, obj2gco(d), &rv); }
+    else luaH_setint(L, d, n, &rv);
+    luaC_barrierback(L, obj2gco(d), &rv);
+}
+#define UPV(i) (&clCvalue(s2v(L->ci->func.p))->upvalue[(i) - 1])
+/* the component slot for key k (x y z, w when nslots is 4), else 0 */
+static int wv_slot(const TValue *k, int nslots) {
+    if (!ttisshrstring(k)) return 0;
+    TString *s = tsvalue(k);
+    if (s == wkey[WK_X]) return 1;
+    if (s == wkey[WK_Y]) return 2;
+    if (s == wkey[WK_Z]) return 3;
+    if (nslots == 4 && s == fkey[FK_W]) return 4;
+    return 0;
+}
+/* a stale watched quaternion brought up to date (materialize, Lua) */
+static void wv_fresh(lua_State *L, int nslots, const TValue *mat) {
+    if (nslots != 4 || !ttisfunction(mat)) return;
+    if (l_isfalse(tab_geti(tab_at(L, 1), 5))) return;
+    setobj2s(L, L->top.p, mat); L->top.p++;
+    lua_pushvalue(L, 1);
+    lua_call(L, 1, 0);
+}
+/* __index of a watched vector / quaternion. upvalues: 1 fast, 2 class,
+ * 3 nslots, 4 materialize | false */
+static int l_wv_index(lua_State *L) {
+    int nslots = (int)ivalue(UPV(3));
+    const TValue *k = s2v(L->ci->func.p + 2);
+    int f = wv_slot(k, nslots);
+    if (f) {
+        wv_fresh(L, nslots, UPV(4));
+        setobj2s(L, L->top.p, tab_geti(tab_at(L, 1), f)); L->top.p++;
+        return 1;
+    }
+    const TValue *m = luaH_get(hvalue(UPV(1)), k);
+    if (isempty(m)) {
+        Table *cls = hvalue(UPV(2));
+        m = luaH_get(cls, k);
+        if (isempty(m) && cls->metatable) {      /* the class's own chain: through the API */
+            setobj2s(L, L->top.p, UPV(2)); L->top.p++;
+            lua_pushvalue(L, 2);
+            lua_gettable(L, -2);
+            return 1;
+        }
+    }
+    setobj2s(L, L->top.p, m); L->top.p++;
+    if (isempty(m)) setnilvalue(s2v(L->top.p - 1));
+    return 1;
+}
+/* __newindex. upvalues: 1 dirty, 2 nslots, 3 materialize | false */
+static int l_wv_newindex(lua_State *L) {
+    int nslots = (int)ivalue(UPV(2));
+    int f = wv_slot(s2v(L->ci->func.p + 2), nslots);
+    if (!f) { lua_settop(L, 3); lua_rawset(L, 1); return 0; }
+    wv_fresh(L, nslots, UPV(3));
+    Table *t = tab_at(L, 1);
+    TValue *slot = (TValue *)tab_geti(t, f);
+    if (isabstkey(slot)) { lua_settop(L, 3); lua_rawseti(L, 1, f); t = tab_at(L, 1); }
+    else { setobj(L, slot, s2v(L->ci->func.p + 3)); luaC_barrierback(L, obj2gco(t), slot); }
+    Table *rec = tv_tab(luaH_getshortstr(t, wkey[WK_REC]));
+    if (rec) wk_mark_t(L, rec, hvalue(UPV(1)));
+    return 0;
+}
+/* t3.watched_vector_mm(dirty, fast, class, nslots, materialize | false) -> __index, __newindex */
+static int l_watched_vector_mm(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    luaL_checktype(L, 3, LUA_TTABLE);
+    lua_Integer n = luaL_checkinteger(L, 4);
+    if (lua_isnoneornil(L, 5)) { lua_settop(L, 4); lua_pushboolean(L, 0); }
+    lua_pushvalue(L, 2); lua_pushvalue(L, 3); lua_pushinteger(L, n); lua_pushvalue(L, 5);
+    lua_pushcclosure(L, l_wv_index, 4);
+    lua_pushvalue(L, 1); lua_pushinteger(L, n); lua_pushvalue(L, 5);
+    lua_pushcclosure(L, l_wv_newindex, 3);
+    return 2;
+}
+
 static int l_euler_newindex(lua_State *L) {
     /* upvalues: 1 dirty, 2 Euler.fresh */
     Table *e = tab_at(L, 1);
@@ -3881,7 +3969,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at }, { "ray_from_camera", l_ray_from_camera },
 #endif
