@@ -1904,6 +1904,18 @@ static int l_u_to_t(lua_State *L) {
     return 1;
 }
 
+/* t3.array_part(t, n): move t's integer keys 1..n into its array part.
+ * Slots added to a table that had only string keys (three.lua's watched
+ * vectors) land in the hash part, where every read and write, from Lua or
+ * from here, goes through luaH_getint; in the array part they are direct. */
+static int l_array_part(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    lua_Integer n = luaL_checkinteger(L, 2);
+    Table *t = tab_at(L, 1);
+    if (n > 0 && n <= 64 && luaH_realasize(t) < (unsigned)n) luaH_resize(L, t, (unsigned)n, allocsizenode(t));
+    return 0;
+}
+
 /* t3.quat_from_euler(x, y, z, order) -> qx, qy, qz, qw (double precision) */
 static int l_quat_from_euler(lua_State *L) {
     double x = lua_tonumber(L, 1), y = lua_tonumber(L, 2), z = lua_tonumber(L, 3);
@@ -2776,7 +2788,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "anim_register_more", l_anim_register_more }, { "deindex", l_deindex }, { "gen_sphere", l_gen_sphere }, { "gen_torus", l_gen_torus }, { "catmull_rom", l_catmull_rom }, { "cr_lengths", l_cr_lengths }, { "bezier3", l_bezier3 }, { "ellipse", l_ellipse }, { "u_to_t", l_u_to_t }, { "gen_torus_knot", l_gen_torus_knot }, { "gen_cylinder", l_gen_cylinder }, { "gen_box", l_gen_box }, { "gen_polyhedron", l_gen_polyhedron }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "array_part", l_array_part }, { "anim_register_more", l_anim_register_more }, { "deindex", l_deindex }, { "gen_sphere", l_gen_sphere }, { "gen_torus", l_gen_torus }, { "catmull_rom", l_catmull_rom }, { "cr_lengths", l_cr_lengths }, { "bezier3", l_bezier3 }, { "ellipse", l_ellipse }, { "u_to_t", l_u_to_t }, { "gen_torus_knot", l_gen_torus_knot }, { "gen_cylinder", l_gen_cylinder }, { "gen_box", l_gen_box }, { "gen_polyhedron", l_gen_polyhedron }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
     { "matrix", l_matrix },
     { "world", l_world }, { "local_matrix", l_local }, { "camera_matrices", l_camera_matrices },
     { "update_world", l_update_world }, { "update_world_matrix", l_update_world_matrix },
