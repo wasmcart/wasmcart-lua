@@ -17,7 +17,7 @@
 static inline v128_t st_splat(double v) { return wasm_f64x2_splat(v); }
 
 /* s, c: sin and cos of the two lanes of x */
-static inline void sincos_f64x2(v128_t x, v128_t *s, v128_t *c) {
+static inline __attribute__((always_inline)) void sincos_f64x2(v128_t x, v128_t *s, v128_t *c) {
     const v128_t invpio2 = st_splat(6.36619772367581382433e-01);
     const v128_t pio2_1 = st_splat(1.57079632673412561417e+00), pio2_1t = st_splat(6.07710050650619224932e-11);
     const v128_t pio2_2 = st_splat(6.07710050630396597660e-11), pio2_2t = st_splat(2.02226624879595063154e-21);
