@@ -36,6 +36,7 @@
 #include "lstate.h"
 #include "ltable.h"
 #include "lgc.h"
+#include "ltm.h"
 #include "lvm.h"
 #include "three.h"
 #include "simd_trig.h"
@@ -2716,6 +2717,125 @@ static int l_watched_vector_mm(lua_State *L) {
     return 2;
 }
 
+/* ── watched objects / materials / colours / drawRange / layers ─────────
+ * t3.watched_mm(mode, map, class, dirty | changes, onWrite) -> __index, __newindex
+ * for _t3.lua's watched tables: map takes a public key to the hidden raw
+ * key it lives under. mode 1 object (watchedClass), 2 material
+ * (watchedMatClass), 3 colour (WCOL), 4 drawRange (WDR), 5 layers (WL:
+ * the one key "mask" in array slot 1). Reads: the hidden field (objects and
+ * materials fall through to the class when it is nil), else the class.
+ * Writes: the hidden field, then the mode's action: the record's flags and
+ * dirty mark (1, 5; matrixAutoUpdate also into rec[8]), onWrite(t, k, v)
+ * in Lua (2, 3), changes.n + 1 (4). */
+static TString *wmkey_t3rec, *wmkey_rec, *wmkey_mau, *wmkey_mask;
+static const TValue *cls_get(lua_State *L, int up_cls, const TValue *k, int *pushed) {
+    *pushed = 0;
+    const TValue *cv = UPV(up_cls);
+    if (!ttistable(cv)) return NULL;
+    Table *cls = hvalue(cv);
+    const TValue *m = luaH_get(cls, k);
+    /* up the class chain while each __index is a table (what Lua's own
+     * lookup does), without the API */
+    for (int depth = 0; isempty(m) && cls->metatable && depth < 32; depth++) {
+        const TValue *ix = luaH_getshortstr(cls->metatable, G(L)->tmname[TM_INDEX]);
+        if (!ttistable(ix)) break;
+        cls = hvalue(ix);
+        m = luaH_get(cls, k);
+    }
+    if (isempty(m) && cls->metatable) {
+        sethvalue2s(L, L->top.p, cls); L->top.p++;
+        setobj2s(L, L->top.p, k); L->top.p++;
+        lua_gettable(L, -2);
+        *pushed = 1;
+        return NULL;
+    }
+    return m;
+}
+/* upvalues: 1 mode, 2 map, 3 class */
+static int l_wm_index(lua_State *L) {
+    int mode = (int)ivalue(UPV(1));
+    Table *o = tab_at(L, 1);
+    const TValue *k = s2v(L->ci->func.p + 2);
+    if (mode == 5) {
+        if (ttisshrstring(k) && tsvalue(k) == wmkey_mask) { setobj2s(L, L->top.p, tab_geti(o, 1)); L->top.p++; return 1; }
+    } else {
+        const TValue *f = luaH_get(hvalue(UPV(2)), k);
+        if (!isempty(f) && ttisshrstring(f)) {
+            const TValue *v = luaH_getshortstr(o, tsvalue(f));
+            if (mode == 3 || mode == 4 || !isempty(v)) {
+                setobj2s(L, L->top.p, v); L->top.p++;
+                if (isempty(v)) setnilvalue(s2v(L->top.p - 1));
+                return 1;
+            }
+        }
+        if (mode == 4) { lua_pushnil(L); return 1; }
+    }
+    int pushed;
+    const TValue *m = cls_get(L, 3, k, &pushed);
+    if (pushed) return 1;
+    if (!m || isempty(m)) { lua_pushnil(L); return 1; }
+    setobj2s(L, L->top.p, m); L->top.p++;
+    return 1;
+}
+/* upvalues: 1 mode, 2 map, 3 dirty | changes, 4 onWrite */
+static int l_wm_newindex(lua_State *L) {
+    int mode = (int)ivalue(UPV(1));
+    lua_settop(L, 3);
+    const TValue *k = s2v(L->ci->func.p + 2);
+    if (mode == 5) {
+        if (!(ttisshrstring(k) && tsvalue(k) == wmkey_mask)) { lua_rawset(L, 1); return 0; }
+        lua_pushvalue(L, 3); lua_rawseti(L, 1, 1);
+        Table *rec = tv_tab(luaH_getshortstr(tab_at(L, 1), wmkey_rec));
+        if (rec) { TValue *fl = (TValue *)tab_geti(rec, 9); if (!isabstkey(fl)) setbtvalue(fl); wk_mark_t(L, rec, hvalue(UPV(3))); }
+        return 0;
+    }
+    const TValue *f = luaH_get(hvalue(UPV(2)), k);
+    if (isempty(f) || !ttisshrstring(f)) { lua_rawset(L, 1); return 0; }
+    /* rawset(o, f, v) */
+    setobj2s(L, L->top.p, f); L->top.p++;
+    lua_pushvalue(L, 3);
+    lua_rawset(L, 1);
+    switch (mode) {
+    case 1: {
+        Table *rec = tv_tab(luaH_getshortstr(tab_at(L, 1), wmkey_t3rec));
+        if (!rec) return luaL_error(L, "watched object without its record");
+        TValue *fl = (TValue *)tab_geti(rec, 9);
+        if (!isabstkey(fl)) setbtvalue(fl);
+        if (tsvalue(k) == wmkey_mau) {
+            TValue *mau = (TValue *)tab_geti(rec, 8);
+            if (!isabstkey(mau)) { setobj(L, mau, s2v(L->ci->func.p + 3)); luaC_barrierback(L, obj2gco(rec), mau); }
+        }
+        wk_mark_t(L, rec, hvalue(UPV(3)));
+        return 0;
+    }
+    case 4: {
+        Table *ch = hvalue(UPV(3));
+        TValue *nv = (TValue *)luaH_getshortstr(ch, wkey[WK_N]);
+        if (ttisinteger(nv)) { setivalue(nv, ivalue(nv) + 1); }
+        else if (ttisfloat(nv)) { setfltvalue(nv, fltvalue(nv) + 1); }
+        return 0;
+    }
+    default:   /* 2, 3: the Lua action */
+        setobj2s(L, L->top.p, UPV(4)); L->top.p++;
+        lua_pushvalue(L, 1); lua_pushvalue(L, 2); lua_pushvalue(L, 3);
+        lua_call(L, 3, 0);
+        return 0;
+    }
+}
+static int l_watched_mm(lua_State *L) {
+    lua_Integer mode = luaL_checkinteger(L, 1);
+    lua_settop(L, 5);
+    if (lua_isnil(L, 2)) { lua_newtable(L); lua_replace(L, 2); }
+    if (lua_isnil(L, 3)) { lua_pushboolean(L, 0); lua_replace(L, 3); }
+    if (lua_isnil(L, 4)) { lua_newtable(L); lua_replace(L, 4); }
+    if (lua_isnil(L, 5)) { lua_pushboolean(L, 0); lua_replace(L, 5); }
+    lua_pushinteger(L, mode); lua_pushvalue(L, 2); lua_pushvalue(L, 3);
+    lua_pushcclosure(L, l_wm_index, 3);
+    lua_pushinteger(L, mode); lua_pushvalue(L, 2); lua_pushvalue(L, 4); lua_pushvalue(L, 5);
+    lua_pushcclosure(L, l_wm_newindex, 4);
+    return 2;
+}
+
 static int l_euler_newindex(lua_State *L) {
     /* upvalues: 1 dirty, 2 Euler.fresh */
     Table *e = tab_at(L, 1);
@@ -3969,7 +4089,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at }, { "ray_from_camera", l_ray_from_camera },
 #endif
@@ -4026,6 +4146,11 @@ void wcl_open_three_c(lua_State *L) {
         lua_pushstring(L, fnames[i]);
         fkey[i] = (TString *)lua_topointer(L, -1);
         luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    {
+        static TString **const ks[] = { &wmkey_t3rec, &wmkey_rec, &wmkey_mau, &wmkey_mask };
+        static const char *const kn[] = { "_t3rec", "_rec", "matrixAutoUpdate", "mask" };
+        for (int i = 0; i < 4; i++) { lua_pushstring(L, kn[i]); *ks[i] = (TString *)lua_topointer(L, -1); luaL_ref(L, LUA_REGISTRYINDEX); }
     }
     static const char *const wnames[WK_COUNT] = { "x", "y", "z", "order", "_x", "_y", "_z", "_order", "_srcq",
                                                   "_onChange", "_t3cb", "_t3q", "_t3rec", "n" };
