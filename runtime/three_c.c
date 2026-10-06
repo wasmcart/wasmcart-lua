@@ -345,7 +345,7 @@ static int l_flush(lua_State *L) {
 /* ── animation: the per-track step of AnimationAction:_update ─────────── */
 
 enum { AK_PP, AK_SV, AK_VS, AK_CI, AK_BUF, AK_CW, AK_RB, AK_MK, AK_CWA, AK_BINDING, AK_SETV, AK_RP, AK_ONCH,
-       AK_X, AK_Y, AK_Z, AK_W, AK_TO, AK_MWNU, AK_N, AK_LO, AK_HI, AK_REC, AK_PN, AK_COUNT };
+       AK_X, AK_Y, AK_Z, AK_W, AK_TO, AK_MWNU, AK_N, AK_LO, AK_HI, AK_REC, AK_PN, AK_STD, AK_ROT, AK_SRCQ, AK_COUNT };
 static TString *anim_key[AK_COUNT];
 
 static TValue *tab_slot(Table *t, int i) { return (TValue *)tab_geti(t, i); }
@@ -726,10 +726,26 @@ static int l_anim_apply(lua_State *L) {
                     L->top.p++;
                     lua_rawseti(L, 7, ++nm);
                 }
-                if (dst && stride == 4 && !ttisnil(luaH_getshortstr(dst, anim_key[AK_ONCH]))) {
-                    sethvalue2s(L, L->top.p, dst);
-                    L->top.p++;
-                    lua_rawseti(L, 6, ++ncb);
+                const TValue *onch = dst && stride == 4 ? luaH_getshortstr(dst, anim_key[AK_ONCH]) : NULL;
+                if (onch && !ttisnil(onch)) {
+                    /* Object3D's own quaternion callback (rotation._srcq =
+                     * quaternion) done here when _onChange is still it */
+                    int handled = 0;
+                    const TValue *std = luaH_getshortstr(dst, anim_key[AK_STD]);
+                    Table *rot = tv_tab(luaH_getshortstr(dst, anim_key[AK_ROT]));
+                    if (rot && ttisLclosure(onch) && ttisLclosure(std) && clLvalue(onch) == clLvalue(std)) {
+                        TValue *sq = (TValue *)luaH_getshortstr(rot, anim_key[AK_SRCQ]);
+                        if (!isabstkey(sq)) {
+                            sethvalue(L, sq, dst);
+                            luaC_barrierback(L, obj2gco(rot), sq);
+                            handled = 1;
+                        }
+                    }
+                    if (!handled) {
+                        sethvalue2s(L, L->top.p, dst);
+                        L->top.p++;
+                        lua_rawseti(L, 6, ++ncb);
+                    }
                 }
                 break;
             }
@@ -2688,7 +2704,7 @@ void wcl_open_three_c(lua_State *L) {
                                                   "buffer", "cumulativeWeight", "resultBuffer", "_t3mk",
                                                   "cumulativeWeightAdditive", "binding", "setValue",
                                                   "resolvedProperty", "_onChange", "x", "y", "z", "w",
-                                                  "targetObject", "matrixWorldNeedsUpdate", "n", "lo", "hi", "_rec", "propertyName" };
+                                                  "targetObject", "matrixWorldNeedsUpdate", "n", "lo", "hi", "_rec", "propertyName", "_t3std", "_t3rot", "_srcq" };
     for (int i = 0; i < AK_COUNT; i++) {
         lua_pushstring(L, anames[i]);
         anim_key[i] = (TString *)lua_topointer(L, -1);
