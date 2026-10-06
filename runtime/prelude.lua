@@ -6240,26 +6240,27 @@ function __wasmcart_frame(b1, lx1, ly1, rx1, ry1,
   p = pads[4]; p.prev = p.buttons; p.buttons = b4; p.lx = lx4; p.ly = ly4; p.rx = rx4; p.ry = ry4
 
   -- edge callbacks (gamepad + the keyboard mapping)
+  -- (a pad whose buttons did not change has no edges: skipped)
   if love.gamepadpressed or love.keypressed then
     for n = 1, 4 do
       local pp = pads[n]
-      for name, bit in pairs(BTN) do
+      if pp.buttons ~= pp.prev then for name, bit in pairs(BTN) do
         if (pp.buttons & bit) ~= 0 and (pp.prev & bit) == 0 then
           if love.gamepadpressed then love.gamepadpressed(joy_objs[n], name) end
           if n == 1 and love.keypressed then love.keypressed(name) end
         end
-      end
+      end end
     end
   end
   if love.gamepadreleased or love.keyreleased then
     for n = 1, 4 do
       local pp = pads[n]
-      for name, bit in pairs(BTN) do
+      if pp.buttons ~= pp.prev then for name, bit in pairs(BTN) do
         if (pp.buttons & bit) == 0 and (pp.prev & bit) ~= 0 then
           if love.gamepadreleased then love.gamepadreleased(joy_objs[n], name) end
           if n == 1 and love.keyreleased then love.keyreleased(name) end
         end
-      end
+      end end
     end
   end
 
