@@ -1014,6 +1014,127 @@ static int l_q_slerp(lua_State *L) {
     return 1;
 }
 
+/* ── BufferGeometry kernels ──────────────────────────────────────────── */
+
+/* a 0-based index value as an integer (an integral float too, as Lua's
+ * table keys normalize it); -1 if it is anything else */
+static lua_Integer tv_index(const TValue *v) {
+    if (ttisinteger(v)) return ivalue(v);
+    if (ttisfloat(v)) {
+        lua_Integer i;
+        if (luaV_flttointeger(fltvalue(v), &i, F2Ieq)) return i;
+    }
+    return -1;
+}
+static int tv_dbl(const TValue *v, double *out) {
+    if (ttisfloat(v)) { *out = fltvalue(v); return 1; }
+    if (ttisinteger(v)) { *out = (double)ivalue(v); return 1; }
+    return 0;
+}
+
+/* t3.deindex(array, indices, itemSize) -> out | false: toNonIndexed's copy
+ * of one attribute (item i of out is item indices[i] of array), values
+ * copied as they are. false (Lua does it) for a non-integer index or a
+ * missing source value. */
+static int l_deindex(lua_State *L) {
+    if (!lua_istable(L, 1) || !lua_istable(L, 2)) NO_KERNEL;
+    Table *src = tab_at(L, 1), *idx = tab_at(L, 2);
+    lua_Integer is = luaL_checkinteger(L, 3);
+    lua_Unsigned n = luaH_getn(idx);
+    if (is < 1 || is > 64 || n * (lua_Unsigned)is > (1u << 26)) NO_KERNEL;
+    lua_createtable(L, (int)(n * is), 0);
+    Table *out = tab_at(L, -1);
+    TValue *o = out->array;
+    for (lua_Unsigned i = 1; i <= n; i++) {
+        lua_Integer s0 = tv_index(tab_geti(idx, (int)i));
+        if (s0 < 0) { lua_pop(L, 1); NO_KERNEL; }
+        s0 *= is;
+        for (lua_Integer k = 1; k <= is; k++) {
+            const TValue *v = tab_geti(src, (int)(s0 + k));
+            if (ttisnil(v)) { lua_pop(L, 1); NO_KERNEL; }
+            setobj(L, o, v);
+            o++;
+        }
+    }
+    return 1;
+}
+
+/* t3.vertex_normals(pa, ps, n, idx|nil, normals|nil) -> normals | false:
+ * computeVertexNormals' arithmetic (zero, accumulate per face, normalize),
+ * the same expressions. normals is the attribute array to reuse (n * 3
+ * slots) or nil for a new one. false: Lua does it. */
+static int l_vertex_normals(lua_State *L) {
+    if (!lua_istable(L, 1)) NO_KERNEL;
+    Table *pa = tab_at(L, 1);
+    lua_Integer ps = luaL_checkinteger(L, 2), n = luaL_checkinteger(L, 3);
+    Table *idx = lua_istable(L, 4) ? tab_at(L, 4) : NULL;
+    if (ps < 3 || n < 0 || n > (1 << 24)) NO_KERNEL;
+    Table *na;
+    if (lua_istable(L, 5)) {
+        na = tab_at(L, 5);
+        if ((lua_Integer)luaH_realasize(na) < n * 3) NO_KERNEL;
+        lua_pushvalue(L, 5);
+    } else {
+        lua_createtable(L, (int)(n * 3), 0);
+        na = tab_at(L, -1);
+    }
+    double *acc = (double *)calloc((size_t)(n * 3 + 1), sizeof(double));
+    if (!acc) NO_KERNEL;
+#define PA(k, dst) if (!tv_dbl(tab_geti(pa, (int)(k)), &(dst))) goto fail
+    if (idx) {
+        lua_Integer len = (lua_Integer)luaH_getn(idx);
+        for (lua_Integer i = 1; i <= len - 2; i += 3) {
+            lua_Integer ia = tv_index(tab_geti(idx, (int)i)), ib = tv_index(tab_geti(idx, (int)i + 1));
+            lua_Integer ic = tv_index(tab_geti(idx, (int)i + 2));
+            if (ia < 0 || ib < 0 || ic < 0 || ia >= n || ib >= n || ic >= n) goto fail;
+            lua_Integer oa = ia * ps, ob = ib * ps, oc = ic * ps;
+            double ax, ay, az, bx, by, bz, cx, cy, cz;
+            PA(oa + 1, ax); PA(oa + 2, ay); PA(oa + 3, az);
+            PA(ob + 1, bx); PA(ob + 2, by); PA(ob + 3, bz);
+            PA(oc + 1, cx); PA(oc + 2, cy); PA(oc + 3, cz);
+            double cbx = cx - bx, cby = cy - by, cbz = cz - bz;
+            double abx = ax - bx, aby = ay - by, abz = az - bz;
+            double nx = cby * abz - cbz * aby, ny = cbz * abx - cbx * abz, nz = cbx * aby - cby * abx;
+            double *a = acc + ia * 3, *b = acc + ib * 3, *c = acc + ic * 3;
+            a[0] = a[0] + nx; a[1] = a[1] + ny; a[2] = a[2] + nz;
+            b[0] = b[0] + nx; b[1] = b[1] + ny; b[2] = b[2] + nz;
+            c[0] = c[0] + nx; c[1] = c[1] + ny; c[2] = c[2] + nz;
+        }
+    } else {
+        for (lua_Integer i = 0; i <= n - 3; i += 3) {
+            lua_Integer oa = i * ps, ob = (i + 1) * ps, oc = (i + 2) * ps;
+            double ax, ay, az, bx, by, bz, cx, cy, cz;
+            PA(oa + 1, ax); PA(oa + 2, ay); PA(oa + 3, az);
+            PA(ob + 1, bx); PA(ob + 2, by); PA(ob + 3, bz);
+            PA(oc + 1, cx); PA(oc + 2, cy); PA(oc + 3, cz);
+            double cbx = cx - bx, cby = cy - by, cbz = cz - bz;
+            double abx = ax - bx, aby = ay - by, abz = az - bz;
+            double nx = cby * abz - cbz * aby, ny = cbz * abx - cbx * abz, nz = cbx * aby - cby * abx;
+            double *a = acc + i * 3;
+            for (int k = 0; k < 9; k += 3) { a[k] = nx; a[k + 1] = ny; a[k + 2] = nz; }
+        }
+    }
+#undef PA
+    /* normalizeNormals: divide by the length, or by 1 when it is zero
+     * (every result is a float, as x * inv is in Lua) */
+    for (lua_Integer i = 0; i < n; i++) {
+        double *v = acc + i * 3;
+        double x = v[0], y = v[1], z = v[2];
+        double len = sqrt(x * x + y * y + z * z);
+        if (len == 0) len = 1;
+        double inv = 1 / len;
+        setfltvalue(&na->array[i * 3], x * inv);
+        setfltvalue(&na->array[i * 3 + 1], y * inv);
+        setfltvalue(&na->array[i * 3 + 2], z * inv);
+    }
+    free(acc);
+    return 1;
+fail:
+    free(acc);
+    lua_pop(L, 1);
+    NO_KERNEL;
+}
+
 /* t3.quat_from_euler(x, y, z, order) -> qx, qy, qz, qw (double precision) */
 static int l_quat_from_euler(lua_State *L) {
     double x = lua_tonumber(L, 1), y = lua_tonumber(L, 2), z = lua_tonumber(L, 3);
@@ -1879,7 +2000,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "deindex", l_deindex }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
     { "matrix", l_matrix },
     { "world", l_world }, { "local_matrix", l_local }, { "camera_matrices", l_camera_matrices },
     { "update_world", l_update_world }, { "update_world_matrix", l_update_world_matrix },
