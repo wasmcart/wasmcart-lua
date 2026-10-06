@@ -62,8 +62,10 @@ if [ ! -f vendor/liblua54.a ]; then
   python3 ../patch-lua.py vendor/lua/src/lmathlib.c
   # -include cartconf.h lands before lauxlib.h's `#if !defined(lua_writestring)`
   # guards, so Lua's stdout/stderr hooks resolve to wc_log instead of stdio.
+  # -flto: the VM's calls into the table code (luaH_getshortstr on every
+  # field read) are inlined at link time; 14-cpu-math -9% (2026-10-05).
   ( cd vendor/lua/src && \
-    emcc -O2 -c $CORE -DLUA_CART_NOFILES -sSUPPORT_LONGJMP=wasm \
+    emcc -O2 -flto -c $CORE -DLUA_CART_NOFILES -sSUPPORT_LONGJMP=wasm \
       -I "$RUNTIME_DIR" -include "$RUNTIME_DIR/cartconf.h" && \
     emar rcs ../../liblua54.a *.o && rm -f *.o )
 fi
