@@ -2617,6 +2617,11 @@ enum { WK_X, WK_Y, WK_Z, WK_ORDER, WK_UX, WK_UY, WK_UZ, WK_UORDER, WK_SRCQ, WK_O
 static TString *wkey[WK_COUNT];
 enum { OK_T3, OK_QUAT, OK_STD, OK_EYE, OK_UP, OK_ISCAM, OK_ISLIGHT, OK_ROT, OK_GEN, OK_COUNT };
 static TString *okey[OK_COUNT];
+enum { TK_MAP, TK_NORMAL, TK_AO, TK_EMISSIVE, TK_ROUGH, TK_METAL, TK_ALPHA, TK_NMAPS,
+       TK_T3 = TK_NMAPS, TK_VERSION, TK_T3VER, TK_WRAPS, TK_WRAPT, TK_MAG, TK_MIN, TK_FLIPY, TK_ISDATA, TK_MIPS,
+       TK_ENC, TK_OFFSET, TK_REPEAT, TK_CENTER, TK_ROT, TK_ANISO, TK_COUNT };
+static TString *tkey[TK_COUNT], *tkey_hidden[TK_NMAPS];
+static int sync_texture_c(Table *tex);
 static void fill(lua_State *L, int t, const float *e, int n);
 static void fill_d(lua_State *L, int t, const double *e, int n);
 /* rec[7] = true and onto the dirty list, unless it is there already */
@@ -4208,21 +4213,41 @@ enum {
  * (the alpha factors -1 = null)
  * flags: MF_* bits. Bumps version (three.js needsUpdate) only when a field
  * that selects the program changed; colours and scalars are uniforms. */
+typedef struct {
+    t3_color color, emissive, specular;
+    float opacity, shininess, roughness, metalness, emissive_intensity, alpha_test, ao_map_intensity, ns_x, ns_y;
+    int side, fl;
+    int has_blend, blending, premultiplied_alpha, blend_src, blend_dst, blend_equation, blend_src_alpha, blend_dst_alpha,
+        blend_equation_alpha, depth_func;
+} mat_args_t;
+static void mat_apply(t3_material *m, const mat_args_t *a);
 static int l_mat_set(lua_State *L) {
-    t3_material *m = (t3_material *)P(L, 1);
-    m->color = color_at(L, 2);
-    m->emissive = color_at(L, 5);
-    m->specular = color_at(L, 8);
-    m->opacity = F(11);
-    m->shininess = F(12);
-    m->roughness = F(13);
-    m->metalness = F(14);
-    m->emissive_intensity = F(15);
-    int side = I(16), fl = I(17);
-    float alpha_test = F(18);
-    m->ao_map_intensity = F(19);
-    m->normal_scale.x = F(20);
-    m->normal_scale.y = F(21);
+    mat_args_t a;
+    a.color = color_at(L, 2); a.emissive = color_at(L, 5); a.specular = color_at(L, 8);
+    a.opacity = F(11); a.shininess = F(12); a.roughness = F(13); a.metalness = F(14); a.emissive_intensity = F(15);
+    a.side = I(16); a.fl = I(17); a.alpha_test = F(18); a.ao_map_intensity = F(19); a.ns_x = F(20); a.ns_y = F(21);
+    a.has_blend = !lua_isnoneornil(L, 22);
+    if (a.has_blend) {
+        a.blending = I(22); a.premultiplied_alpha = B(23); a.blend_src = I(24); a.blend_dst = I(25); a.blend_equation = I(26);
+        a.blend_src_alpha = I(27); a.blend_dst_alpha = I(28); a.blend_equation_alpha = I(29); a.depth_func = I(30);
+    }
+    mat_apply((t3_material *)P(L, 1), &a);
+    return 0;
+}
+static void mat_apply(t3_material *m, const mat_args_t *a) {
+    m->color = a->color;
+    m->emissive = a->emissive;
+    m->specular = a->specular;
+    m->opacity = a->opacity;
+    m->shininess = a->shininess;
+    m->roughness = a->roughness;
+    m->metalness = a->metalness;
+    m->emissive_intensity = a->emissive_intensity;
+    int side = a->side, fl = a->fl;
+    float alpha_test = a->alpha_test;
+    m->ao_map_intensity = a->ao_map_intensity;
+    m->normal_scale.x = a->ns_x;
+    m->normal_scale.y = a->ns_y;
     bool tr = fl & MF_TRANSPARENT, dt = fl & MF_DEPTH_TEST, dw = fl & MF_DEPTH_WRITE, vc = fl & MF_VERTEX_COLORS;
     bool fs = fl & MF_FLAT, wf = fl & MF_WIREFRAME, vis = fl & MF_VISIBLE, fog = fl & MF_FOG;
     bool sk = fl & MF_SKINNING, mt = fl & MF_MORPH, mn = fl & MF_MORPH_NORMALS;
@@ -4237,13 +4262,156 @@ static int l_mat_set(lua_State *L) {
         m->version++;
     }
     m->visible = vis;
-    if (!lua_isnoneornil(L, 22)) {
-        m->blending = I(22);
-        m->premultiplied_alpha = B(23);
-        m->blend_src = I(24); m->blend_dst = I(25); m->blend_equation = I(26);
-        m->blend_src_alpha = I(27); m->blend_dst_alpha = I(28); m->blend_equation_alpha = I(29);
-        m->depth_func = I(30);
+    if (a->has_blend) {
+        m->blending = a->blending;
+        m->premultiplied_alpha = a->premultiplied_alpha;
+        m->blend_src = a->blend_src; m->blend_dst = a->blend_dst; m->blend_equation = a->blend_equation;
+        m->blend_src_alpha = a->blend_src_alpha; m->blend_dst_alpha = a->blend_dst_alpha; m->blend_equation_alpha = a->blend_equation_alpha;
+        m->depth_func = a->depth_func;
     }
+}
+/* t3.sync_materials(matDirty, mapped, syncTexture, viaLua): three.lua's
+ * syncMaterial for every material on the dirty list (a twinned one: its
+ * fields read as Lua does, the watched hidden fields and the class chain,
+ * pushed to the twin; its maps synced and bound), the list emptied. A
+ * material without a twin or with a field this cannot read goes to
+ * viaLua(m); a texture the engine cannot sync goes to syncTexture(tex). */
+enum { QK_COLOR, QK_EMISSIVE, QK_SPECULAR, QK_OPACITY, QK_SHININESS, QK_ROUGHNESS, QK_METALNESS, QK_EMISSIVE_INTENSITY,
+       QK_SIDE, QK_TRANSPARENT, QK_DEPTH_TEST, QK_DEPTH_WRITE, QK_VERTEX_COLORS, QK_FLAT, QK_WIREFRAME, QK_VISIBLE, QK_FOG,
+       QK_SKINNING, QK_MORPH, QK_MORPH_NORMALS, QK_ALPHA_TEST, QK_AO_INTENSITY, QK_NORMAL_SCALE, QK_BLENDING, QK_PREMUL,
+       QK_BLEND_SRC, QK_BLEND_DST, QK_BLEND_EQ, QK_BLEND_SRC_A, QK_BLEND_DST_A, QK_BLEND_EQ_A, QK_DEPTH_FUNC, QK_NWATCHED,
+       QK_WR = QK_NWATCHED, QK_WG, QK_WB, QK_COUNT };
+static TString *qkey[QK_COUNT], *qkey_hidden[QK_NWATCHED], *tkey_bound[TK_NMAPS];
+/* m[k] with its hidden field; NULL = unreadable */
+static const TValue *mq(lua_State *L, Table *m, int k) { return obj_get(L, m, qkey[k], qkey_hidden[k]); }
+static int mq_num(lua_State *L, Table *m, int k, double def, float *out) {
+    const TValue *v = mq(L, m, k);
+    if (!v) return 0;
+    *out = (float)((isempty(v) || l_isfalse(v)) ? def : tv_num(v));
+    return 1;
+}
+static int mq_int(lua_State *L, Table *m, int k, double def, int *out) {
+    const TValue *v = mq(L, m, k);
+    if (!v) return 0;
+    *out = lk_int((isempty(v) || l_isfalse(v)) ? def : tv_num(v));
+    return 1;
+}
+/* truthy / "not false" flags; -1 = unreadable */
+static int mq_truthy(lua_State *L, Table *m, int k) { const TValue *v = mq(L, m, k); return v ? (!isempty(v) && tv_true(v)) : -1; }
+static int mq_notfalse(lua_State *L, Table *m, int k) { const TValue *v = mq(L, m, k); return v ? !(!isempty(v) && ttisboolean(v) && l_isfalse(v)) : -1; }
+/* a Color's r g b: its fields, or the hidden ones of a watched colour */
+static t3_color col_read(Table *c) {
+    const TValue *r = luaH_getshortstr(c, lkey[LK_R]);
+    t3_color out;
+    if (!isempty(r)) {
+        out.r = (float)tv_num(r); out.g = (float)tv_num(luaH_getshortstr(c, lkey[LK_G])); out.b = (float)tv_num(luaH_getshortstr(c, lkey[LK_B]));
+    } else {
+        out.r = (float)tv_num(luaH_getshortstr(c, qkey[QK_WR])); out.g = (float)tv_num(luaH_getshortstr(c, qkey[QK_WG]));
+        out.b = (float)tv_num(luaH_getshortstr(c, qkey[QK_WB]));
+    }
+    return out;
+}
+static int sync_material_c(lua_State *L, Table *m, int mapped_idx, int synctex_idx) {
+    t3_material *h = (t3_material *)tv_handle(luaH_getshortstr(m, lkey[LK_T3]));
+    if (!h) return 0;
+    mat_args_t a;
+    const TValue *cv = mq(L, m, QK_COLOR), *ev = mq(L, m, QK_EMISSIVE), *sv = mq(L, m, QK_SPECULAR);
+    if (!cv || !ev || !sv) return 0;
+    Table *c = tv_tab(cv), *e = tv_tab(ev), *sp = tv_tab(sv);
+    t3_color white = { 1, 1, 1 }, black = { 0, 0, 0 }, grey = { 0.0666f, 0.0666f, 0.0666f };
+    a.color = c ? col_read(c) : white;
+    a.emissive = e ? col_read(e) : black;
+    a.specular = sp ? col_read(sp) : grey;
+    int fl = 0, t;
+    if ((t = mq_truthy(L, m, QK_TRANSPARENT)) < 0) return 0; if (t) fl |= MF_TRANSPARENT;
+    if ((t = mq_notfalse(L, m, QK_DEPTH_TEST)) < 0) return 0; if (t) fl |= MF_DEPTH_TEST;
+    if ((t = mq_notfalse(L, m, QK_DEPTH_WRITE)) < 0) return 0; if (t) fl |= MF_DEPTH_WRITE;
+    if ((t = mq_truthy(L, m, QK_VERTEX_COLORS)) < 0) return 0; if (t) fl |= MF_VERTEX_COLORS;
+    if ((t = mq_truthy(L, m, QK_FLAT)) < 0) return 0; if (t) fl |= MF_FLAT;
+    if ((t = mq_truthy(L, m, QK_WIREFRAME)) < 0) return 0; if (t) fl |= MF_WIREFRAME;
+    if ((t = mq_notfalse(L, m, QK_VISIBLE)) < 0) return 0; if (t) fl |= MF_VISIBLE;
+    if ((t = mq_notfalse(L, m, QK_FOG)) < 0) return 0; if (t) fl |= MF_FOG;
+    if ((t = mq_truthy(L, m, QK_SKINNING)) < 0) return 0; if (t) fl |= MF_SKINNING;
+    if ((t = mq_truthy(L, m, QK_MORPH)) < 0) return 0; if (t) fl |= MF_MORPH;
+    if ((t = mq_truthy(L, m, QK_MORPH_NORMALS)) < 0) return 0; if (t) fl |= MF_MORPH_NORMALS;
+    a.fl = fl;
+    if (!mq_num(L, m, QK_OPACITY, 1, &a.opacity) || !mq_num(L, m, QK_SHININESS, 30, &a.shininess)
+        || !mq_num(L, m, QK_ROUGHNESS, 1, &a.roughness) || !mq_num(L, m, QK_METALNESS, 0, &a.metalness)
+        || !mq_num(L, m, QK_EMISSIVE_INTENSITY, 1, &a.emissive_intensity) || !mq_int(L, m, QK_SIDE, 0, &a.side)
+        || !mq_num(L, m, QK_ALPHA_TEST, 0, &a.alpha_test) || !mq_num(L, m, QK_AO_INTENSITY, 1, &a.ao_map_intensity)) return 0;
+    const TValue *nsv = mq(L, m, QK_NORMAL_SCALE);
+    if (!nsv) return 0;
+    Table *ns = tv_tab(nsv);
+    a.ns_x = ns ? (float)tv_num(luaH_getshortstr(ns, fkey[FK_X])) : 1;
+    a.ns_y = ns ? (float)tv_num(luaH_getshortstr(ns, fkey[FK_Y])) : 1;
+    a.has_blend = 1;
+    if (!mq_int(L, m, QK_BLENDING, 1, &a.blending) || (t = mq_truthy(L, m, QK_PREMUL)) < 0
+        || !mq_int(L, m, QK_BLEND_SRC, 204, &a.blend_src) || !mq_int(L, m, QK_BLEND_DST, 205, &a.blend_dst)
+        || !mq_int(L, m, QK_BLEND_EQ, 100, &a.blend_equation) || !mq_int(L, m, QK_BLEND_SRC_A, -1, &a.blend_src_alpha)
+        || !mq_int(L, m, QK_BLEND_DST_A, -1, &a.blend_dst_alpha) || !mq_int(L, m, QK_BLEND_EQ_A, -1, &a.blend_equation_alpha)
+        || !mq_int(L, m, QK_DEPTH_FUNC, 3, &a.depth_func)) return 0;
+    a.premultiplied_alpha = t;
+    /* the maps: each looked up as Lua does, synced, bound when changed */
+    const TValue *maps[TK_NMAPS];
+    for (int slot = 0; slot < TK_NMAPS; slot++) {
+        maps[slot] = obj_get(L, m, tkey[slot], tkey_hidden[slot]);
+        if (!maps[slot]) return 0;
+    }
+    /* from here on nothing fails: the twin is written */
+    TValue *md = (TValue *)luaH_getshortstr(m, mkey[MK_MD]);
+    if (!isabstkey(md)) setbfvalue(md);
+    else { sethvalue2s(L, L->top.p, m); L->top.p++; lua_pushstring(L, getstr(mkey[MK_MD])); lua_pushboolean(L, 0); lua_rawset(L, -3); lua_pop(L, 1); }
+    mat_apply(h, &a);
+    int any = 0;
+    for (int slot = 0; slot < TK_NMAPS; slot++) {
+        Table *tex = tv_tab(maps[slot]);
+        t3_texture *th = NULL;
+        if (tex) {
+            if (sync_texture_c(tex)) th = (t3_texture *)tv_handle(luaH_getshortstr(tex, tkey[TK_T3]));
+            else {
+                lua_pushvalue(L, synctex_idx);
+                sethvalue2s(L, L->top.p, tex); L->top.p++;
+                lua_call(L, 1, 1);
+                th = (t3_texture *)Popt(L, -1);
+                lua_pop(L, 1);
+            }
+        }
+        if (th) any = 1;
+        t3_texture *bound = (t3_texture *)tv_handle(luaH_getshortstr(m, tkey_bound[slot]));
+        if (bound != th) {
+            t3_material_set_texture(h, (t3_map_slot)slot, th);
+            h->version++;
+            sethvalue2s(L, L->top.p, m); L->top.p++;
+            lua_pushstring(L, getstr(tkey_bound[slot]));
+            if (th && tex) { setobj2s(L, L->top.p, luaH_getshortstr(tex, tkey[TK_T3])); L->top.p++; }
+            else lua_pushnil(L);
+            lua_rawset(L, -3);
+            lua_pop(L, 1);
+        }
+    }
+    sethvalue2s(L, L->top.p, m); L->top.p++;
+    if (any) lua_pushboolean(L, 1); else lua_pushnil(L);
+    lua_rawset(L, mapped_idx);
+    return 1;
+}
+static int l_sync_materials(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE); luaL_checktype(L, 2, LUA_TTABLE);
+    luaL_checktype(L, 3, LUA_TFUNCTION); luaL_checktype(L, 4, LUA_TFUNCTION);
+    lua_settop(L, 4);
+    Table *list = tab_at(L, 1);
+    const TValue *nv = luaH_getshortstr(list, wkey[WK_N]);
+    lua_Integer n = ttisinteger(nv) ? ivalue(nv) : 0;
+    if (n == 0) return 0;
+    for (lua_Integer i = 1; i <= n; i++) {
+        lua_rawgeti(L, 1, i);
+        Table *m = lua_istable(L, -1) ? tab_at(L, -1) : NULL;
+        if (!m || !sync_material_c(L, m, 2, 3)) {
+            lua_pushvalue(L, 4); lua_pushvalue(L, -2); lua_call(L, 1, 0);
+        }
+        lua_pop(L, 1);
+        lua_pushnil(L); lua_rawseti(L, 1, i);
+    }
+    lua_pushinteger(L, 0); lua_setfield(L, 1, "n");
     return 0;
 }
 
@@ -4353,10 +4521,6 @@ static int l_tex_get(lua_State *L) {
  * parameters and the transform to the twin), reading the texture's fields
  * as Lua does; a texture without a twin, with a new version, or with a
  * field missing goes to viaLua(tex). */
-enum { TK_MAP, TK_NORMAL, TK_AO, TK_EMISSIVE, TK_ROUGH, TK_METAL, TK_ALPHA, TK_NMAPS,
-       TK_T3 = TK_NMAPS, TK_VERSION, TK_T3VER, TK_WRAPS, TK_WRAPT, TK_MAG, TK_MIN, TK_FLIPY, TK_ISDATA, TK_MIPS,
-       TK_ENC, TK_OFFSET, TK_REPEAT, TK_CENTER, TK_ROT, TK_ANISO, TK_COUNT };
-static TString *tkey[TK_COUNT], *tkey_hidden[TK_NMAPS];
 /* a field: 1 and its number (`v or def` when nil / false), 0 when missing */
 static int tk_num(Table *t, int k, double def, double *out) {
     const TValue *v = luaH_getshortstr(t, tkey[k]);
@@ -4903,7 +5067,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "frame_setup", l_frame_setup }, { "renderer_get", l_renderer_get }, { "scene_get", l_scene_get }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "frame_setup", l_frame_setup }, { "sync_materials", l_sync_materials }, { "renderer_get", l_renderer_get }, { "scene_get", l_scene_get }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at }, { "ray_from_camera", l_ray_from_camera },
 #endif
@@ -5009,6 +5173,27 @@ void wcl_open_three_c(lua_State *L) {
     for (int i = 0; i < RK_COUNT; i++) {
         lua_pushstring(L, rnames[i]);
         rkey[i] = (TString *)lua_topointer(L, -1);
+        luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    static const char *const qnames[QK_COUNT] = { "color", "emissive", "specular", "opacity", "shininess", "roughness", "metalness",
+                                                  "emissiveIntensity", "side", "transparent", "depthTest", "depthWrite", "vertexColors",
+                                                  "flatShading", "wireframe", "visible", "fog", "skinning", "morphTargets", "morphNormals",
+                                                  "alphaTest", "aoMapIntensity", "normalScale", "blending", "premultipliedAlpha", "blendSrc",
+                                                  "blendDst", "blendEquation", "blendSrcAlpha", "blendDstAlpha", "blendEquationAlpha",
+                                                  "depthFunc", "_w_r", "_w_g", "_w_b" };
+    for (int i = 0; i < QK_COUNT; i++) {
+        lua_pushstring(L, qnames[i]);
+        qkey[i] = (TString *)lua_topointer(L, -1);
+        luaL_ref(L, LUA_REGISTRYINDEX);
+        if (i < QK_NWATCHED) {
+            lua_pushfstring(L, "_w_%s", qnames[i]);
+            qkey_hidden[i] = (TString *)lua_topointer(L, -1);
+            luaL_ref(L, LUA_REGISTRYINDEX);
+        }
+    }
+    for (int i = 0; i < TK_NMAPS; i++) {
+        lua_pushfstring(L, "_t3%s", tnames[i]);
+        tkey_bound[i] = (TString *)lua_topointer(L, -1);
         luaL_ref(L, LUA_REGISTRYINDEX);
     }
     static const char *const wnames[WK_COUNT] = { "x", "y", "z", "order", "_x", "_y", "_z", "_order", "_srcq",
