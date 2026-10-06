@@ -761,6 +761,198 @@ static int l_m4_invert(lua_State *L) {
     return 1;
 }
 
+/* ── Vector3 / Quaternion / compose kernels (fields x y z w) ──────────────
+ * Lua keeps integer arithmetic integer (Vector3(0, 1, 0) stays integers
+ * through an identity quaternion), so these carry the number subtype with
+ * each value and store what Lua would have stored. Integers past 2^53 (where
+ * Lua's would wrap and a double would not) give up and leave it to Lua. */
+
+enum { FK_X, FK_Y, FK_Z, FK_W, FK_EX, FK_EY, FK_EZ, FK_EO, FK_COUNT };
+static TString *fkey[FK_COUNT];
+
+typedef struct { double d; int i; } num_t;
+static int num_bail;
+static inline num_t nchk(double d, int i) {
+    if (i && fabs(d) >= 9007199254740992.0) num_bail = 1;
+    num_t r = { d, i };
+    return r;
+}
+static inline num_t nadd(num_t a, num_t b) { return nchk(a.d + b.d, a.i && b.i); }
+static inline num_t nsub(num_t a, num_t b) { return nchk(a.d - b.d, a.i && b.i); }
+static inline num_t nmul(num_t a, num_t b) { return nchk(a.d * b.d, a.i && b.i); }
+static inline num_t nint(double d) { num_t r = { d, 1 }; return r; }
+static inline num_t nflt(double d) { num_t r = { d, 0 }; return r; }
+
+/* the numbers in fields (x, y, z[, w]) of the table at idx; 0 if it is not
+ * such a plain table (a watched vector keeps them in slots instead) */
+static int get_fields(lua_State *L, int idx, int n, num_t *out, Table **tp) {
+    if (!lua_istable(L, idx)) return 0;
+    Table *t = tab_at(L, idx);
+    for (int i = 0; i < n; i++) {
+        const TValue *v = luaH_getshortstr(t, fkey[FK_X + i]);
+        if (ttisfloat(v)) out[i] = nflt(fltvalue(v));
+        else if (ttisinteger(v)) out[i] = nint((double)ivalue(v));
+        else return 0;
+    }
+    if (tp) *tp = t;
+    return 1;
+}
+static void set_tv(TValue *s, num_t v) {
+    if (v.i) { setivalue(s, (lua_Integer)v.d); }
+    else { setfltvalue(s, v.d); }
+}
+static void set_fields(Table *t, int n, const num_t *v) {
+    for (int i = 0; i < n; i++) set_tv((TValue *)luaH_getshortstr(t, fkey[FK_X + i]), v[i]);
+}
+static int m4_get_n(lua_State *L, int idx, num_t e[16], Table **out) {
+    if (!lua_istable(L, idx)) return 0;
+    Table *t = tab_at(L, idx);
+    if (t->alimit < 16) return 0;
+    for (int i = 0; i < 16; i++) {
+        const TValue *v = &t->array[i];
+        if (ttisfloat(v)) e[i] = nflt(fltvalue(v));
+        else if (ttisinteger(v)) e[i] = nint((double)ivalue(v));
+        else return 0;
+    }
+    if (out) *out = t;
+    return 1;
+}
+#define NO_KERNEL do { lua_pushboolean(L, 0); return 1; } while (0)
+
+/* t3.v3_apply_m4(v, elements) -> ok: Vector3:applyMatrix4 */
+static int l_v3_apply_m4(lua_State *L) {
+    num_t p[3], e[16];
+    Table *t;
+    if (!get_fields(L, 1, 3, p, &t) || !m4_get_n(L, 2, e, NULL)) NO_KERNEL;
+    num_bail = 0;
+    num_t x = p[0], y = p[1], z = p[2];
+    num_t w = nadd(nadd(nadd(nmul(e[3], x), nmul(e[7], y)), nmul(e[11], z)), e[15]);
+    w = (w.d == 0) ? nint(1) : nflt(1 / w.d);
+    num_t r[3] = { nmul(nadd(nadd(nadd(nmul(e[0], x), nmul(e[4], y)), nmul(e[8], z)), e[12]), w),
+                   nmul(nadd(nadd(nadd(nmul(e[1], x), nmul(e[5], y)), nmul(e[9], z)), e[13]), w),
+                   nmul(nadd(nadd(nadd(nmul(e[2], x), nmul(e[6], y)), nmul(e[10], z)), e[14]), w) };
+    if (num_bail) NO_KERNEL;
+    set_fields(t, 3, r);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* t3.v3_apply_q(v, q) -> ok: Vector3:applyQuaternion */
+static int l_v3_apply_q(lua_State *L) {
+    num_t v[3], q[4];
+    Table *t;
+    if (!get_fields(L, 1, 3, v, &t) || !get_fields(L, 2, 4, q, NULL)) NO_KERNEL;
+    num_bail = 0;
+    num_t vx = v[0], vy = v[1], vz = v[2], qx = q[0], qy = q[1], qz = q[2], qw = q[3], two = nint(2);
+    num_t tx = nmul(two, nsub(nmul(qy, vz), nmul(qz, vy)));
+    num_t ty = nmul(two, nsub(nmul(qz, vx), nmul(qx, vz)));
+    num_t tz = nmul(two, nsub(nmul(qx, vy), nmul(qy, vx)));
+    num_t r[3] = { nsub(nadd(nadd(vx, nmul(qw, tx)), nmul(qy, tz)), nmul(qz, ty)),
+                   nsub(nadd(nadd(vy, nmul(qw, ty)), nmul(qz, tx)), nmul(qx, tz)),
+                   nsub(nadd(nadd(vz, nmul(qw, tz)), nmul(qx, ty)), nmul(qy, tx)) };
+    if (num_bail) NO_KERNEL;
+    set_fields(t, 3, r);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* t3.m4_compose(elements, position, quaternion, scale) -> ok: Matrix4:compose */
+static int l_m4_compose(lua_State *L) {
+    num_t p[3], q[4], s[3];
+    if (!lua_istable(L, 1) || !get_fields(L, 2, 3, p, NULL) || !get_fields(L, 3, 4, q, NULL) ||
+        !get_fields(L, 4, 3, s, NULL)) NO_KERNEL;
+    Table *te = tab_at(L, 1);
+    if (te->alimit < 16) NO_KERNEL;
+    num_bail = 0;
+    num_t x = q[0], y = q[1], z = q[2], w = q[3], one = nint(1);
+    num_t x2 = nadd(x, x), y2 = nadd(y, y), z2 = nadd(z, z);
+    num_t xx = nmul(x, x2), xy = nmul(x, y2), xz = nmul(x, z2);
+    num_t yy = nmul(y, y2), yz = nmul(y, z2), zz = nmul(z, z2);
+    num_t wx = nmul(w, x2), wy = nmul(w, y2), wz = nmul(w, z2);
+    num_t sx = s[0], sy = s[1], sz = s[2];
+    num_t r[12] = { nmul(nsub(one, nadd(yy, zz)), sx), nmul(nadd(xy, wz), sx), nmul(nsub(xz, wy), sx),
+                    nmul(nsub(xy, wz), sy), nmul(nsub(one, nadd(xx, zz)), sy), nmul(nadd(yz, wx), sy),
+                    nmul(nadd(xz, wy), sz), nmul(nsub(yz, wx), sz), nmul(nsub(one, nadd(xx, yy)), sz) };
+    if (num_bail) NO_KERNEL;
+    TValue *a = te->array;
+    set_tv(&a[0], r[0]); set_tv(&a[1], r[1]); set_tv(&a[2], r[2]); setivalue(&a[3], 0);
+    set_tv(&a[4], r[3]); set_tv(&a[5], r[4]); set_tv(&a[6], r[5]); setivalue(&a[7], 0);
+    set_tv(&a[8], r[6]); set_tv(&a[9], r[7]); set_tv(&a[10], r[8]); setivalue(&a[11], 0);
+    set_tv(&a[12], p[0]); set_tv(&a[13], p[1]); set_tv(&a[14], p[2]); setivalue(&a[15], 1);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* t3.q_from_euler(q, euler) -> ok: Quaternion:setFromEuler's arithmetic
+ * (the caller fires _onChange). The euler's _x _y _z _order fields. */
+static int l_q_from_euler(lua_State *L) {
+    num_t qd[4];
+    Table *qt;
+    if (!get_fields(L, 1, 4, qd, &qt) || !lua_istable(L, 2)) { lua_pushboolean(L, 0); return 1; }
+    Table *et = tab_at(L, 2);
+    const TValue *vx = luaH_getshortstr(et, fkey[FK_EX]), *vy = luaH_getshortstr(et, fkey[FK_EY]);
+    const TValue *vz = luaH_getshortstr(et, fkey[FK_EZ]), *vo = luaH_getshortstr(et, fkey[FK_EO]);
+    if (!ttisnumber(vx) || !ttisnumber(vy) || !ttisnumber(vz) || !ttisstring(vo)) { lua_pushboolean(L, 0); return 1; }
+    double x = tv_num(vx), y = tv_num(vy), z = tv_num(vz);
+    const char *order = getstr(tsvalue(vo));
+    double hx = x * 0.5, hy = y * 0.5, hz = z * 0.5;
+    double c1 = cos(hx), c2 = cos(hy), c3 = cos(hz);
+    double s1 = sin(hx), s2 = sin(hy), s3 = sin(hz);
+    double c1c2 = c1 * c2, s1s2 = s1 * s2, s1c2 = s1 * c2, c1s2 = c1 * s2;
+    double c1c2c3 = c1c2 * c3, s1s2s3 = s1s2 * s3, s1c2c3 = s1c2 * c3, c1s2s3 = c1s2 * s3;
+    double c1s2c3 = c1s2 * c3, s1c2s3 = s1c2 * s3, c1c2s3 = c1c2 * s3, s1s2c3 = s1s2 * c3;
+    double r[4];
+    num_t rn[4];
+    if (!strcmp(order, "XYZ")) { r[0] = s1c2c3 + c1s2s3; r[1] = c1s2c3 - s1c2s3; r[2] = c1c2s3 + s1s2c3; r[3] = c1c2c3 - s1s2s3; }
+    else if (!strcmp(order, "YXZ")) { r[0] = s1c2c3 + c1s2s3; r[1] = c1s2c3 - s1c2s3; r[2] = c1c2s3 - s1s2c3; r[3] = c1c2c3 + s1s2s3; }
+    else if (!strcmp(order, "ZXY")) { r[0] = s1c2c3 - c1s2s3; r[1] = c1s2c3 + s1c2s3; r[2] = c1c2s3 + s1s2c3; r[3] = c1c2c3 - s1s2s3; }
+    else if (!strcmp(order, "ZYX")) { r[0] = s1c2c3 - c1s2s3; r[1] = c1s2c3 + s1c2s3; r[2] = c1c2s3 - s1s2c3; r[3] = c1c2c3 + s1s2s3; }
+    else if (!strcmp(order, "YZX")) { r[0] = s1c2c3 + c1s2s3; r[1] = c1s2c3 + s1c2s3; r[2] = c1c2s3 - s1s2c3; r[3] = c1c2c3 - s1s2s3; }
+    else if (!strcmp(order, "XZY")) { r[0] = s1c2c3 - c1s2s3; r[1] = c1s2c3 - s1c2s3; r[2] = c1c2s3 + s1s2c3; r[3] = c1c2c3 + s1s2s3; }
+    else { lua_pushboolean(L, 0); return 1; }
+    for (int i = 0; i < 4; i++) rn[i] = nflt(r[i]);
+    set_fields(qt, 4, rn);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* t3.q_slerp(q, qb, t) -> ok: Quaternion:slerp's arithmetic for t other
+ * than 0 and 1 (the caller handles those and fires _onChange) */
+static int l_q_slerp(lua_State *L) {
+    num_t an[4], bn[4];
+    Table *qt;
+    if (!get_fields(L, 1, 4, an, &qt) || !get_fields(L, 2, 4, bn, NULL) || !lua_isnumber(L, 3)) NO_KERNEL;
+    double t = lua_tonumber(L, 3);
+    double x = an[0].d, y = an[1].d, z = an[2].d, w = an[3].d;
+    double b[4] = { bn[0].d, bn[1].d, bn[2].d, bn[3].d };
+    double cosHalfTheta = w * b[3] + x * b[0] + y * b[1] + z * b[2];
+    double sx, sy, sz, sw;           /* self after the copy / negation */
+    if (cosHalfTheta < 0) { sw = -b[3]; sx = -b[0]; sy = -b[1]; sz = -b[2]; cosHalfTheta = -cosHalfTheta; }
+    else { sx = b[0]; sy = b[1]; sz = b[2]; sw = b[3]; }
+    /* >= 1: self is put back as it was, number subtypes and all */
+    if (cosHalfTheta >= 1.0) { lua_pushboolean(L, 1); return 1; }
+    num_t r[4];
+    double sqrSinHalfTheta = 1.0 - cosHalfTheta * cosHalfTheta;
+    if (sqrSinHalfTheta <= 2.220446049250313e-16) {
+        double s = 1 - t;
+        double rw = s * w + t * sw, rx = s * x + t * sx, ry = s * y + t * sy, rz = s * z + t * sz;
+        /* Quaternion:normalize */
+        double l = sqrt(rx * rx + ry * ry + rz * rz + rw * rw);
+        if (l == 0) { r[0] = nint(0); r[1] = nint(0); r[2] = nint(0); r[3] = nint(1); }
+        else { l = 1 / l; r[0] = nflt(rx * l); r[1] = nflt(ry * l); r[2] = nflt(rz * l); r[3] = nflt(rw * l); }
+    } else {
+        double sinHalfTheta = sqrt(sqrSinHalfTheta);
+        double halfTheta = atan2(sinHalfTheta, cosHalfTheta);
+        double ratioA = sin((1 - t) * halfTheta) / sinHalfTheta;
+        double ratioB = sin(t * halfTheta) / sinHalfTheta;
+        r[3] = nflt(w * ratioA + sw * ratioB); r[0] = nflt(x * ratioA + sx * ratioB);
+        r[1] = nflt(y * ratioA + sy * ratioB); r[2] = nflt(z * ratioA + sz * ratioB);
+    }
+    set_fields(qt, 4, r);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
 /* t3.quat_from_euler(x, y, z, order) -> qx, qy, qz, qw (double precision) */
 static int l_quat_from_euler(lua_State *L) {
     double x = lua_tonumber(L, 1), y = lua_tonumber(L, 2), z = lua_tonumber(L, 3);
@@ -1626,7 +1818,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
     { "matrix", l_matrix },
     { "world", l_world }, { "local_matrix", l_local }, { "camera_matrices", l_camera_matrices },
     { "update_world", l_update_world }, { "update_world_matrix", l_update_world_matrix },
@@ -1670,6 +1862,12 @@ void wcl_open_three_c(lua_State *L) {
     for (int i = 0; i < AK_COUNT; i++) {
         lua_pushstring(L, anames[i]);
         anim_key[i] = (TString *)lua_topointer(L, -1);
+        luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    static const char *const fnames[FK_COUNT] = { "x", "y", "z", "w", "_x", "_y", "_z", "_order" };
+    for (int i = 0; i < FK_COUNT; i++) {
+        lua_pushstring(L, fnames[i]);
+        fkey[i] = (TString *)lua_topointer(L, -1);
         luaL_ref(L, LUA_REGISTRYINDEX);
     }
     luaL_newmetatable(L, HANDLE_MT);
