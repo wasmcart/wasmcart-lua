@@ -2169,6 +2169,265 @@ static int l_m4a_to_instanced(lua_State *L) {
     return 0;
 }
 
+/* ── more bulk ops (Vector3Array / QuaternionArray / Matrix4Array /
+ * ScalarArray), each the per-object method's expressions item by item ── */
+
+/* t3.v3a_add(a, b) / v3a_sub(a, b): a[i] += / -= b[i] */
+static int l_v3a_add(lua_State *L) {
+    f64a_t *a = f64a_of(L, 1, 3), *b = f64a_of(L, 2, 3);
+    f64a_same_n(L, a, b);
+    for (int i = 0; i < a->n * 3; i++) a->d[i] = a->d[i] + b->d[i];
+    return 0;
+}
+static int l_v3a_sub(lua_State *L) {
+    f64a_t *a = f64a_of(L, 1, 3), *b = f64a_of(L, 2, 3);
+    f64a_same_n(L, a, b);
+    for (int i = 0; i < a->n * 3; i++) a->d[i] = a->d[i] - b->d[i];
+    return 0;
+}
+/* t3.v3a_set_scaled(a, s, x, y, z): a[i] = (s[i] * x, s[i] * y, s[i] * z) */
+static int l_v3a_set_scaled(lua_State *L) {
+    f64a_t *a = f64a_of(L, 1, 3), *s = f64a_of(L, 2, 1);
+    f64a_same_n(L, a, s);
+    double x = luaL_checknumber(L, 3), y = luaL_checknumber(L, 4), z = luaL_checknumber(L, 5);
+    for (int i = 0; i < a->n; i++) {
+        double t = s->d[i];
+        a->d[i * 3] = t * x; a->d[i * 3 + 1] = t * y; a->d[i * 3 + 2] = t * z;
+    }
+    return 0;
+}
+/* t3.v3a_normalize(a): Vector3:normalize (a zero vector stays zero) */
+static int l_v3a_normalize(lua_State *L) {
+    f64a_t *a = f64a_of(L, 1, 3);
+    for (int i = 0; i < a->n; i++) {
+        double *p = a->d + i * 3;
+        double x = p[0], y = p[1], z = p[2];
+        double l = sqrt(x * x + y * y + z * z);
+        if (l == 0) continue;
+        double inv = 1 / l;
+        p[0] = x * inv; p[1] = y * inv; p[2] = z * inv;
+    }
+    return 0;
+}
+/* t3.v3a_cross(a, b, c): a[i] = b[i] x c[i] (crossVectors; a may be b or c) */
+static int l_v3a_cross(lua_State *L) {
+    f64a_t *a = f64a_of(L, 1, 3), *b = f64a_of(L, 2, 3), *cc = f64a_of(L, 3, 3);
+    f64a_same_n(L, a, b); f64a_same_n(L, a, cc);
+    for (int i = 0; i < a->n; i++) {
+        const double *p = b->d + i * 3, *q = cc->d + i * 3;
+        double ax = p[0], ay = p[1], az = p[2], bx = q[0], by = q[1], bz = q[2];
+        double *o = a->d + i * 3;
+        o[0] = ay * bz - az * by;
+        o[1] = az * bx - ax * bz;
+        o[2] = ax * by - ay * bx;
+    }
+    return 0;
+}
+/* t3.v3a_measure(a, b | nil, out, kind): out[i] = a[i]:dot(b[i]) (0),
+ * lengthSq (1), length (2), distanceToSquared(b[i]) (3), distanceTo (4) */
+static int l_v3a_measure(lua_State *L) {
+    f64a_t *a = f64a_of(L, 1, 3);
+    f64a_t *b = lua_isnoneornil(L, 2) ? NULL : f64a_of(L, 2, 3);
+    f64a_t *o = f64a_of(L, 3, 1);
+    int kind = (int)luaL_checkinteger(L, 4);
+    f64a_same_n(L, a, o);
+    if (b) f64a_same_n(L, a, b);
+    if ((kind == 0 || kind >= 3) && !b) return luaL_error(L, "t3.v3a_measure: second array needed");
+    for (int i = 0; i < a->n; i++) {
+        const double *p = a->d + i * 3, *q = b ? b->d + i * 3 : NULL;
+        double r;
+        switch (kind) {
+        case 0: r = p[0] * q[0] + p[1] * q[1] + p[2] * q[2]; break;
+        case 1: r = p[0] * p[0] + p[1] * p[1] + p[2] * p[2]; break;
+        case 2: { double x = p[0], y = p[1], z = p[2]; r = sqrt(x * x + y * y + z * z); break; }
+        case 3: { double dx = p[0] - q[0], dy = p[1] - q[1], dz = p[2] - q[2]; r = dx * dx + dy * dy + dz * dz; break; }
+        default: { double dx = p[0] - q[0], dy = p[1] - q[1], dz = p[2] - q[2]; r = sqrt(dx * dx + dy * dy + dz * dz); break; }
+        }
+        o->d[i] = r;
+    }
+    return 0;
+}
+/* t3.v3a_apply_qa(a, qa): a[i]:applyQuaternion(qa[i]) */
+static int l_v3a_apply_qa(lua_State *L) {
+    f64a_t *a = f64a_of(L, 1, 3), *q = f64a_of(L, 2, 4);
+    f64a_same_n(L, a, q);
+    for (int i = 0; i < a->n; i++) {
+        double *p = a->d + i * 3;
+        const double *r = q->d + i * 4;
+        double vx = p[0], vy = p[1], vz = p[2], qx = r[0], qy = r[1], qz = r[2], qw = r[3];
+        double tx = 2 * (qy * vz - qz * vy);
+        double ty = 2 * (qz * vx - qx * vz);
+        double tz = 2 * (qx * vy - qy * vx);
+        p[0] = vx + qw * tx + qy * tz - qz * ty;
+        p[1] = vy + qw * ty + qz * tx - qx * tz;
+        p[2] = vz + qw * tz + qx * ty - qy * tx;
+    }
+    return 0;
+}
+/* t3.f64a_sum(a, k) -> the sum of component k (0-based) over the items, in order */
+static int l_f64a_sum(lua_State *L) {
+    f64a_t *a = f64a_check(L, 1);
+    int k = (int)luaL_optinteger(L, 2, 0);
+    if (k < 0 || k >= a->stride) return luaL_error(L, "t3.f64a_sum: component %d of %d", k, a->stride);
+    double s = 0;
+    for (int i = 0; i < a->n; i++) s = s + a->d[i * a->stride + k];
+    lua_pushnumber(L, s);
+    return 1;
+}
+/* t3.qa_from_axis_angle(qa, axes, angles): qa[i]:setFromAxisAngle(axes[i],
+ * angles[i]) (sin and cos two items at a time, within an ulp) */
+static int l_qa_from_axis_angle(lua_State *L) {
+    f64a_t *q = f64a_of(L, 1, 4), *ax = f64a_of(L, 2, 3), *an = f64a_of(L, 3, 1);
+    f64a_same_n(L, q, ax); f64a_same_n(L, q, an);
+    for (int i = 0; i < q->n; i += 2) {
+        int j = i + 1 < q->n ? i + 1 : i;
+        v128_t half = wasm_f64x2_div(wasm_f64x2_make(an->d[i], an->d[j]), wasm_f64x2_splat(2));
+        v128_t s, cs;
+        sincos_f64x2(half, &s, &cs);
+        int idx[2] = { i, j };
+        for (int k = 0; k < (j != i ? 2 : 1); k++) {
+            double sv = k ? wasm_f64x2_extract_lane(s, 1) : wasm_f64x2_extract_lane(s, 0);
+            double cv = k ? wasm_f64x2_extract_lane(cs, 1) : wasm_f64x2_extract_lane(cs, 0);
+            const double *a = ax->d + idx[k] * 3;
+            double *o = q->d + idx[k] * 4;
+            o[0] = a[0] * sv; o[1] = a[1] * sv; o[2] = a[2] * sv; o[3] = cv;
+        }
+    }
+    return 0;
+}
+/* Quaternion:slerp on doubles (three.lua's, branches included) */
+static void q_slerp_d(double *self, const double *qb, double t) {
+    if (t == 0) return;
+    if (t == 1) { memcpy(self, qb, sizeof(double) * 4); return; }
+    double x = self[0], y = self[1], z = self[2], w = self[3];
+    double cosHalfTheta = w * qb[3] + x * qb[0] + y * qb[1] + z * qb[2];
+    double sx, sy, sz, sw;
+    if (cosHalfTheta < 0) { sw = -qb[3]; sx = -qb[0]; sy = -qb[1]; sz = -qb[2]; cosHalfTheta = -cosHalfTheta; }
+    else { sx = qb[0]; sy = qb[1]; sz = qb[2]; sw = qb[3]; }
+    if (cosHalfTheta >= 1.0) { self[0] = x; self[1] = y; self[2] = z; self[3] = w; return; }
+    double sqrSinHalfTheta = 1.0 - cosHalfTheta * cosHalfTheta;
+    if (sqrSinHalfTheta <= 2.220446049250313e-16) {
+        double s = 1 - t;
+        double rw = s * w + t * sw, rx = s * x + t * sx, ry = s * y + t * sy, rz = s * z + t * sz;
+        double l = sqrt(rx * rx + ry * ry + rz * rz + rw * rw);
+        if (l == 0) { self[0] = 0; self[1] = 0; self[2] = 0; self[3] = 1; return; }
+        l = 1 / l;
+        self[0] = rx * l; self[1] = ry * l; self[2] = rz * l; self[3] = rw * l;
+        return;
+    }
+    double sinHalfTheta = sqrt(sqrSinHalfTheta);
+    double halfTheta = atan2(sinHalfTheta, cosHalfTheta);
+    double ratioA = sin((1 - t) * halfTheta) / sinHalfTheta;
+    double ratioB = sin(t * halfTheta) / sinHalfTheta;
+    self[3] = w * ratioA + sw * ratioB; self[0] = x * ratioA + sx * ratioB;
+    self[1] = y * ratioA + sy * ratioB; self[2] = z * ratioA + sz * ratioB;
+}
+/* t3.qa_slerp(qa, qb, t): qa[i]:slerp(qb[i], t) */
+static int l_qa_slerp(lua_State *L) {
+    f64a_t *a = f64a_of(L, 1, 4), *b = f64a_of(L, 2, 4);
+    f64a_same_n(L, a, b);
+    double t = luaL_checknumber(L, 3);
+    for (int i = 0; i < a->n; i++) q_slerp_d(a->d + i * 4, b->d + i * 4, t);
+    return 0;
+}
+/* t3.qa_normalize(qa): Quaternion:normalize (zero length -> identity) */
+static int l_qa_normalize(lua_State *L) {
+    f64a_t *a = f64a_of(L, 1, 4);
+    for (int i = 0; i < a->n; i++) {
+        double *p = a->d + i * 4;
+        double l = sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2] + p[3] * p[3]);
+        if (l == 0) { p[0] = 0; p[1] = 0; p[2] = 0; p[3] = 1; }
+        else { l = 1 / l; p[0] = p[0] * l; p[1] = p[1] * l; p[2] = p[2] * l; p[3] = p[3] * l; }
+    }
+    return 0;
+}
+/* Matrix4:multiplyMatrices on doubles, its affine fast path included */
+static void m4_mul_d(double *out, const double *ae, const double *be) {
+    double r[16];
+    if (ae[3] == 0 && ae[7] == 0 && ae[11] == 0 && ae[15] == 1 && be[3] == 0 && be[7] == 0 && be[11] == 0 && be[15] == 1) {
+        for (int c = 0; c < 4; c++) {
+            for (int i = 0; i < 3; i++) {
+                double s = ae[i] * be[c * 4] + ae[4 + i] * be[c * 4 + 1] + ae[8 + i] * be[c * 4 + 2];
+                if (c == 3) s = s + ae[12 + i];
+                r[c * 4 + i] = s;
+            }
+            r[c * 4 + 3] = c == 3 ? 1 : 0;
+        }
+    } else {
+        for (int c = 0; c < 4; c++)
+            for (int i = 0; i < 4; i++)
+                r[c * 4 + i] = ae[i] * be[c * 4] + ae[4 + i] * be[c * 4 + 1] + ae[8 + i] * be[c * 4 + 2] + ae[12 + i] * be[c * 4 + 3];
+    }
+    memcpy(out, r, sizeof r);
+}
+/* t3.m4a_multiply(a, b, pre): a[i] = a[i] * b[i] (pre: b[i] * a[i]) */
+static int l_m4a_multiply(lua_State *L) {
+    f64a_t *a = f64a_of(L, 1, 16), *b = f64a_of(L, 2, 16);
+    f64a_same_n(L, a, b);
+    int pre = lua_toboolean(L, 3);
+    for (int i = 0; i < a->n; i++) {
+        double *p = a->d + i * 16;
+        const double *q = b->d + i * 16;
+        if (pre) m4_mul_d(p, q, p); else m4_mul_d(p, p, q);
+    }
+    return 0;
+}
+/* Matrix4:invert on doubles (its affine fast path, then the general one;
+ * singular -> all zero) */
+static void m4_invert_d(double *e) {
+    if (e[3] == 0 && e[7] == 0 && e[11] == 0 && e[15] == 1) {
+        double a11 = e[0], a21 = e[1], a31 = e[2], a12 = e[4], a22 = e[5], a32 = e[6];
+        double a13 = e[8], a23 = e[9], a33 = e[10], tx = e[12], ty = e[13], tz = e[14];
+        double c11 = a22 * a33 - a23 * a32, c12 = a23 * a31 - a21 * a33, c13 = a21 * a32 - a22 * a31;
+        double det = a11 * c11 + a12 * c12 + a13 * c13;
+        if (det != 0) {
+            double d = 1 / det;
+            double i11 = c11 * d, i12 = (a13 * a32 - a12 * a33) * d, i13 = (a12 * a23 - a13 * a22) * d;
+            double i21 = c12 * d, i22 = (a11 * a33 - a13 * a31) * d, i23 = (a13 * a21 - a11 * a23) * d;
+            double i31 = c13 * d, i32 = (a12 * a31 - a11 * a32) * d, i33 = (a11 * a22 - a12 * a21) * d;
+            e[0] = i11; e[1] = i21; e[2] = i31; e[3] = 0;
+            e[4] = i12; e[5] = i22; e[6] = i32; e[7] = 0;
+            e[8] = i13; e[9] = i23; e[10] = i33; e[11] = 0;
+            e[12] = -(i11 * tx + i12 * ty + i13 * tz);
+            e[13] = -(i21 * tx + i22 * ty + i23 * tz);
+            e[14] = -(i31 * tx + i32 * ty + i33 * tz);
+            e[15] = 1;
+            return;
+        }
+    }
+    double n11 = e[0], n21 = e[1], n31 = e[2], n41 = e[3], n12 = e[4], n22 = e[5], n32 = e[6], n42 = e[7];
+    double n13 = e[8], n23 = e[9], n33 = e[10], n43 = e[11], n14 = e[12], n24 = e[13], n34 = e[14], n44 = e[15];
+    double t11 = n23 * n34 * n42 - n24 * n33 * n42 + n24 * n32 * n43 - n22 * n34 * n43 - n23 * n32 * n44 + n22 * n33 * n44;
+    double t12 = n14 * n33 * n42 - n13 * n34 * n42 - n14 * n32 * n43 + n12 * n34 * n43 + n13 * n32 * n44 - n12 * n33 * n44;
+    double t13 = n13 * n24 * n42 - n14 * n23 * n42 + n14 * n22 * n43 - n12 * n24 * n43 - n13 * n22 * n44 + n12 * n23 * n44;
+    double t14 = n14 * n23 * n32 - n13 * n24 * n32 - n14 * n22 * n33 + n12 * n24 * n33 + n13 * n22 * n34 - n12 * n23 * n34;
+    double det = n11 * t11 + n21 * t12 + n31 * t13 + n41 * t14;
+    if (det == 0) { memset(e, 0, sizeof(double) * 16); return; }
+    double d = 1 / det;
+    e[0] = t11 * d;
+    e[1] = (n24 * n33 * n41 - n23 * n34 * n41 - n24 * n31 * n43 + n21 * n34 * n43 + n23 * n31 * n44 - n21 * n33 * n44) * d;
+    e[2] = (n22 * n34 * n41 - n24 * n32 * n41 + n24 * n31 * n42 - n21 * n34 * n42 - n22 * n31 * n44 + n21 * n32 * n44) * d;
+    e[3] = (n23 * n32 * n41 - n22 * n33 * n41 - n23 * n31 * n42 + n21 * n33 * n42 + n22 * n31 * n43 - n21 * n32 * n43) * d;
+    e[4] = t12 * d;
+    e[5] = (n13 * n34 * n41 - n14 * n33 * n41 + n14 * n31 * n43 - n11 * n34 * n43 - n13 * n31 * n44 + n11 * n33 * n44) * d;
+    e[6] = (n14 * n32 * n41 - n12 * n34 * n41 - n14 * n31 * n42 + n11 * n34 * n42 + n12 * n31 * n44 - n11 * n32 * n44) * d;
+    e[7] = (n12 * n33 * n41 - n13 * n32 * n41 + n13 * n31 * n42 - n11 * n33 * n42 - n12 * n31 * n43 + n11 * n32 * n43) * d;
+    e[8] = t13 * d;
+    e[9] = (n14 * n23 * n41 - n13 * n24 * n41 - n14 * n21 * n43 + n11 * n24 * n43 + n13 * n21 * n44 - n11 * n23 * n44) * d;
+    e[10] = (n12 * n24 * n41 - n14 * n22 * n41 + n14 * n21 * n42 - n11 * n24 * n42 - n12 * n21 * n44 + n11 * n22 * n44) * d;
+    e[11] = (n13 * n22 * n41 - n12 * n23 * n41 - n13 * n21 * n42 + n11 * n23 * n42 + n12 * n21 * n43 - n11 * n22 * n43) * d;
+    e[12] = t14 * d;
+    e[13] = (n13 * n24 * n31 - n14 * n23 * n31 + n14 * n21 * n33 - n11 * n24 * n33 - n13 * n21 * n34 + n11 * n23 * n34) * d;
+    e[14] = (n14 * n22 * n31 - n12 * n24 * n31 - n14 * n21 * n32 + n11 * n24 * n32 + n12 * n21 * n34 - n11 * n22 * n34) * d;
+    e[15] = (n12 * n23 * n31 - n13 * n22 * n31 + n13 * n21 * n32 - n11 * n23 * n32 - n12 * n21 * n33 + n11 * n22 * n33) * d;
+}
+/* t3.m4a_invert(a) */
+static int l_m4a_invert(lua_State *L) {
+    f64a_t *a = f64a_of(L, 1, 16);
+    for (int i = 0; i < a->n; i++) m4_invert_d(a->d + i * 16);
+    return 0;
+}
+
 /* t3.quat_from_euler(x, y, z, order) -> qx, qy, qz, qw (double precision) */
 static int l_quat_from_euler(lua_State *L) {
     double x = lua_tonumber(L, 1), y = lua_tonumber(L, 2), z = lua_tonumber(L, 3);
@@ -3041,7 +3300,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "f64a", l_f64a }, { "f64a_get", l_f64a_get }, { "f64a_set", l_f64a_set }, { "f64a_fill", l_f64a_fill }, { "f64a_copy", l_f64a_copy }, { "v3a_add_xyz", l_v3a_add_xyz }, { "v3a_add_scaled", l_v3a_add_scaled }, { "v3a_multiply_scalar", l_v3a_multiply_scalar }, { "v3a_apply_m4a", l_v3a_apply_m4a }, { "v3a_sum", l_v3a_sum }, { "qa_from_euler_scaled", l_qa_from_euler_scaled }, { "m4a_compose", l_m4a_compose }, { "m4a_to_instanced", l_m4a_to_instanced }, { "array_part", l_array_part }, { "anim_register_more", l_anim_register_more }, { "deindex", l_deindex }, { "gen_sphere", l_gen_sphere }, { "gen_torus", l_gen_torus }, { "catmull_rom", l_catmull_rom }, { "cr_lengths", l_cr_lengths }, { "bezier3", l_bezier3 }, { "ellipse", l_ellipse }, { "u_to_t", l_u_to_t }, { "gen_torus_knot", l_gen_torus_knot }, { "gen_cylinder", l_gen_cylinder }, { "gen_box", l_gen_box }, { "gen_polyhedron", l_gen_polyhedron }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "f64a", l_f64a }, { "v3a_add", l_v3a_add }, { "v3a_sub", l_v3a_sub }, { "v3a_set_scaled", l_v3a_set_scaled }, { "v3a_normalize", l_v3a_normalize }, { "v3a_cross", l_v3a_cross }, { "v3a_measure", l_v3a_measure }, { "v3a_apply_qa", l_v3a_apply_qa }, { "f64a_sum", l_f64a_sum }, { "qa_from_axis_angle", l_qa_from_axis_angle }, { "qa_slerp", l_qa_slerp }, { "qa_normalize", l_qa_normalize }, { "m4a_multiply", l_m4a_multiply }, { "m4a_invert", l_m4a_invert }, { "f64a_get", l_f64a_get }, { "f64a_set", l_f64a_set }, { "f64a_fill", l_f64a_fill }, { "f64a_copy", l_f64a_copy }, { "v3a_add_xyz", l_v3a_add_xyz }, { "v3a_add_scaled", l_v3a_add_scaled }, { "v3a_multiply_scalar", l_v3a_multiply_scalar }, { "v3a_apply_m4a", l_v3a_apply_m4a }, { "v3a_sum", l_v3a_sum }, { "qa_from_euler_scaled", l_qa_from_euler_scaled }, { "m4a_compose", l_m4a_compose }, { "m4a_to_instanced", l_m4a_to_instanced }, { "array_part", l_array_part }, { "anim_register_more", l_anim_register_more }, { "deindex", l_deindex }, { "gen_sphere", l_gen_sphere }, { "gen_torus", l_gen_torus }, { "catmull_rom", l_catmull_rom }, { "cr_lengths", l_cr_lengths }, { "bezier3", l_bezier3 }, { "ellipse", l_ellipse }, { "u_to_t", l_u_to_t }, { "gen_torus_knot", l_gen_torus_knot }, { "gen_cylinder", l_gen_cylinder }, { "gen_box", l_gen_box }, { "gen_polyhedron", l_gen_polyhedron }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
     { "matrix", l_matrix },
     { "world", l_world }, { "local_matrix", l_local }, { "camera_matrices", l_camera_matrices },
     { "update_world", l_update_world }, { "update_world_matrix", l_update_world_matrix },

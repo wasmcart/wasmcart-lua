@@ -67,7 +67,7 @@ if [ ! -f vendor/liblua54.a ]; then
   ( cd vendor/lua/src && \
     emcc -O2 -flto -c $CORE -DLUA_CART_NOFILES -sSUPPORT_LONGJMP=wasm \
       -I "$RUNTIME_DIR" -include "$RUNTIME_DIR/cartconf.h" && \
-    emar rcs ../../liblua54.a *.o && rm -f *.o )
+    emar rcs ../../liblua54.a ${CORE//.c/.o} && rm -f ${CORE//.c/.o} )
 fi
 
 
