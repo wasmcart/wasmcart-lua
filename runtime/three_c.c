@@ -35,6 +35,8 @@
 #include "lobject.h"
 #include "lstate.h"
 #include "ltable.h"
+#include "lgc.h"
+#include "lvm.h"
 #include "three.h"
 #include "wasmcart.h"
 #include <string.h>
@@ -338,6 +340,271 @@ static int l_flush(lua_State *L) {
     }
     lua_pushinteger(L, keep);
     return 1;
+}
+
+/* ── animation: the per-track step of AnimationAction:_update ─────────── */
+
+enum { AK_PP, AK_SV, AK_VS, AK_CI, AK_BUF, AK_CW, AK_RB, AK_MK, AK_CWA, AK_COUNT };
+static TString *anim_key[AK_COUNT];
+
+static TValue *tab_slot(Table *t, int i) { return (TValue *)tab_geti(t, i); }
+static void slot_set(Table *t, int i, double v) {
+    TValue *s = tab_slot(t, i);
+    if (!isabstkey(s)) setfltvalue(s, v);
+}
+static double tab_field_num(Table *t, int k) { return tv_num(luaH_getshortstr(t, anim_key[k])); }
+static Table *tab_field_tab(Table *t, int k) { return tv_tab(luaH_getshortstr(t, anim_key[k])); }
+
+/* Quaternion.slerpFlat (three.lua's Interpolants.slerpFlat), 0-based offsets */
+static void slerp_flat(Table *dst, int dofs, Table *s0, int o0, Table *s1, int o1, double t) {
+    double x0 = tab_num(s0, o0 + 1), y0 = tab_num(s0, o0 + 2), z0 = tab_num(s0, o0 + 3), w0 = tab_num(s0, o0 + 4);
+    double x1 = tab_num(s1, o1 + 1), y1 = tab_num(s1, o1 + 2), z1 = tab_num(s1, o1 + 3), w1 = tab_num(s1, o1 + 4);
+    if (t == 0) {
+        slot_set(dst, dofs + 1, x0); slot_set(dst, dofs + 2, y0); slot_set(dst, dofs + 3, z0); slot_set(dst, dofs + 4, w0);
+        return;
+    }
+    if (t == 1) {
+        slot_set(dst, dofs + 1, x1); slot_set(dst, dofs + 2, y1); slot_set(dst, dofs + 3, z1); slot_set(dst, dofs + 4, w1);
+        return;
+    }
+    if (w0 != w1 || x0 != x1 || y0 != y1 || z0 != z1) {
+        double s = 1 - t;
+        double c = x0 * x1 + y0 * y1 + z0 * z1 + w0 * w1;
+        double dir = c >= 0 ? 1 : -1;
+        double sqrSin = 1 - c * c;
+        if (sqrSin > 2.220446049250313e-16) {
+            double sn = sqrt(sqrSin);
+            double len = atan2(sn, c * dir);
+            s = sin(s * len) / sn;
+            t = sin(t * len) / sn;
+        }
+        double tDir = t * dir;
+        x0 = x0 * s + x1 * tDir;
+        y0 = y0 * s + y1 * tDir;
+        z0 = z0 * s + z1 * tDir;
+        w0 = w0 * s + w1 * tDir;
+        if (s == 1 - t) {
+            double f = 1 / sqrt(x0 * x0 + y0 * y0 + z0 * z0 + w0 * w0);
+            x0 *= f; y0 *= f; z0 *= f; w0 *= f;
+        }
+    }
+    slot_set(dst, dofs + 1, x0); slot_set(dst, dofs + 2, y0); slot_set(dst, dofs + 3, z0); slot_set(dst, dofs + 4, w0);
+}
+
+/* pp[k] for 1-based k: present (returns 1, *v) or nil (0) */
+static int pp_at(Table *pp, int n, int k, double *v) {
+    if (k < 1 || k > n) return 0;
+    *v = tab_num(pp, k);
+    return 1;
+}
+
+/* Interpolant:evaluate(t) of three.lua (r128's seek), for linear (1),
+ * discrete (2) and quaternion-linear (3) interpolants writing into rb */
+static void interp_eval(Table *it, int kind, double t) {
+    Table *pp = tab_field_tab(it, AK_PP), *sv = tab_field_tab(it, AK_SV), *rb = NULL;
+    (void)rb;
+    int stride = (int)tab_field_num(it, AK_VS);
+    int n = (int)luaH_getn(pp);
+    int i1 = (int)tab_field_num(it, AK_CI);
+    double t0 = 0, t1 = 0;
+    int has1 = pp_at(pp, n, i1 + 1, &t1), has0 = pp_at(pp, n, i1, &t0);
+    int right = 0, giveUpAt, copy_index = -1;
+    if (!has1 || !(t < t1)) {
+        giveUpAt = i1 + 2;
+        for (;;) {
+            if (!has1) {
+                if (has0 && t < t0) goto backward;
+                i1 = n;
+                copy_index = i1 - 1;       /* afterEnd_ */
+                goto done;
+            }
+            if (i1 == giveUpAt) break;
+            t0 = t1; has0 = 1;
+            i1 = i1 + 1;
+            has1 = pp_at(pp, n, i1 + 1, &t1);
+            if (has1 && t < t1) goto found;
+        }
+        right = n;
+        goto search;
+    }
+backward:
+    if (!has0 || !(t >= t0)) {
+        double t1g;
+        if (pp_at(pp, n, 2, &t1g) && t < t1g) {
+            i1 = 2;
+            t0 = t1g; has0 = 1;
+        }
+        giveUpAt = i1 - 2;
+        for (;;) {
+            if (!has0) {
+                i1 = 0;
+                copy_index = 0;            /* beforeStart_ */
+                goto done;
+            }
+            if (i1 == giveUpAt) break;
+            t1 = t0; has1 = 1;
+            i1 = i1 - 1;
+            has0 = pp_at(pp, n, i1, &t0);
+            if (has0 && t >= t0) goto found;
+        }
+        right = i1;
+        i1 = 0;
+        goto search;
+    }
+    goto interpolate;
+search:
+    while (i1 < right) {
+        int mid = (i1 + right) / 2;
+        double pm = 0;
+        pp_at(pp, n, mid + 1, &pm);
+        if (t < pm) right = mid; else i1 = mid + 1;
+    }
+    has1 = pp_at(pp, n, i1 + 1, &t1);
+    has0 = pp_at(pp, n, i1, &t0);
+    if (!has0) { i1 = 0; copy_index = 0; goto done; }
+    if (!has1) { i1 = n; copy_index = i1 - 1; goto done; }
+found:
+interpolate:
+    {
+        /* the mixer's buffer is the interpolant's resultBuffer */
+        Table *res = tv_tab(luaH_getshortstr(it, anim_key[AK_RB]));
+        if (!res) return;
+        if (kind == 2) { copy_index = i1 - 1; goto done_res; }
+        if (kind == 1) {
+            int off1 = i1 * stride, off0 = off1 - stride;
+            double w1 = (t - t0) / (t1 - t0), w0 = 1 - w1;
+            for (int k = 1; k <= stride; k++) slot_set(res, k, tab_num(sv, off0 + k) * w0 + tab_num(sv, off1 + k) * w1);
+        } else {
+            double alpha = (t - t0) / (t1 - t0);
+            int off = i1 * stride, stop = off + stride, dofs = 0;
+            (void)dofs;
+            while (off != stop) {
+                slerp_flat(res, 0, sv, off - stride, sv, off, alpha);
+                off += 4;
+            }
+        }
+        goto store;
+    done_res:
+        for (int k = 1; k <= stride; k++) slot_set(res, k, tab_num(sv, copy_index * stride + k));
+        goto store;
+    }
+done:
+    {
+        Table *res = tv_tab(luaH_getshortstr(it, anim_key[AK_RB]));
+        if (res)
+            for (int k = 1; k <= stride; k++) slot_set(res, k, tab_num(sv, copy_index * stride + k));
+    }
+store:
+    {
+        TValue *ci = (TValue *)luaH_getshortstr(it, anim_key[AK_CI]);
+        if (!isabstkey(ci)) setivalue(ci, i1);
+    }
+}
+
+/* t3.anim_step(interpolants, mixers, kinds, n, t, accuIndex, weight):
+ * for each track j, interpolants[j]:evaluate(t) then
+ * mixers[j]:accumulate(accuIndex, weight), as three.lua's
+ * AnimationAction:_update does. kinds[j] = interpolant kind * 4 + mix kind
+ * (interpolant 1 linear, 2 discrete, 3 quaternion; mix 1 lerp, 2 slerp,
+ * 3 select). The interpolant's resultBuffer must be the mixer's buffer,
+ * which AnimationAction arranges; three.lua checks this before calling. */
+static int l_anim_step(lua_State *L) {
+    Table *its = tab_at(L, 1), *mxs = tab_at(L, 2), *kinds = tab_at(L, 3);
+    int n = I(4);
+    double t = lua_tonumber(L, 5);
+    int accuIndex = I(6);
+    double weight = lua_tonumber(L, 7);
+    for (int j = 1; j <= n; j++) {
+        Table *it = tv_tab(tab_geti(its, j)), *mx = tv_tab(tab_geti(mxs, j));
+        if (!it || !mx) continue;
+        int k = (int)tab_num(kinds, j);
+        int ik = k >> 2, mk = k & 3;
+        /* the interpolant writes its own resultBuffer: point it at the mixer's */
+        interp_eval(it, ik, t);
+        Table *buf = tab_field_tab(mx, AK_BUF);
+        int stride = (int)tab_field_num(mx, AK_VS);
+        int offset = accuIndex * stride + stride;
+        TValue *cwv = (TValue *)luaH_getshortstr(mx, anim_key[AK_CW]);
+        double cw = tv_num(cwv);
+        if (cw == 0) {
+            for (int i = 1; i <= stride; i++) slot_set(buf, offset + i, tab_num(buf, i));
+            cw = weight;
+        } else {
+            cw += weight;
+            double mix = weight / cw;
+            if (mk == 1) {
+                double s = 1 - mix;
+                for (int i = 1; i <= stride; i++) slot_set(buf, offset + i, tab_num(buf, offset + i) * s + tab_num(buf, i) * mix);
+            } else if (mk == 2) {
+                slerp_flat(buf, offset, buf, offset, buf, 0, mix);
+            } else if (mix >= 0.5) {
+                for (int i = 1; i <= stride; i++) {
+                    /* select: copy the value whatever its type (strings, booleans) */
+                    const TValue *src = tab_geti(buf, i);
+                    TValue *dst = tab_slot(buf, offset + i);
+                    if (!isabstkey(dst)) setobj(L, dst, src);
+                }
+            }
+        }
+        if (!isabstkey(cwv)) setfltvalue(cwv, cw);
+    }
+    return 0;
+}
+
+/* t3.anim_apply(mixers, n, accuIndex, changed, other) -> nchanged, nother:
+ * PropertyMixer:apply for each of the n mixers whose mix kind (_t3mk: 1
+ * lerp, 2 slerp, 3 select) is known and that has no additive weight: the
+ * original value mixed in for a weight short of 1, then the two accus
+ * compared. changed gets the indices of the mixers whose value moved (Lua
+ * calls their binding's setValue: the write must go through the target's
+ * own setters); other gets the indices left to Lua's apply. */
+static int l_anim_apply(lua_State *L) {
+    Table *mxs = tab_at(L, 1);
+    int n = I(2), accuIndex = I(3);
+    int nc = 0, no = 0;
+    for (int j = 1; j <= n; j++) {
+        Table *mx = tv_tab(tab_geti(mxs, j));
+        if (!mx) continue;
+        const TValue *mkv = luaH_getshortstr(mx, anim_key[AK_MK]);
+        int mk = ttisinteger(mkv) ? (int)ivalue(mkv) : 0;
+        TValue *wav = (TValue *)luaH_getshortstr(mx, anim_key[AK_CWA]);
+        if (!mk || tv_num(wav) > 0) {
+            lua_pushinteger(L, j);
+            lua_rawseti(L, 5, ++no);
+            continue;
+        }
+        Table *buf = tab_field_tab(mx, AK_BUF);
+        int stride = (int)tab_field_num(mx, AK_VS);
+        int offset = accuIndex * stride + stride;
+        TValue *cwv = (TValue *)luaH_getshortstr(mx, anim_key[AK_CW]);
+        double weight = tv_num(cwv);
+        if (!isabstkey(cwv)) setfltvalue(cwv, 0);
+        if (!isabstkey(wav)) setfltvalue(wav, 0);
+        if (weight < 1) {
+            int orig = stride * 3;
+            double t = 1 - weight;
+            if (mk == 1) {
+                double s = 1 - t;
+                for (int i = 1; i <= stride; i++) slot_set(buf, offset + i, tab_num(buf, offset + i) * s + tab_num(buf, orig + i) * t);
+            } else if (mk == 2) {
+                slerp_flat(buf, offset, buf, offset, buf, orig, t);
+            } else if (t >= 0.5) {
+                for (int i = 1; i <= stride; i++) {
+                    TValue *dst = tab_slot(buf, offset + i);
+                    if (!isabstkey(dst)) setobj(L, dst, tab_geti(buf, orig + i));
+                }
+            }
+        }
+        for (int i = stride + 1; i <= stride + stride; i++)
+            if (!luaV_rawequalobj(tab_geti(buf, i), tab_geti(buf, i + stride))) {
+                lua_pushinteger(L, j);
+                lua_rawseti(L, 4, ++nc);
+                break;
+            }
+    }
+    lua_pushinteger(L, nc);
+    lua_pushinteger(L, no);
+    return 2;
 }
 
 /* t3.quat_from_euler(x, y, z, order) -> qx, qy, qz, qw (double precision) */
@@ -1205,7 +1472,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "anim_apply", l_anim_apply }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
     { "matrix", l_matrix },
     { "world", l_world }, { "local_matrix", l_local }, { "camera_matrices", l_camera_matrices },
     { "update_world", l_update_world }, { "update_world_matrix", l_update_world_matrix },
@@ -1243,6 +1510,14 @@ void wcl_open_three_c(lua_State *L) {
     lua_pushstring(L, "_t3");
     key_t3 = (TString *)lua_topointer(L, -1);
     luaL_ref(L, LUA_REGISTRYINDEX);
+    static const char *const anames[AK_COUNT] = { "parameterPositions", "sampleValues", "valueSize", "_cachedIndex",
+                                                  "buffer", "cumulativeWeight", "resultBuffer", "_t3mk",
+                                                  "cumulativeWeightAdditive" };
+    for (int i = 0; i < AK_COUNT; i++) {
+        lua_pushstring(L, anames[i]);
+        anim_key[i] = (TString *)lua_topointer(L, -1);
+        luaL_ref(L, LUA_REGISTRYINDEX);
+    }
     luaL_newmetatable(L, HANDLE_MT);
     lua_pushcfunction(L, handle_gc);
     lua_setfield(L, -2, "__gc");
