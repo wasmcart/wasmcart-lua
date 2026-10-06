@@ -39,7 +39,11 @@
 #include "ltm.h"
 #include "lvm.h"
 #include "three.h"
+#ifdef __wasm_simd128__
 #include "simd_trig.h"
+#else
+#include "simd_portable.h"   /* the native bench host: lane by lane */
+#endif
 #include "wasmcart.h"
 #include <string.h>
 #include <stdlib.h>
