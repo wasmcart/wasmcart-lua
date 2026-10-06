@@ -1135,6 +1135,118 @@ fail:
     NO_KERNEL;
 }
 
+/* ── geometry generators: three.lua's, expression for expression ────────
+ * Each returns indices, positions, normals, uvs as new tables (or false:
+ * Lua builds it). Every vertex value three.lua computes is a float and every
+ * index an integer, so that is what these store. */
+
+static Table *new_array(lua_State *L, lua_Integer n) {
+    lua_createtable(L, (int)n, 0);
+    return tab_at(L, -1);
+}
+#define L_PI 3.141592653589793238462643383279502884
+
+/* t3.gen_sphere(radius, widthSegments, heightSegments, phiStart, phiLength,
+ * thetaStart, thetaLength): the arguments already defaulted and floored */
+static int l_gen_sphere(lua_State *L) {
+    for (int i = 1; i <= 7; i++) if (!lua_isnumber(L, i)) NO_KERNEL;
+    if (!lua_isinteger(L, 2) || !lua_isinteger(L, 3)) NO_KERNEL;
+    double radius = lua_tonumber(L, 1);
+    lua_Integer ws = lua_tointeger(L, 2), hs = lua_tointeger(L, 3);
+    double phiStart = lua_tonumber(L, 4), phiLength = lua_tonumber(L, 5);
+    double thetaStart = lua_tonumber(L, 6), thetaLength = lua_tonumber(L, 7);
+    if (ws < 1 || hs < 1 || (ws + 1) * (hs + 1) > (1 << 22)) NO_KERNEL;
+    double thetaSum = thetaStart + thetaLength;
+    if (thetaSum != thetaSum) NO_KERNEL;   /* NaN */
+    double thetaEnd = L_PI < thetaSum ? L_PI : thetaSum;   /* math.min */
+    lua_Integer nv = (ws + 1) * (hs + 1);
+    int skipTop = !(thetaStart > 0), skipBottom = !(thetaEnd < L_PI);
+    lua_Integer ntri = ws * hs * 2 - (skipTop ? ws : 0) - (skipBottom ? ws : 0);
+    Table *ti = new_array(L, ntri * 3);
+    Table *tp = new_array(L, nv * 3);
+    Table *tn = new_array(L, nv * 3);
+    Table *tu = new_array(L, nv * 2);
+    TValue *P = tp->array, *N = tn->array, *U = tu->array;
+    for (lua_Integer iy = 0; iy <= hs; iy++) {
+        double v = (double)iy / (double)hs;
+        double uOffset = 0;   /* (u + uOffset is a float either way) */
+        if (iy == 0 && thetaStart == 0) uOffset = 0.5 / (double)ws;
+        else if (iy == hs && thetaEnd == L_PI) uOffset = -0.5 / (double)ws;
+        double theta = thetaStart + v * thetaLength;
+        double sinTheta = sin(theta), cosTheta = cos(theta);
+        double rSinTheta = radius * sinTheta, rCosTheta = radius * cosTheta;
+        double oneMinusV = 1 - v;
+        for (lua_Integer ix = 0; ix <= ws; ix++) {
+            double u = (double)ix / (double)ws;
+            double phi = phiStart + u * phiLength;
+            double px = -rSinTheta * cos(phi);
+            double py = rCosTheta;
+            double pz = rSinTheta * sin(phi);
+            setfltvalue(P, px); setfltvalue(P + 1, py); setfltvalue(P + 2, pz); P += 3;
+            double len = sqrt(px * px + py * py + pz * pz);
+            if (len == 0) len = 1;
+            setfltvalue(N, px / len); setfltvalue(N + 1, py / len); setfltvalue(N + 2, pz / len); N += 3;
+            setfltvalue(U, u + uOffset); setfltvalue(U + 1, oneMinusV); U += 2;
+        }
+    }
+    TValue *I = ti->array;
+    lua_Integer row = ws + 1;
+    for (lua_Integer iy = 1; iy <= hs; iy++)
+        for (lua_Integer ix = 1; ix <= ws; ix++) {
+            /* grid[iy][ix] (1-based rows / columns) is (iy - 1) * row + ix - 1 */
+            lua_Integer a = (iy - 1) * row + ix, b = (iy - 1) * row + ix - 1;
+            lua_Integer c = iy * row + ix - 1, d = iy * row + ix;
+            if (iy != 1 || thetaStart > 0) { setivalue(I, a); setivalue(I + 1, b); setivalue(I + 2, d); I += 3; }
+            if (iy != hs || thetaEnd < L_PI) { setivalue(I, b); setivalue(I + 1, c); setivalue(I + 2, d); I += 3; }
+        }
+    if (I != ti->array + ntri * 3) return luaL_error(L, "t3.gen_sphere: index count");
+    return 4;
+}
+
+/* t3.gen_torus(radius, tube, radialSegments, tubularSegments, arc) */
+static int l_gen_torus(lua_State *L) {
+    for (int i = 1; i <= 5; i++) if (!lua_isnumber(L, i)) NO_KERNEL;
+    if (!lua_isinteger(L, 3) || !lua_isinteger(L, 4)) NO_KERNEL;
+    double radius = lua_tonumber(L, 1), tube = lua_tonumber(L, 2), arc = lua_tonumber(L, 5);
+    lua_Integer rs = lua_tointeger(L, 3), ts = lua_tointeger(L, 4);
+    if (rs < 1 || ts < 1 || (rs + 1) * (ts + 1) > (1 << 22)) NO_KERNEL;
+    lua_Integer nv = (rs + 1) * (ts + 1);
+    Table *ti = new_array(L, rs * ts * 6);
+    Table *tp = new_array(L, nv * 3);
+    Table *tn = new_array(L, nv * 3);
+    Table *tu = new_array(L, nv * 2);
+    TValue *P = tp->array, *N = tn->array, *U = tu->array;
+    for (lua_Integer j = 0; j <= rs; j++) {
+        double v = (double)j / (double)rs * L_PI * 2;
+        double tubeCosV = tube * cos(v);
+        double pz = tube * sin(v);
+        double ringRadius = radius + tubeCosV;
+        double vv = (double)j / (double)rs;
+        for (lua_Integer i = 0; i <= ts; i++) {
+            double u = (double)i / (double)ts * arc;
+            double cosU = cos(u), sinU = sin(u);
+            double cx = radius * cosU, cy = radius * sinU;
+            double px = ringRadius * cosU, py = ringRadius * sinU;
+            setfltvalue(P, px); setfltvalue(P + 1, py); setfltvalue(P + 2, pz); P += 3;
+            double nx = px - cx, ny = py - cy, nz = pz;
+            double len = sqrt(nx * nx + ny * ny + nz * nz);
+            if (len == 0) len = 1;
+            setfltvalue(N, nx / len); setfltvalue(N + 1, ny / len); setfltvalue(N + 2, nz / len); N += 3;
+            setfltvalue(U, (double)i / (double)ts); setfltvalue(U + 1, vv); U += 2;
+        }
+    }
+    TValue *I = ti->array;
+    for (lua_Integer j = 1; j <= rs; j++)
+        for (lua_Integer i = 1; i <= ts; i++) {
+            lua_Integer a = (ts + 1) * j + i - 1, b = (ts + 1) * (j - 1) + i - 1;
+            lua_Integer c = (ts + 1) * (j - 1) + i, d = (ts + 1) * j + i;
+            setivalue(I, a); setivalue(I + 1, b); setivalue(I + 2, d);
+            setivalue(I + 3, b); setivalue(I + 4, c); setivalue(I + 5, d);
+            I += 6;
+        }
+    return 4;
+}
+
 /* t3.quat_from_euler(x, y, z, order) -> qx, qy, qz, qw (double precision) */
 static int l_quat_from_euler(lua_State *L) {
     double x = lua_tonumber(L, 1), y = lua_tonumber(L, 2), z = lua_tonumber(L, 3);
@@ -2000,7 +2112,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "deindex", l_deindex }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "deindex", l_deindex }, { "gen_sphere", l_gen_sphere }, { "gen_torus", l_gen_torus }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
     { "matrix", l_matrix },
     { "world", l_world }, { "local_matrix", l_local }, { "camera_matrices", l_camera_matrices },
     { "update_world", l_update_world }, { "update_world_matrix", l_update_world_matrix },
