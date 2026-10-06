@@ -344,7 +344,8 @@ static int l_flush(lua_State *L) {
 
 /* ── animation: the per-track step of AnimationAction:_update ─────────── */
 
-enum { AK_PP, AK_SV, AK_VS, AK_CI, AK_BUF, AK_CW, AK_RB, AK_MK, AK_CWA, AK_COUNT };
+enum { AK_PP, AK_SV, AK_VS, AK_CI, AK_BUF, AK_CW, AK_RB, AK_MK, AK_CWA, AK_BINDING, AK_SETV, AK_RP, AK_ONCH,
+       AK_X, AK_Y, AK_Z, AK_W, AK_TO, AK_MWNU, AK_COUNT };
 static TString *anim_key[AK_COUNT];
 
 static TValue *tab_slot(Table *t, int i) { return (TValue *)tab_geti(t, i); }
@@ -558,10 +559,62 @@ static int l_anim_step(lua_State *L) {
  * compared. changed gets the indices of the mixers whose value moved (Lua
  * calls their binding's setValue: the write must go through the target's
  * own setters); other gets the indices left to Lua's apply. */
+/* t3.anim_register(setFromArray, Vector3, Quaternion, setFromArrayMWNU):
+ * the plain fromArray setter, the two classes whose fromArray anim_apply may
+ * do itself (field writes, then the quaternion's _onChange left to Lua), and
+ * the setter that also sets targetObject.matrixWorldNeedsUpdate (an
+ * Object3D's position / quaternion / scale) */
+static const void *anim_fromarray, *anim_v3_mt, *anim_q_mt, *anim_fromarray_mw;
+static int l_anim_register(lua_State *L) {
+    for (int i = 1; i <= 4; i++) { lua_pushvalue(L, i); luaL_ref(L, LUA_REGISTRYINDEX); }
+    anim_fromarray = lua_topointer(L, 1);
+    anim_v3_mt = lua_topointer(L, 2);
+    anim_q_mt = lua_topointer(L, 3);
+    anim_fromarray_mw = lua_isfunction(L, 4) ? lua_topointer(L, 4) : NULL;
+    return 0;
+}
+
+/* The binding's write done here when it is the plain fromArray setter on a
+ * plain Vector3 / Quaternion (fields present, its own metatable): returns
+ * the target, or NULL for Lua's setValue */
+static Table *anim_direct(lua_State *L, Table *mx, int stride, Table *buf, int offset) {
+    if (!anim_fromarray) return NULL;
+    Table *b = tab_field_tab(mx, AK_BINDING);
+    if (!b) return NULL;
+    const TValue *sv = luaH_getshortstr(b, anim_key[AK_SETV]);
+    if (!ttisLclosure(sv)) return NULL;
+    const void *setter = clLvalue(sv);
+    TValue *mwnu = NULL;
+    if (setter == anim_fromarray_mw && anim_fromarray_mw) {
+        /* the flag must be a plain field of the target (a mirrored object
+         * watches its writes: Lua's setter then) */
+        Table *to = tab_field_tab(b, AK_TO);
+        if (!to) return NULL;
+        mwnu = (TValue *)luaH_getshortstr(to, anim_key[AK_MWNU]);
+        if (isabstkey(mwnu)) return NULL;
+    } else if (setter != anim_fromarray) return NULL;
+    Table *dst = tab_field_tab(b, AK_RP);
+    if (!dst || !dst->metatable) return NULL;
+    const void *mt = dst->metatable;
+    if (!((mt == anim_v3_mt && stride == 3) || (mt == anim_q_mt && stride == 4))) return NULL;
+    TValue *slot[4];
+    for (int i = 0; i < stride; i++) {
+        slot[i] = (TValue *)luaH_getshortstr(dst, anim_key[AK_X + i]);
+        if (isabstkey(slot[i])) return NULL;
+    }
+    for (int i = 0; i < stride; i++) {
+        const TValue *v = tab_geti(buf, offset + i + 1);
+        setobj(L, slot[i], v);
+    }
+    if (mwnu) setbtvalue(mwnu);
+    return dst;
+}
+
 static int l_anim_apply(lua_State *L) {
     Table *mxs = tab_at(L, 1);
     int n = I(2), accuIndex = I(3);
-    int nc = 0, no = 0;
+    int nc = 0, no = 0, ncb = 0;
+    int have_cb = lua_istable(L, 6);
     for (int j = 1; j <= n; j++) {
         Table *mx = tv_tab(tab_geti(mxs, j));
         if (!mx) continue;
@@ -597,14 +650,22 @@ static int l_anim_apply(lua_State *L) {
         }
         for (int i = stride + 1; i <= stride + stride; i++)
             if (!luaV_rawequalobj(tab_geti(buf, i), tab_geti(buf, i + stride))) {
-                lua_pushinteger(L, j);
-                lua_rawseti(L, 4, ++nc);
+                Table *dst = have_cb ? anim_direct(L, mx, stride, buf, offset) : NULL;
+                if (!dst) {
+                    lua_pushinteger(L, j);
+                    lua_rawseti(L, 4, ++nc);
+                } else if (stride == 4 && !ttisnil(luaH_getshortstr(dst, anim_key[AK_ONCH]))) {
+                    sethvalue2s(L, L->top.p, dst);
+                    L->top.p++;
+                    lua_rawseti(L, 6, ++ncb);
+                }
                 break;
             }
     }
     lua_pushinteger(L, nc);
     lua_pushinteger(L, no);
-    return 2;
+    lua_pushinteger(L, ncb);
+    return 3;
 }
 
 /* ── Matrix4 kernels for three.lua ─────────────────────────────────────
@@ -1818,7 +1879,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
     { "matrix", l_matrix },
     { "world", l_world }, { "local_matrix", l_local }, { "camera_matrices", l_camera_matrices },
     { "update_world", l_update_world }, { "update_world_matrix", l_update_world_matrix },
@@ -1858,7 +1919,9 @@ void wcl_open_three_c(lua_State *L) {
     luaL_ref(L, LUA_REGISTRYINDEX);
     static const char *const anames[AK_COUNT] = { "parameterPositions", "sampleValues", "valueSize", "_cachedIndex",
                                                   "buffer", "cumulativeWeight", "resultBuffer", "_t3mk",
-                                                  "cumulativeWeightAdditive" };
+                                                  "cumulativeWeightAdditive", "binding", "setValue",
+                                                  "resolvedProperty", "_onChange", "x", "y", "z", "w",
+                                                  "targetObject", "matrixWorldNeedsUpdate" };
     for (int i = 0; i < AK_COUNT; i++) {
         lua_pushstring(L, anames[i]);
         anim_key[i] = (TString *)lua_topointer(L, -1);
