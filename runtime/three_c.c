@@ -4513,6 +4513,315 @@ static int l_uuid(lua_State *L) {
     lua_pushlstring(L, out, (size_t)n);
     return 1;
 }
+/* t3.anim_update(mixer, deltaTime) -> mixer | nil: AnimationMixer:update
+ * (three.lua's) in C: the mixer's time and accumulator index, each active
+ * action's _update (its scheduled start, time scale and weight with their
+ * control interpolants, its clip time through the loop modes with their
+ * endings and events, the tracks stepped by t3.anim_step), then the apply
+ * (t3.anim_apply, the writes through the bindings). An action this cannot
+ * step (an additive blend, tracks without kinds) runs its Lua _update; a
+ * mixer not as expected returns nil before touching anything. */
+enum { AU_TIMESCALE, AU_ACTIONS, AU_NACTIVE, AU_TIME, AU_ACCU, AU_BINDINGS, AU_NBINDINGS, AU_CHANGED, AU_OTHER, AU_CBS,
+       AU_MARKS, AU_ENABLED, AU_STARTTIME, AU_PAUSED, AU_WEIGHT, AU_WINTERP, AU_TSINTERP, AU_EWEIGHT, AU_ETIMESCALE,
+       AU_CLIP, AU_DURATION, AU_LOOP, AU_LOOPCOUNT, AU_REPETITIONS, AU_CLAMP, AU_MIXER, AU_BLENDMODE, AU_INTERPOLANTS,
+       AU_PBINDINGS, AU_KINDS, AU_SETTINGS, AU_ENDSTART, AU_ENDEND, AU_ZSSTART, AU_ZSEND, AU_STOPFADING, AU_STOPWARPING,
+       AU_DISPATCH, AU_UPDATE, AU_APPLY, AU_TYPE, AU_ACTION, AU_DIRECTION, AU_LOOPDELTA, AU_MARKRECS, AU_COUNT };
+static TString *aukey[AU_COUNT];
+static int l_anim_step(lua_State *L);
+static void interp_eval(Table *it, int kind, double t);
+enum { AU_LOOP_ONCE = 2200, AU_LOOP_REPEAT = 2201, AU_LOOP_PINGPONG = 2202, AU_ZERO_CURVATURE = 2400, AU_ZERO_SLOPE = 2401,
+       AU_WRAP_AROUND = 2402, AU_ADDITIVE = 2501 };
+static const TValue *au(lua_State *L, Table *t, int k) { return obj_get(L, t, aukey[k], NULL); }
+static int au_truthy(lua_State *L, Table *t, int k) { const TValue *v = au(L, t, k); return v ? (!isempty(v) && tv_true(v)) : -1; }
+static void au_set(lua_State *L, int idx, int k) { lua_setfield(L, idx, getstr(aukey[k])); }   /* value on top */
+static void au_setnum(lua_State *L, int idx, int k, num_t v) { push_num(L, v); au_set(L, idx, k); }
+static void au_setbool(lua_State *L, int idx, int k, int v) { lua_pushboolean(L, v); au_set(L, idx, k); }
+/* math.floor as Lua's: an integer when it fits */
+static num_t nfloor(num_t x) {
+    if (x.i) return x;
+    double d = floor(x.d);
+    if (d >= -9223372036854775808.0 && d < 9223372036854775808.0) return nint(d);
+    return nflt(d);
+}
+static num_t nabs(num_t x) { return nchk(fabs(x.d), x.i); }
+static int ncmp_lt(num_t a, num_t b) { return a.d < b.d; }
+/* a method called on the table at idx with the arguments already pushed (nargs of them) */
+static void au_call_method(lua_State *L, int idx, int k, int nargs) {
+    int fn = lua_gettop(L) - nargs + 1;
+    lua_getfield(L, idx, getstr(aukey[k]));
+    lua_insert(L, fn);
+    lua_pushvalue(L, idx);
+    lua_insert(L, fn + 1);
+    lua_call(L, nargs + 1, 0);
+}
+/* the action's weight for this time (AnimationAction:_updateWeight) */
+static num_t au_update_weight(lua_State *L, int ai, num_t time) {
+    Table *a = tab_at(L, ai);
+    num_t weight = nint(0);
+    if (au_truthy(L, a, AU_ENABLED) > 0) {
+        tv_nt(au(L, a, AU_WEIGHT), &weight);
+        Table *it = tv_tab(au(L, a, AU_WINTERP));
+        if (it) {
+            interp_eval(it, 1, time.d);
+            Table *rb = tab_field_tab(it, AK_RB), *pp = tab_field_tab(it, AK_PP);
+            num_t v; if (!rb || !tv_nt(tab_geti(rb, 1), &v)) v = nflt(0);
+            weight = nmul(weight, v);
+            if (pp && time.d > tab_num(pp, 2)) {
+                au_call_method(L, ai, AU_STOPFADING, 0);
+                a = tab_at(L, ai);
+                if (v.d == 0) au_setbool(L, ai, AU_ENABLED, 0);
+            }
+        }
+    }
+    au_setnum(L, ai, AU_EWEIGHT, weight);
+    return weight;
+}
+static num_t au_update_timescale(lua_State *L, int ai, num_t time) {
+    Table *a = tab_at(L, ai);
+    num_t ts = nint(0);
+    if (au_truthy(L, a, AU_PAUSED) <= 0) {
+        tv_nt(au(L, a, AU_TIMESCALE), &ts);
+        Table *it = tv_tab(au(L, a, AU_TSINTERP));
+        if (it) {
+            interp_eval(it, 1, time.d);
+            Table *rb = tab_field_tab(it, AK_RB), *pp = tab_field_tab(it, AK_PP);
+            num_t v; if (!rb || !tv_nt(tab_geti(rb, 1), &v)) v = nflt(0);
+            ts = nmul(ts, v);
+            if (pp && time.d > tab_num(pp, 2)) {
+                au_call_method(L, ai, AU_STOPWARPING, 0);
+                if (ts.d == 0) au_setbool(L, ai, AU_PAUSED, 1);
+                else au_setnum(L, ai, AU_TIMESCALE, ts);
+            }
+        }
+    }
+    au_setnum(L, ai, AU_ETIMESCALE, ts);
+    return ts;
+}
+static void au_set_endings(lua_State *L, int ai, int at_start, int at_end, int ping_pong) {
+    Table *a = tab_at(L, ai);
+    const TValue *sv = au(L, a, AU_SETTINGS);
+    if (!sv || !ttistable(sv)) return;
+    setobj2s(L, L->top.p, sv); L->top.p++;
+    int si = lua_gettop(L);
+    if (ping_pong) {
+        lua_pushinteger(L, AU_ZERO_SLOPE); au_set(L, si, AU_ENDSTART);
+        lua_pushinteger(L, AU_ZERO_SLOPE); au_set(L, si, AU_ENDEND);
+    } else {
+        lua_pushinteger(L, at_start ? (au_truthy(L, a, AU_ZSSTART) > 0 ? AU_ZERO_SLOPE : AU_ZERO_CURVATURE) : AU_WRAP_AROUND);
+        au_set(L, si, AU_ENDSTART);
+        lua_pushinteger(L, at_end ? (au_truthy(L, a, AU_ZSEND) > 0 ? AU_ZERO_SLOPE : AU_ZERO_CURVATURE) : AU_WRAP_AROUND);
+        au_set(L, si, AU_ENDEND);
+    }
+    lua_pop(L, 1);
+}
+/* mixer:dispatchEvent({ type = , action = self, <extra> = v }) */
+static void au_dispatch(lua_State *L, int ai, const char *type, int extra_key, num_t extra) {
+    Table *a = tab_at(L, ai);
+    const TValue *mv = au(L, a, AU_MIXER);
+    if (!mv || !ttistable(mv)) return;
+    setobj2s(L, L->top.p, mv); L->top.p++;
+    int mi = lua_gettop(L);
+    lua_createtable(L, 0, 4);
+    lua_pushstring(L, type); au_set(L, -2, AU_TYPE);
+    lua_pushvalue(L, ai); au_set(L, -2, AU_ACTION);
+    push_num(L, extra); au_set(L, -2, extra_key);
+    au_call_method(L, mi, AU_DISPATCH, 1);
+    lua_pop(L, 1);
+}
+/* the clip time (AnimationAction:_updateTime) */
+static num_t au_update_time(lua_State *L, int ai, num_t dt) {
+    Table *a = tab_at(L, ai);
+    Table *clip = tv_tab(au(L, a, AU_CLIP));
+    num_t duration, time0, loopCount, repetitions;
+    tv_nt(au(L, clip, AU_DURATION), &duration);
+    const TValue *lv = au(L, a, AU_LOOP);
+    lua_Integer loop = ttisinteger(lv) ? ivalue(lv) : (lua_Integer)tv_num(lv);
+    tv_nt(au(L, a, AU_TIME), &time0);
+    num_t time = nadd(time0, dt);
+    tv_nt(au(L, a, AU_LOOPCOUNT), &loopCount);
+    tv_nt(au(L, a, AU_REPETITIONS), &repetitions);
+    int pingPong = loop == AU_LOOP_PINGPONG;
+    if (dt.d == 0) {
+        if (loopCount.d == -1) return time;
+        return (pingPong && ((long long)loopCount.d & 1) == 1) ? nsub(duration, time) : time;
+    }
+    if (loop == AU_LOOP_ONCE) {
+        if (loopCount.d == -1) {
+            au_setnum(L, ai, AU_LOOPCOUNT, nint(0));
+            au_set_endings(L, ai, 1, 1, 0);
+        }
+        int stopped = 1;
+        if (time.d >= duration.d) time = duration;
+        else if (time.d < 0) time = nint(0);
+        else { au_setnum(L, ai, AU_TIME, time); stopped = 0; }
+        if (stopped) {
+            a = tab_at(L, ai);
+            if (au_truthy(L, a, AU_CLAMP) > 0) au_setbool(L, ai, AU_PAUSED, 1); else au_setbool(L, ai, AU_ENABLED, 0);
+            au_setnum(L, ai, AU_TIME, time);
+            au_dispatch(L, ai, "finished", AU_DIRECTION, nint(dt.d < 0 ? -1 : 1));
+        }
+    } else {
+        if (loopCount.d == -1) {
+            if (dt.d >= 0) { loopCount = nint(0); au_set_endings(L, ai, 1, repetitions.d == 0, pingPong); }
+            else au_set_endings(L, ai, repetitions.d == 0, 1, pingPong);
+        }
+        if (time.d >= duration.d || time.d < 0) {
+            num_t loopDelta = nfloor(nflt(time.d / duration.d));
+            time = nsub(time, nmul(duration, loopDelta));
+            loopCount = nadd(loopCount, nabs(loopDelta));
+            num_t pending = nsub(repetitions, loopCount);
+            if (pending.d <= 0) {
+                a = tab_at(L, ai);
+                if (au_truthy(L, a, AU_CLAMP) > 0) au_setbool(L, ai, AU_PAUSED, 1); else au_setbool(L, ai, AU_ENABLED, 0);
+                time = dt.d > 0 ? duration : nint(0);
+                au_setnum(L, ai, AU_TIME, time);
+                au_dispatch(L, ai, "finished", AU_DIRECTION, nint(dt.d > 0 ? 1 : -1));
+            } else {
+                if (pending.d == 1) { int atStart = dt.d < 0; au_set_endings(L, ai, atStart, !atStart, pingPong); }
+                else au_set_endings(L, ai, 0, 0, pingPong);
+                au_setnum(L, ai, AU_LOOPCOUNT, loopCount);
+                au_setnum(L, ai, AU_TIME, time);
+                au_dispatch(L, ai, "loop", AU_LOOPDELTA, loopDelta);
+            }
+        } else au_setnum(L, ai, AU_TIME, time);
+        if (pingPong && ((long long)nfloor(loopCount).d & 1) == 1) return nsub(duration, time);
+    }
+    return time;
+}
+/* an action's _update; 0 when it must run in Lua (nothing touched then) */
+static int au_action_update(lua_State *L, int ai, num_t time, num_t dt, int dir, int accu) {
+    Table *a = tab_at(L, ai);
+    const TValue *bm = au(L, a, AU_BLENDMODE);
+    if (!bm || (ttisnumber(bm) && tv_num(bm) == AU_ADDITIVE)) return 0;
+    Table *kinds = tv_tab(au(L, a, AU_KINDS));
+    Table *its = tv_tab(au(L, a, AU_INTERPOLANTS)), *mxs = tv_tab(au(L, a, AU_PBINDINGS));
+    Table *clip = tv_tab(au(L, a, AU_CLIP));
+    const TValue *sv = au(L, a, AU_SETTINGS), *mv = au(L, a, AU_MIXER), *lv = au(L, a, AU_LOOP);
+    num_t tmp;
+    if (!kinds || !its || !mxs || !clip || !sv || !ttistable(sv) || !mv || !ttistable(mv) || !lv || !ttisnumber(lv)) return 0;
+    if (!tv_nt(au(L, clip, AU_DURATION), &tmp) || !tv_nt(au(L, a, AU_TIME), &tmp) || !tv_nt(au(L, a, AU_LOOPCOUNT), &tmp)
+        || !tv_nt(au(L, a, AU_REPETITIONS), &tmp) || !tv_nt(au(L, a, AU_WEIGHT), &tmp) || !tv_nt(au(L, a, AU_TIMESCALE), &tmp)) return 0;
+    const TValue *st = au(L, a, AU_STARTTIME);
+    if (!st || (!isempty(st) && !ttisnil(st) && !ttisnumber(st))) return 0;
+    int en = au_truthy(L, a, AU_ENABLED), pa = au_truthy(L, a, AU_PAUSED);
+    if (en < 0 || pa < 0) return 0;
+    if (!en) { au_update_weight(L, ai, time); return 1; }
+    if (ttisnumber(st)) {
+        num_t startTime; tv_nt(st, &startTime);
+        num_t timeRunning = nmul(nsub(time, startTime), nint(dir));
+        if (timeRunning.d < 0 || dir == 0) return 1;
+        lua_pushnil(L); au_set(L, ai, AU_STARTTIME);
+        dt = nmul(nint(dir), timeRunning);
+    }
+    dt = nmul(dt, au_update_timescale(L, ai, time));
+    num_t clipTime = au_update_time(L, ai, dt);
+    num_t weight = au_update_weight(L, ai, time);
+    if (weight.d > 0) {
+        a = tab_at(L, ai);
+        its = tv_tab(au(L, a, AU_INTERPOLANTS)); mxs = tv_tab(au(L, a, AU_PBINDINGS)); kinds = tv_tab(au(L, a, AU_KINDS));
+        lua_pushcfunction(L, l_anim_step);
+        sethvalue2s(L, L->top.p, its); L->top.p++;
+        sethvalue2s(L, L->top.p, mxs); L->top.p++;
+        sethvalue2s(L, L->top.p, kinds); L->top.p++;
+        lua_pushinteger(L, (lua_Integer)luaH_getn(its));
+        push_num(L, clipTime);
+        lua_pushinteger(L, accu);
+        push_num(L, weight);
+        lua_call(L, 7, 0);
+    }
+    return 1;
+}
+static int l_anim_update(lua_State *L) {
+    lua_settop(L, 2);
+    if (!lua_istable(L, 1) || !lua_isnumber(L, 2)) { lua_pushnil(L); return 1; }
+    Table *m = tab_at(L, 1);
+    num_t dt, ts, time0, accu0;
+    if (!tv_nt(s2v(L->ci->func.p + 2), &dt) || !tv_nt(au(L, m, AU_TIMESCALE), &ts) || !tv_nt(au(L, m, AU_TIME), &time0)
+        || !tv_nt(au(L, m, AU_ACCU), &accu0) || !accu0.i) { lua_pushnil(L); return 1; }
+    Table *actions = tv_tab(au(L, m, AU_ACTIONS)), *bindings = tv_tab(au(L, m, AU_BINDINGS));
+    const TValue *nav = au(L, m, AU_NACTIVE), *nbv = au(L, m, AU_NBINDINGS);
+    if (!actions || !bindings || !nav || !ttisinteger(nav) || !nbv || !ttisinteger(nbv)) { lua_pushnil(L); return 1; }
+    lua_Integer nActions = ivalue(nav), nb = ivalue(nbv);
+    num_bail = 0;
+    dt = nmul(dt, ts);
+    num_t time = nadd(time0, dt);
+    if (num_bail) { lua_pushnil(L); return 1; }
+    au_setnum(L, 1, AU_TIME, time);
+    int dir = dt.d > 0 ? 1 : (dt.d < 0 ? -1 : 0);
+    lua_Integer accu = (lua_Integer)accu0.d ^ 1;
+    lua_pushinteger(L, accu); au_set(L, 1, AU_ACCU);
+    for (lua_Integer i = 1; i <= nActions; i++) {
+        sethvalue2s(L, L->top.p, actions); L->top.p++;
+        lua_rawgeti(L, -1, i);
+        lua_remove(L, -2);
+        int ai = lua_gettop(L);
+        if (!lua_istable(L, ai) || !au_action_update(L, ai, time, dt, dir, (int)accu)) {
+            /* action:_update(time, deltaTime, timeDirection, accuIndex) in Lua */
+            push_num(L, time); push_num(L, dt); lua_pushinteger(L, dir); lua_pushinteger(L, accu);
+            au_call_method(L, ai, AU_UPDATE, 4);
+        }
+        lua_settop(L, 2);
+        actions = tv_tab(au(L, tab_at(L, 1), AU_ACTIONS));
+        if (!actions) break;
+    }
+    /* the apply, as AnimationMixer:update does it with t3.anim_apply */
+    m = tab_at(L, 1);
+    const TValue *chv = au(L, m, AU_CHANGED);
+    if (!chv || !ttistable(chv)) {
+        static const int ks[4] = { AU_CHANGED, AU_OTHER, AU_CBS, AU_MARKS };
+        for (int k = 0; k < 4; k++) { lua_newtable(L); au_set(L, 1, ks[k]); }
+        m = tab_at(L, 1);
+    }
+    lua_getglobal(L, "t3");                                   /* 3 */
+    lua_getfield(L, 3, getstr(aukey[AU_MARKRECS]));            /* 4: markRecs | nil */
+    int have_marks = lua_isfunction(L, 4);
+    lua_getfield(L, 3, "anim_apply");                          /* 5 */
+    setobj2s(L, L->top.p, au(L, m, AU_BINDINGS)); L->top.p++;   /* 6 */
+    lua_pushinteger(L, nb);                                    /* 7 */
+    lua_pushinteger(L, accu);                                  /* 8 */
+    setobj2s(L, L->top.p, au(L, m, AU_CHANGED)); L->top.p++;    /* 9 */
+    setobj2s(L, L->top.p, au(L, m, AU_OTHER)); L->top.p++;      /* 10 */
+    setobj2s(L, L->top.p, au(L, m, AU_CBS)); L->top.p++;        /* 11 */
+    if (have_marks) { setobj2s(L, L->top.p, au(L, m, AU_MARKS)); L->top.p++; } else lua_pushnil(L);   /* 12 */
+    lua_pushvalue(L, 5);
+    for (int i = 6; i <= 12; i++) lua_pushvalue(L, i);
+    lua_call(L, 7, 4);                                         /* 13..16: nc, no, ncb, nm */
+    lua_Integer nc = lua_tointeger(L, 13), no = lua_tointeger(L, 14), ncb = lua_tointeger(L, 15), nm = lua_tointeger(L, 16);
+    if (have_marks && nm > 0) { lua_pushvalue(L, 4); lua_pushvalue(L, 12); lua_pushinteger(L, nm); lua_call(L, 2, 0); }
+    for (lua_Integer i = 1; i <= ncb; i++) {
+        lua_rawgeti(L, 11, i);
+        lua_getfield(L, -1, "_onChange");
+        lua_call(L, 0, 0);
+        lua_pop(L, 1);
+    }
+    for (lua_Integer i = 1; i <= nc; i++) {
+        lua_rawgeti(L, 9, i);
+        lua_rawget(L, 6);                                      /* b = bindings[changed[i]] */
+        int bi = lua_gettop(L);
+        Table *b = lua_istable(L, bi) ? tab_at(L, bi) : NULL;
+        lua_Integer stride = b ? (lua_Integer)tab_field_num(b, AK_VS) : 0;
+        lua_getfield(L, bi, "binding");
+        lua_getfield(L, -1, "setValue");
+        lua_pushvalue(L, -2);
+        lua_getfield(L, bi, "buffer");
+        lua_pushinteger(L, accu * stride + stride);
+        lua_call(L, 3, 0);
+        lua_settop(L, bi - 1);
+    }
+    for (lua_Integer i = 1; i <= no; i++) {
+        lua_rawgeti(L, 10, i);
+        lua_rawget(L, 6);
+        int bi = lua_gettop(L);
+        lua_getfield(L, bi, "apply");
+        lua_pushvalue(L, bi);
+        lua_pushinteger(L, accu);
+        lua_call(L, 2, 0);
+        lua_settop(L, bi - 1);
+    }
+    lua_settop(L, 1);
+    return 1;
+}
+
 static int l_object_methods(lua_State *L) {
     luaL_checktype(L, 1, LUA_TTABLE); luaL_checktype(L, 2, LUA_TTABLE); luaL_checktype(L, 3, LUA_TFUNCTION);
     luaL_checktype(L, 4, LUA_TTABLE); luaL_checktype(L, 5, LUA_TFUNCTION); luaL_checktype(L, 6, LUA_TFUNCTION);
@@ -5705,7 +6014,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "curve_methods", l_curve_methods }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "frame_setup", l_frame_setup }, { "frame", l_frame }, { "raycast_records", l_raycast_records }, { "sync_materials", l_sync_materials }, { "renderer_get", l_renderer_get }, { "scene_get", l_scene_get }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "uuid", l_uuid }, { "camera_methods", l_camera_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "anim_update", l_anim_update }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "curve_methods", l_curve_methods }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "frame_setup", l_frame_setup }, { "frame", l_frame }, { "raycast_records", l_raycast_records }, { "sync_materials", l_sync_materials }, { "renderer_get", l_renderer_get }, { "scene_get", l_scene_get }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "uuid", l_uuid }, { "camera_methods", l_camera_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at }, { "ray_from_camera", l_ray_from_camera },
 #endif
@@ -5864,6 +6173,19 @@ void wcl_open_three_c(lua_State *L) {
     for (int i = 0; i < CMK_COUNT; i++) {
         lua_pushstring(L, cmnames[i]);
         cmkey[i] = (TString *)lua_topointer(L, -1);
+        luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    static const char *const aunames[AU_COUNT] = { "timeScale", "_actions", "_nActiveActions", "time", "_accuIndex", "_bindings",
+                                                   "_nActiveBindings", "_t3changed", "_t3other", "_t3cbs", "_t3marks", "enabled",
+                                                   "_startTime", "paused", "weight", "_weightInterpolant", "_timeScaleInterpolant",
+                                                   "_effectiveWeight", "_effectiveTimeScale", "_clip", "duration", "loop", "_loopCount",
+                                                   "repetitions", "clampWhenFinished", "_mixer", "blendMode", "_interpolants",
+                                                   "_propertyBindings", "_t3kinds", "_interpolantSettings", "endingStart", "endingEnd",
+                                                   "zeroSlopeAtStart", "zeroSlopeAtEnd", "stopFading", "stopWarping", "dispatchEvent",
+                                                   "_update", "apply", "type", "action", "direction", "loopDelta", "_markRecs" };
+    for (int i = 0; i < AU_COUNT; i++) {
+        lua_pushstring(L, aunames[i]);
+        aukey[i] = (TString *)lua_topointer(L, -1);
         luaL_ref(L, LUA_REGISTRYINDEX);
     }
     static const char *const wnames[WK_COUNT] = { "x", "y", "z", "order", "_x", "_y", "_z", "_order", "_srcq",
