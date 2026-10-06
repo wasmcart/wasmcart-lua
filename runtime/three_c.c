@@ -3679,6 +3679,172 @@ static int sync_light_c(lua_State *L, Table *o) {
  * intensity, distance, decay, angle, penumbra, gr, gg, gb, tx, ty, tz,
  * mapW, mapH, bias, normalBias, radius, near, far, left, right, top,
  * bottom, fov (the shadow ones 0 without a shadow) */
+
+/* t3.object_methods(dirty, filled, flushDirty, Vector3, luaUpdateMatrixWorld,
+ * luaGetWorldPosition, luaLookAt) -> updateMatrixWorld, getWorldPosition,
+ * lookAt: Object3D's three most-called methods for a mirrored object (the
+ * flush of pending writes, the twin's world update, the proxies' reset,
+ * the result), each falling back to its Lua version for an object without
+ * a twin or a case it does not cover. */
+enum { OK_T3, OK_QUAT, OK_STD, OK_EYE, OK_UP, OK_ISCAM, OK_ISLIGHT, OK_ROT, OK_GEN, OK_COUNT };
+static TString *okey[OK_COUNT];
+/* bump(): the world matrices changed; the filled proxies forget their copies */
+static void bump_c(lua_State *L, Table *filled) {
+    TValue *g = (TValue *)luaH_getshortstr(filled, okey[OK_GEN]);
+    if (ttisinteger(g)) setivalue(g, ivalue(g) + 1);
+    TValue *nv = (TValue *)luaH_getshortstr(filled, wkey[WK_N]);
+    lua_Integer n = ttisinteger(nv) ? ivalue(nv) : 0;
+    for (lua_Integer i = 1; i <= n; i++) {
+        TValue *slot = (TValue *)tab_geti(filled, (int)i);
+        if (isabstkey(slot)) continue;
+        Table *pt = tv_tab(slot);
+        if (pt) for (int k = 1; k <= 16; k++) { TValue *e = (TValue *)tab_geti(pt, k); if (!isabstkey(e)) setnilvalue(e); }
+        setnilvalue(slot);
+    }
+    if (ttisinteger(nv)) setivalue(nv, 0);
+}
+/* pending writes to the twins, when any: t3.flush here, and the records it
+ * keeps (flags, a hand-set matrix) finished by Lua's flushKept */
+static void om_flush(lua_State *L, Table *dirty, const TValue *flushKept) {
+    TValue *nv = (TValue *)luaH_getshortstr(dirty, wkey[WK_N]);
+    if (!ttisinteger(nv) || ivalue(nv) == 0) return;
+    lua_pushcfunction(L, l_flush);
+    sethvalue2s(L, L->top.p, dirty); L->top.p++;
+    lua_pushinteger(L, ivalue(nv));
+    lua_call(L, 2, 1);
+    lua_Integer keep = lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    nv = (TValue *)luaH_getshortstr(dirty, wkey[WK_N]);
+    if (keep == 0) { setivalue(nv, 0); return; }
+    setobj2s(L, L->top.p, flushKept); L->top.p++;
+    lua_pushinteger(L, keep);
+    lua_call(L, 1, 0);
+}
+static int om_fallback(lua_State *L, int up, int nargs) {
+    int base = lua_gettop(L);
+    lua_pushvalue(L, lua_upvalueindex(up));
+    for (int i = 1; i <= nargs; i++) lua_pushvalue(L, i);
+    lua_call(L, nargs, LUA_MULTRET);
+    return lua_gettop(L) - base;
+}
+/* upvalues: 1 dirty, 2 filled, 3 flushDirty, 4 Lua updateMatrixWorld */
+static int l_om_update_matrix_world(lua_State *L) {
+    lua_settop(L, 2);
+    Table *o = lua_istable(L, 1) ? tab_at(L, 1) : NULL;
+    t3_object *h = o ? (t3_object *)tv_handle(luaH_getshortstr(o, okey[OK_T3])) : NULL;
+    if (!h) return om_fallback(L, 4, 2);
+    om_flush(L, hvalue(UPV(1)), UPV(3));
+    uint32_t before = t3_world_recompute_count();
+    t3_object_update_matrix_world(h, B(2));
+    if (t3_world_recompute_count() != before) bump_c(L, hvalue(UPV(2)));
+    lua_settop(L, 1);
+    return 1;
+}
+/* upvalues: 1 dirty, 2 filled, 3 flushDirty, 4 Vector3, 5 Lua getWorldPosition */
+static int l_om_get_world_position(lua_State *L) {
+    lua_settop(L, 2);
+    Table *o = lua_istable(L, 1) ? tab_at(L, 1) : NULL;
+    t3_object *h = o ? (t3_object *)tv_handle(luaH_getshortstr(o, okey[OK_T3])) : NULL;
+    if (!h) return om_fallback(L, 5, 2);
+    if (lua_isnil(L, 2)) {   /* Vector3.new() */
+        lua_createtable(L, 0, 3);
+        for (int d = 0; d < 3; d++) { lua_pushinteger(L, 0); lua_setfield(L, -2, getstr(fkey[FK_X + d])); }
+        lua_pushvalue(L, lua_upvalueindex(4)); lua_setmetatable(L, -2);
+        lua_replace(L, 2);
+    }
+    om_flush(L, hvalue(UPV(1)), UPV(3));
+    uint32_t before = t3_world_recompute_count();
+    t3_object_update_world_matrix(h, true, false);
+    if (t3_world_recompute_count() != before) bump_c(L, hvalue(UPV(2)));
+#ifdef T3_F64_MATH
+    const double *e = h->_mwd;
+#else
+    const float *e = h->matrix_world.e;
+#endif
+    Table *tg = lua_istable(L, 2) ? tab_at(L, 2) : NULL;
+    TValue *sl[3];
+    int direct = tg && tg->metatable == hvalue(UPV(4));
+    for (int d = 0; direct && d < 3; d++) {
+        sl[d] = (TValue *)luaH_getshortstr(tg, fkey[FK_X + d]);
+        if (isabstkey(sl[d])) direct = 0;
+    }
+    if (direct) {
+        setfltvalue(sl[0], e[12]); setfltvalue(sl[1], e[13]); setfltvalue(sl[2], e[14]);
+        lua_settop(L, 2);
+        return 1;
+    }
+    /* target:set(x, y, z) */
+    lua_getfield(L, 2, "set");
+    lua_pushvalue(L, 2);
+    lua_pushnumber(L, e[12]); lua_pushnumber(L, e[13]); lua_pushnumber(L, e[14]);
+    lua_call(L, 4, 1);
+    return 1;
+}
+/* upvalues: 1 dirty, 2 filled, 3 flushDirty, 4 Lua lookAt */
+static int l_om_look_at(lua_State *L) {
+    lua_settop(L, 4);
+    Table *o = lua_istable(L, 1) ? tab_at(L, 1) : NULL;
+    const TValue *hv = o ? luaH_getshortstr(o, okey[OK_T3]) : NULL;
+    if (!hv || !tv_handle(hv)) return om_fallback(L, 4, 4);
+    Table *q = tv_tab(luaH_getshortstr(o, okey[OK_QUAT]));
+    if (!q) return om_fallback(L, 4, 4);
+    const TValue *cb = luaH_getshortstr(q, wkey[WK_ONCH]);
+    int hascb = !isempty(cb) && !l_isfalse(cb);
+    if (hascb) {
+        const TValue *std = luaH_getshortstr(q, okey[OK_STD]);
+        if (!(ttisLclosure(cb) && ttisLclosure(std) && clLvalue(cb) == clLvalue(std))) return om_fallback(L, 4, 4);
+    }
+    const TValue *eyev = luaH_getshortstr(o, okey[OK_EYE]);
+    int eye;
+    if (isempty(eyev) || ttisnil(eyev)) {
+        const TValue *c = obj_get(L, o, okey[OK_ISCAM], NULL), *l = obj_get(L, o, okey[OK_ISLIGHT], NULL);
+        if (!c || !l) return om_fallback(L, 4, 4);
+        eye = tv_true(c) || tv_true(l);
+        lua_pushboolean(L, eye); lua_setfield(L, 1, getstr(okey[OK_EYE]));
+    } else eye = tv_true(eyev);
+    const TValue *up = obj_get(L, o, okey[OK_UP], NULL);
+    if (!up || !ttistable(up)) return om_fallback(L, 4, 4);
+    om_flush(L, hvalue(UPV(1)), UPV(3));
+    /* t3.look_at(h, target | x, y, z, up, eye, q) */
+    int base = lua_gettop(L);
+    lua_pushcfunction(L, l_look_at);
+    setobj2s(L, L->top.p, hv); L->top.p++;
+    int n = 2;
+    if (lua_isnil(L, 3)) { lua_pushvalue(L, 2); n += 1; }
+    else { lua_pushvalue(L, 2); lua_pushvalue(L, 3); lua_pushvalue(L, 4); n += 3; }
+    setobj2s(L, L->top.p, up); L->top.p++;
+    lua_pushboolean(L, eye);
+    lua_pushvalue(L, 1); lua_getfield(L, -1, "quaternion"); lua_remove(L, -2);
+    lua_call(L, n + 2, 2);
+    int ok = lua_toboolean(L, -2), changed = lua_toboolean(L, -1);
+    lua_settop(L, base);
+    if (!ok) return om_fallback(L, 4, 4);
+    if (changed) bump_c(L, hvalue(UPV(2)));
+    Table *rec = tv_tab(luaH_getshortstr(q, wmkey_rec));
+    if (rec) wk_mark_t(L, rec, hvalue(UPV(1)));
+    if (hascb) {
+        /* the standard callback: rotation._srcq = quaternion */
+        Table *rot = tv_tab(luaH_getshortstr(o, okey[OK_ROT]));
+        TValue *sq = rot ? (TValue *)luaH_getshortstr(rot, wkey[WK_SRCQ]) : NULL;
+        if (sq && !isabstkey(sq)) { sethvalue(L, sq, q); luaC_barrierback(L, obj2gco(rot), sq); }
+        else if (rot) { lua_getfield(L, 1, "rotation"); lua_pushstring(L, "_srcq"); lua_pushvalue(L, 1); lua_getfield(L, -1, "quaternion"); lua_remove(L, -2); lua_rawset(L, -3); lua_pop(L, 1); }
+    }
+    lua_settop(L, 1);
+    return 1;
+}
+static int l_object_methods(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE); luaL_checktype(L, 2, LUA_TTABLE); luaL_checktype(L, 3, LUA_TFUNCTION);
+    luaL_checktype(L, 4, LUA_TTABLE); luaL_checktype(L, 5, LUA_TFUNCTION); luaL_checktype(L, 6, LUA_TFUNCTION);
+    luaL_checktype(L, 7, LUA_TFUNCTION);
+    lua_settop(L, 7);
+    lua_pushvalue(L, 1); lua_pushvalue(L, 2); lua_pushvalue(L, 3); lua_pushvalue(L, 5);
+    lua_pushcclosure(L, l_om_update_matrix_world, 4);
+    lua_pushvalue(L, 1); lua_pushvalue(L, 2); lua_pushvalue(L, 3); lua_pushvalue(L, 4); lua_pushvalue(L, 6);
+    lua_pushcclosure(L, l_om_get_world_position, 5);
+    lua_pushvalue(L, 1); lua_pushvalue(L, 2); lua_pushvalue(L, 3); lua_pushvalue(L, 7);
+    lua_pushcclosure(L, l_om_look_at, 4);
+    return 3;
+}
 static int l_light_get(lua_State *L) {
     t3_light *l = (t3_light *)P(L, 1);
     lua_pushnumber(L, l->color.r); lua_pushnumber(L, l->color.g); lua_pushnumber(L, l->color.b);
@@ -4287,7 +4453,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "object_methods", l_object_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at }, { "ray_from_camera", l_ray_from_camera },
 #endif
@@ -4358,6 +4524,12 @@ void wcl_open_three_c(lua_State *L) {
     for (int i = 0; i < LK_COUNT; i++) {
         lua_pushstring(L, lnames[i]);
         lkey[i] = (TString *)lua_topointer(L, -1);
+        luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    static const char *const onames[OK_COUNT] = { "_t3", "quaternion", "_t3std", "_t3lookEye", "up", "isCamera", "isLight", "rotation", "gen" };
+    for (int i = 0; i < OK_COUNT; i++) {
+        lua_pushstring(L, onames[i]);
+        okey[i] = (TString *)lua_topointer(L, -1);
         luaL_ref(L, LUA_REGISTRYINDEX);
     }
     static const char *const wnames[WK_COUNT] = { "x", "y", "z", "order", "_x", "_y", "_z", "_order", "_srcq",
