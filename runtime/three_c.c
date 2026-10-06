@@ -2553,6 +2553,58 @@ static int l_u_to_t_array(lua_State *L) {
     return 1;
 }
 
+/* t3.bbox(array, count, itemSize) -> minx, miny, minz, maxx, maxy, maxz |
+ * false: BufferGeometry:computeBoundingBox's loop; each bound is one of the
+ * array's own values, number subtype and all (math.huge / -math.huge when
+ * no value beats them, as Lua's) */
+static int l_bbox(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    Table *a = tab_at(L, 1);
+    lua_Integer n = luaL_checkinteger(L, 2), st = luaL_checkinteger(L, 3);
+    if (st < 3) NO_KERNEL;
+    TValue inf, ninf;
+    setfltvalue(&inf, HUGE_VAL);
+    setfltvalue(&ninf, -HUGE_VAL);
+    const TValue *mn[3] = { &inf, &inf, &inf }, *mx[3] = { &ninf, &ninf, &ninf };
+    double mnd[3] = { HUGE_VAL, HUGE_VAL, HUGE_VAL }, mxd[3] = { -HUGE_VAL, -HUGE_VAL, -HUGE_VAL };
+    for (lua_Integer i = 0; i < n; i++) {
+        lua_Integer o = i * st;
+        for (int k = 0; k < 3; k++) {
+            const TValue *v = tab_geti(a, (int)(o + k + 1));
+            double d;
+            if (!tv_dbl(v, &d)) NO_KERNEL;
+            /* Lua: if x < minx then minx = x end; if x > maxx then maxx = x end */
+            if (d < mnd[k]) { mnd[k] = d; mn[k] = v; }
+            if (d > mxd[k]) { mxd[k] = d; mx[k] = v; }
+        }
+    }
+    for (int k = 0; k < 3; k++) { setobj2s(L, L->top.p, mn[k]); L->top.p++; }
+    for (int k = 0; k < 3; k++) { setobj2s(L, L->top.p, mx[k]); L->top.p++; }
+    return 6;
+}
+/* t3.bsphere_maxsq(array, count, itemSize, cx, cy, cz) -> the largest
+ * squared distance from (cx, cy, cz) (computeBoundingSphere's loop) | false */
+static int l_bsphere_maxsq(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    Table *a = tab_at(L, 1);
+    lua_Integer n = luaL_checkinteger(L, 2), st = luaL_checkinteger(L, 3);
+    double cx = luaL_checknumber(L, 4), cy = luaL_checknumber(L, 5), cz = luaL_checknumber(L, 6);
+    if (st < 3) NO_KERNEL;
+    double maxSq = 0;
+    int any = 0;
+    for (lua_Integer i = 0; i < n; i++) {
+        lua_Integer o = i * st;
+        double x, y, z;
+        if (!tv_dbl(tab_geti(a, (int)(o + 1)), &x) || !tv_dbl(tab_geti(a, (int)(o + 2)), &y) ||
+            !tv_dbl(tab_geti(a, (int)(o + 3)), &z)) NO_KERNEL;
+        double dx = x - cx, dy = y - cy, dz = z - cz;
+        double d = dx * dx + dy * dy + dz * dz;
+        if (d > maxSq) { maxSq = d; any = 1; }
+    }
+    if (any) lua_pushnumber(L, maxSq); else lua_pushinteger(L, 0);
+    return 1;
+}
+
 /* t3.quat_from_euler(x, y, z, order) -> qx, qy, qz, qw (double precision) */
 static int l_quat_from_euler(lua_State *L) {
     double x = lua_tonumber(L, 1), y = lua_tonumber(L, 2), z = lua_tonumber(L, 3);
@@ -3541,7 +3593,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at },
 #endif
