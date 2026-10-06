@@ -41,6 +41,8 @@
  */
 import fs from 'fs';
 import path from 'path';
+import __makeJit from '../test/jit-host.js';
+const __jit = await __makeJit();
 
 const WEBGL_NODE = process.env.WEBGL_NODE
   || `${process.env.HOME}/code/cliemu/romdev/node_modules/webgl-node/index.mjs`;
@@ -105,6 +107,7 @@ const env = {
   wc_peer_transport: () => 0,
   wc_debug_mark: () => {},
   emscripten_notify_memory_growth: () => {},
+  ...__jit.imports,
 };
 
 const glImports = createWebGLImports({ getMemory: () => mem, ctx: gl });
@@ -112,6 +115,7 @@ const { instance } = await WebAssembly.instantiate(fs.readFileSync(enginePath), 
   env, gl: glImports,
   wasi_snapshot_preview1: new Proxy({}, { get: () => () => 0 }),
 });
+__jit.bind(instance);
 const e = instance.exports;
 mem = e.memory;
 e.wc_get_info();

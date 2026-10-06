@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+let __jit = null;  // set in the first async function before imports are built
 /*
  * test/run.js - headless conformance + smoke harness for the engine.
  *
@@ -53,6 +54,8 @@ async function runCart(wasmPath, appDir, frames, opts = {}) {
   const wasiCalled = new Set();
   const wasi = new Proxy({}, { get: (_t, n) => () => { wasiCalled.add(String(n)); return 0; } });
 
+  __jit = await require('./jit-host.js')();  // wc_jit_link (runtime JIT)
+
   const imports = {
     env: {
       wc_log: (p, l) => logs.push(dec.decode(new Uint8Array(mem.buffer, p, l))),
@@ -89,11 +92,13 @@ async function runCart(wasmPath, appDir, frames, opts = {}) {
       wc_peer_transport: () => 0,
       wc_debug_mark: (id) => marks.push(id),
       emscripten_notify_memory_growth: () => {},
+      ...__jit.imports,
     },
     wasi_snapshot_preview1: wasi,
   };
 
   const { instance } = await WebAssembly.instantiate(buf, imports);
+__jit.bind(instance);
   const e = instance.exports;
   mem = e.memory;
 
