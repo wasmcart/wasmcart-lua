@@ -790,58 +790,6 @@ static int l_m4_copy(lua_State *L) {
     return 1;
 }
 
-/* t3.m4_mul(te, ae, be) -> ok: Matrix4:multiplyMatrices (te may be ae or be) */
-static int l_m4_mul(lua_State *L) {
-    double ae[16], be[16];
-    Table *te;
-    if (!m4_get(L, 2, ae, NULL) || !m4_get(L, 3, be, NULL) || !lua_istable(L, 1) ||
-        (te = tab_at(L, 1))->alimit < 16) { lua_pushboolean(L, 0); return 1; }
-    if (ae[3] == 0 && ae[7] == 0 && ae[11] == 0 && ae[15] == 1 && be[3] == 0 && be[7] == 0 && be[11] == 0 && be[15] == 1) {
-        double a11 = ae[0], a21 = ae[1], a31 = ae[2], a12 = ae[4], a22 = ae[5], a32 = ae[6];
-        double a13 = ae[8], a23 = ae[9], a33 = ae[10], a14 = ae[12], a24 = ae[13], a34 = ae[14];
-        double b11 = be[0], b21 = be[1], b31 = be[2], b12 = be[4], b22 = be[5], b32 = be[6];
-        double b13 = be[8], b23 = be[9], b33 = be[10], b14 = be[12], b24 = be[13], b34 = be[14];
-        SETF(te, 1, a11 * b11 + a12 * b21 + a13 * b31);
-        SETF(te, 2, a21 * b11 + a22 * b21 + a23 * b31);
-        SETF(te, 3, a31 * b11 + a32 * b21 + a33 * b31);
-        SETI(te, 4, 0);
-        SETF(te, 5, a11 * b12 + a12 * b22 + a13 * b32);
-        SETF(te, 6, a21 * b12 + a22 * b22 + a23 * b32);
-        SETF(te, 7, a31 * b12 + a32 * b22 + a33 * b32);
-        SETI(te, 8, 0);
-        SETF(te, 9, a11 * b13 + a12 * b23 + a13 * b33);
-        SETF(te, 10, a21 * b13 + a22 * b23 + a23 * b33);
-        SETF(te, 11, a31 * b13 + a32 * b23 + a33 * b33);
-        SETI(te, 12, 0);
-        SETF(te, 13, a11 * b14 + a12 * b24 + a13 * b34 + a14);
-        SETF(te, 14, a21 * b14 + a22 * b24 + a23 * b34 + a24);
-        SETF(te, 15, a31 * b14 + a32 * b24 + a33 * b34 + a34);
-        SETI(te, 16, 1);
-    } else {
-        double a11 = ae[0], a21 = ae[1], a31 = ae[2], a41 = ae[3], a12 = ae[4], a22 = ae[5], a32 = ae[6], a42 = ae[7];
-        double a13 = ae[8], a23 = ae[9], a33 = ae[10], a43 = ae[11], a14 = ae[12], a24 = ae[13], a34 = ae[14], a44 = ae[15];
-        double b11 = be[0], b21 = be[1], b31 = be[2], b41 = be[3], b12 = be[4], b22 = be[5], b32 = be[6], b42 = be[7];
-        double b13 = be[8], b23 = be[9], b33 = be[10], b43 = be[11], b14 = be[12], b24 = be[13], b34 = be[14], b44 = be[15];
-        SETF(te, 1, a11 * b11 + a12 * b21 + a13 * b31 + a14 * b41);
-        SETF(te, 2, a21 * b11 + a22 * b21 + a23 * b31 + a24 * b41);
-        SETF(te, 3, a31 * b11 + a32 * b21 + a33 * b31 + a34 * b41);
-        SETF(te, 4, a41 * b11 + a42 * b21 + a43 * b31 + a44 * b41);
-        SETF(te, 5, a11 * b12 + a12 * b22 + a13 * b32 + a14 * b42);
-        SETF(te, 6, a21 * b12 + a22 * b22 + a23 * b32 + a24 * b42);
-        SETF(te, 7, a31 * b12 + a32 * b22 + a33 * b32 + a34 * b42);
-        SETF(te, 8, a41 * b12 + a42 * b22 + a43 * b32 + a44 * b42);
-        SETF(te, 9, a11 * b13 + a12 * b23 + a13 * b33 + a14 * b43);
-        SETF(te, 10, a21 * b13 + a22 * b23 + a23 * b33 + a24 * b43);
-        SETF(te, 11, a31 * b13 + a32 * b23 + a33 * b33 + a34 * b43);
-        SETF(te, 12, a41 * b13 + a42 * b23 + a43 * b33 + a44 * b43);
-        SETF(te, 13, a11 * b14 + a12 * b24 + a13 * b34 + a14 * b44);
-        SETF(te, 14, a21 * b14 + a22 * b24 + a23 * b34 + a24 * b44);
-        SETF(te, 15, a31 * b14 + a32 * b24 + a33 * b34 + a34 * b44);
-        SETF(te, 16, a41 * b14 + a42 * b24 + a43 * b34 + a44 * b44);
-    }
-    lua_pushboolean(L, 1);
-    return 1;
-}
 
 /* t3.m4_invert(te) -> ok: Matrix4:invert (affine path, else the general
  * cofactor inverse, zero on a singular matrix) */
@@ -923,10 +871,15 @@ static TString *fkey[FK_COUNT];
 typedef struct { double d; int i; } num_t;
 static int num_bail;
 static inline num_t nchk(double d, int i) {
-    if (i && fabs(d) >= 9007199254740992.0) num_bail = 1;
+    if (i) {
+        if (fabs(d) >= 9007199254740992.0) num_bail = 1;
+        d = d + 0.0;   /* an integer has no negative zero: -3 * 0 is 0 */
+    }
     num_t r = { d, i };
     return r;
 }
+/* Lua's unary minus: an integer 0 stays 0 (a float 0.0 becomes -0.0) */
+static inline double nneg(num_t a) { return a.i ? 0.0 - a.d : -a.d; }
 static inline num_t nadd(num_t a, num_t b) { return nchk(a.d + b.d, a.i && b.i); }
 static inline num_t nsub(num_t a, num_t b) { return nchk(a.d - b.d, a.i && b.i); }
 static inline num_t nmul(num_t a, num_t b) { return nchk(a.d * b.d, a.i && b.i); }
@@ -968,6 +921,43 @@ static int m4_get_n(lua_State *L, int idx, num_t e[16], Table **out) {
     return 1;
 }
 #define NO_KERNEL do { lua_pushboolean(L, 0); return 1; } while (0)
+
+/* t3.m4_mul(te, ae, be) -> ok: Matrix4:multiplyMatrices (its affine fast
+ * path included), number subtypes as Lua's: integer matrices multiply to
+ * integers */
+static int l_m4_mul(lua_State *L) {
+    num_t ae[16], be[16];
+    if (!m4_get_n(L, 2, ae, NULL) || !m4_get_n(L, 3, be, NULL) || !lua_istable(L, 1)) NO_KERNEL;
+    Table *te = tab_at(L, 1);
+    if (te->alimit < 16) NO_KERNEL;
+    num_bail = 0;
+    num_t r[16];
+#define A(i) ae[(i) - 1]
+#define Bv(i) be[(i) - 1]
+    if (ae[3].d == 0 && ae[7].d == 0 && ae[11].d == 0 && ae[15].d == 1 && be[3].d == 0 && be[7].d == 0 &&
+        be[11].d == 0 && be[15].d == 1) {
+        for (int c = 0; c < 4; c++) {
+            for (int i = 0; i < 3; i++) {
+                /* a[i][0] * b[0][c] + a[i][1] * b[1][c] + a[i][2] * b[2][c] (+ a[i][3] for the translation column) */
+                num_t s = nadd(nadd(nmul(ae[i], be[c * 4]), nmul(ae[4 + i], be[c * 4 + 1])), nmul(ae[8 + i], be[c * 4 + 2]));
+                if (c == 3) s = nadd(s, ae[12 + i]);
+                r[c * 4 + i] = s;
+            }
+            r[c * 4 + 3] = nint(c == 3 ? 1 : 0);
+        }
+    } else {
+        for (int c = 0; c < 4; c++)
+            for (int i = 0; i < 4; i++)
+                r[c * 4 + i] = nadd(nadd(nadd(nmul(ae[i], be[c * 4]), nmul(ae[4 + i], be[c * 4 + 1])),
+                                         nmul(ae[8 + i], be[c * 4 + 2])), nmul(ae[12 + i], be[c * 4 + 3]));
+    }
+#undef A
+#undef Bv
+    if (num_bail) NO_KERNEL;
+    for (int i = 0; i < 16; i++) set_tv(&te->array[i], r[i]);
+    lua_pushboolean(L, 1);
+    return 1;
+}
 
 /* t3.v3_apply_m4(v, elements) -> ok: Vector3:applyMatrix4 */
 static int l_v3_apply_m4(lua_State *L) {
@@ -1077,7 +1067,10 @@ static int l_q_slerp(lua_State *L) {
     double b[4] = { bn[0].d, bn[1].d, bn[2].d, bn[3].d };
     double cosHalfTheta = w * b[3] + x * b[0] + y * b[1] + z * b[2];
     double sx, sy, sz, sw;           /* self after the copy / negation */
-    if (cosHalfTheta < 0) { sw = -b[3]; sx = -b[0]; sy = -b[1]; sz = -b[2]; cosHalfTheta = -cosHalfTheta; }
+    if (cosHalfTheta < 0) {
+        sw = nneg(bn[3]); sx = nneg(bn[0]); sy = nneg(bn[1]); sz = nneg(bn[2]);
+        cosHalfTheta = -cosHalfTheta;
+    }
     else { sx = b[0]; sy = b[1]; sz = b[2]; sw = b[3]; }
     /* >= 1: self is put back as it was, number subtypes and all */
     if (cosHalfTheta >= 1.0) { lua_pushboolean(L, 1); return 1; }
