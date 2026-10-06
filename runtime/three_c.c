@@ -3149,6 +3149,78 @@ static int l_look_at(lua_State *L) {
 }
 #endif
 
+#ifdef T3_F64_MATH
+/* run a kernel on the given stack values (pushed copies), true if it took them */
+static int kcall(lua_State *L, lua_CFunction f, int nargs, const int *idx) {
+    lua_pushcfunction(L, f);
+    for (int i = 0; i < nargs; i++) lua_pushvalue(L, idx[i]);
+    lua_call(L, nargs, 1);
+    int ok = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    return ok;
+}
+static int ray_scratch_ref[2] = { LUA_NOREF, LUA_NOREF };
+static void push_scratch16(lua_State *L, int which) {
+    if (ray_scratch_ref[which] == LUA_NOREF) {
+        lua_createtable(L, 16, 0);
+        for (int i = 1; i <= 16; i++) { lua_pushinteger(L, 0); lua_rawseti(L, -2, i); }
+        ray_scratch_ref[which] = luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ray_scratch_ref[which]);
+}
+/* t3.ray_from_camera(h, projectionElements, matrixWorldInverseElements, x, y,
+ * origin, direction, Vector3) -> true, worldChanged | false:
+ * Raycaster:setFromCamera for a mirrored perspective camera, three.lua's
+ * steps in one call: camera:updateMatrixWorld() (the world in C, then
+ * matrixWorldInverse = copy(matrixWorld):invert()), origin from the world
+ * position, direction = (x, y, 0.5):unproject(camera) - origin, normalized;
+ * the same typed kernels the Lua methods use, on scratch matrices. */
+static int l_ray_from_camera(lua_State *L) {
+    t3_object *o = (t3_object *)P(L, 1);
+    lua_settop(L, 8);
+    if (!lua_istable(L, 2) || !lua_istable(L, 3) || !lua_isnumber(L, 4) || !lua_isnumber(L, 5)) NO_KERNEL;
+    for (int i = 6; i <= 7; i++) {
+        if (!lua_istable(L, i) || tab_at(L, i)->metatable != (Table *)lua_topointer(L, 8)) NO_KERNEL;
+        num_t f[3];
+        if (!get_fields(L, i, 3, f, NULL)) NO_KERNEL;
+    }
+    if (tab_at(L, 3)->alimit < 16 || tab_at(L, 2)->alimit < 16) NO_KERNEL;
+    uint32_t before = t3_world_recompute_count();
+    t3_object_update_matrix_world(o, false);
+    int changed = t3_world_recompute_count() != before;
+    const double *w = o->_mwd;
+    /* the world as the matrixWorld proxy holds it (floats), for the Lua steps */
+    push_scratch16(L, 0);                                       /* 9: world */
+    Table *wt = tab_at(L, 9);
+    for (int i = 0; i < 16; i++) setfltvalue(&wt->array[i], w[i]);
+    /* matrixWorldInverse:copy(matrixWorld):invert() */
+    { int a[2] = { 3, 9 }; kcall(L, l_m4_copy, 2, a); }
+    { int a[1] = { 3 }; if (!kcall(L, l_m4_invert, 1, a)) NO_KERNEL; }
+    /* origin:setFromMatrixPosition(matrixWorld) */
+    Table *ot = tab_at(L, 6);
+    for (int d = 0; d < 3; d++) setfltvalue((TValue *)luaH_getshortstr(ot, fkey[FK_X + d]), w[12 + d]);
+    /* direction:set(x, y, 0.5):unproject(camera): applyMatrix4(copy(projection):invert()):applyMatrix4(matrixWorld) */
+    Table *dt = tab_at(L, 7);
+    setobj(L, (TValue *)luaH_getshortstr(dt, fkey[FK_X]), s2v(L->ci->func.p + 4));
+    setobj(L, (TValue *)luaH_getshortstr(dt, fkey[FK_Y]), s2v(L->ci->func.p + 5));
+    setfltvalue((TValue *)luaH_getshortstr(dt, fkey[FK_Z]), 0.5);
+    push_scratch16(L, 1);                                       /* 10: projection inverse */
+    { int a[2] = { 10, 2 }; if (!kcall(L, l_m4_copy, 2, a)) NO_KERNEL; }
+    { int a[1] = { 10 }; if (!kcall(L, l_m4_invert, 1, a)) NO_KERNEL; }
+    { int a[2] = { 7, 10 }; if (!kcall(L, l_v3_apply_m4, 2, a)) NO_KERNEL; }
+    { int a[2] = { 7, 9 }; if (!kcall(L, l_v3_apply_m4, 2, a)) NO_KERNEL; }
+    /* :sub(origin):normalize() */
+    double d3[3];
+    for (int d = 0; d < 3; d++) d3[d] = tv_num(luaH_getshortstr(dt, fkey[FK_X + d])) - w[12 + d];
+    double l = sqrt(d3[0] * d3[0] + d3[1] * d3[1] + d3[2] * d3[2]);
+    if (l != 0) { double inv = 1 / l; d3[0] = d3[0] * inv; d3[1] = d3[1] * inv; d3[2] = d3[2] * inv; }
+    for (int d = 0; d < 3; d++) setfltvalue((TValue *)luaH_getshortstr(dt, fkey[FK_X + d]), d3[d]);
+    lua_pushboolean(L, 1);
+    lua_pushboolean(L, changed);
+    return 2;
+}
+#endif
+
 /* ── cameras and lights ──────────────────────────────────────────────── */
 
 static int l_perspective(lua_State *L) {
@@ -3811,7 +3883,7 @@ static const luaL_Reg t3_lib[] = {
     { "add", l_add }, { "remove", l_remove },
     { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
-    { "look_at", l_look_at },
+    { "look_at", l_look_at }, { "ray_from_camera", l_ray_from_camera },
 #endif
     { "f64a", l_f64a }, { "curve_sample", l_curve_sample }, { "u_to_t_array", l_u_to_t_array }, { "v3a_add", l_v3a_add }, { "v3a_sub", l_v3a_sub }, { "v3a_set_scaled", l_v3a_set_scaled }, { "v3a_normalize", l_v3a_normalize }, { "v3a_cross", l_v3a_cross }, { "v3a_measure", l_v3a_measure }, { "v3a_apply_qa", l_v3a_apply_qa }, { "f64a_sum", l_f64a_sum }, { "qa_from_axis_angle", l_qa_from_axis_angle }, { "qa_slerp", l_qa_slerp }, { "qa_normalize", l_qa_normalize }, { "m4a_multiply", l_m4a_multiply }, { "m4a_invert", l_m4a_invert }, { "f64a_get", l_f64a_get }, { "f64a_set", l_f64a_set }, { "f64a_fill", l_f64a_fill }, { "f64a_copy", l_f64a_copy }, { "v3a_add_xyz", l_v3a_add_xyz }, { "v3a_add_scaled", l_v3a_add_scaled }, { "v3a_multiply_scalar", l_v3a_multiply_scalar }, { "v3a_apply_m4a", l_v3a_apply_m4a }, { "v3a_sum", l_v3a_sum }, { "qa_from_euler_scaled", l_qa_from_euler_scaled }, { "m4a_compose", l_m4a_compose }, { "m4a_to_instanced", l_m4a_to_instanced }, { "array_part", l_array_part }, { "anim_register_more", l_anim_register_more }, { "deindex", l_deindex }, { "gen_sphere", l_gen_sphere }, { "gen_torus", l_gen_torus }, { "catmull_rom", l_catmull_rom }, { "cr_lengths", l_cr_lengths }, { "bezier3", l_bezier3 }, { "ellipse", l_ellipse }, { "u_to_t", l_u_to_t }, { "gen_torus_knot", l_gen_torus_knot }, { "gen_cylinder", l_gen_cylinder }, { "gen_box", l_gen_box }, { "gen_polyhedron", l_gen_polyhedron }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
     { "matrix", l_matrix },
