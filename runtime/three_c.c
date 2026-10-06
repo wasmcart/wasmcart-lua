@@ -2628,6 +2628,8 @@ enum { TK_MAP, TK_NORMAL, TK_AO, TK_EMISSIVE, TK_ROUGH, TK_METAL, TK_ALPHA, TK_N
        TK_ENC, TK_OFFSET, TK_REPEAT, TK_CENTER, TK_ROT, TK_ANISO, TK_COUNT };
 static TString *tkey[TK_COUNT], *tkey_hidden[TK_NMAPS];
 static int sync_texture_c(Table *tex);
+static void aim(t3_renderer *r);
+static void hand_back(t3_renderer *r);
 static const TValue *obj_get(lua_State *L, Table *o, TString *k, TString *hidden);
 static void fill(lua_State *L, int t, const float *e, int n);
 static void fill_d(lua_State *L, int t, const double *e, int n);
@@ -5318,6 +5320,123 @@ static int l_scene_get(lua_State *L) {
     lua_pushboolean(L, s->auto_update);
     return 12;
 }
+/* t3.frame(ctx, r, sceneH, camH, infoRender) -> calls, triangles, failed:
+ * what B.render does after the prologue: the pending object writes
+ * flushed (t3.flush, the kept records finished by ctx.flushKept), the
+ * geometries checked for changed attributes when BufferGeometry.changes
+ * moved (ctx.syncGeometry on a change), the dirty materials, the mapped
+ * textures and the lights synced, the render, the frame's numbers into
+ * renderer.info.render, the stand-ins reset when a world matrix changed.
+ * ctx: dirty, filled, flushKept, geoChanges, geos, syncGeometry, matDirty,
+ * mapped, syncTexture, syncMaterial, lights, syncLight (geoSeen kept here). */
+enum { XK_DIRTY, XK_FILLED, XK_FLUSHKEPT, XK_GEOCHANGES, XK_GEOS, XK_SYNCGEOMETRY, XK_MATDIRTY, XK_MAPPED, XK_SYNCTEXTURE,
+       XK_SYNCMATERIAL, XK_LIGHTS, XK_SYNCLIGHT, XK_GEOSEEN, XK_T3V, XK_ATTRIBUTES, XK_POSITION, XK_POSITIONV, XK_NORMAL,
+       XK_NORMALV, XK_COLOR, XK_COLORV, XK_UV, XK_UVV, XK_INDEX, XK_INDEXV, XK_GPUDIRTY, XK_VERSION, XK_CALLS, XK_TRIANGLES,
+       XK_COUNT };
+static TString *xkey[XK_COUNT];
+static const TValue *xk(Table *t, int k) { return luaH_getshortstr(t, xkey[k]); }
+/* attribute.version or 0 against the seen value (Lua's ~=) */
+static int version_differs(const TValue *seen, Table *attr) {
+    const TValue *v = xk(attr, XK_VERSION);
+    double d = (isempty(v) || ttisnil(v)) ? 0 : tv_num(v);
+    if (!ttisnumber(v) && !(isempty(v) || ttisnil(v))) return 1;
+    if (!ttisnumber(seen)) return 1;
+    return tv_num(seen) != d;
+}
+static int geometry_changed(Table *g) {
+    Table *seen = tv_tab(xk(g, XK_T3V));
+    Table *attrs = tv_tab(xk(g, XK_ATTRIBUTES));
+    if (!seen || !attrs) return 1;
+    if (tv_true(xk(g, XK_GPUDIRTY))) return 1;
+    Table *a = tv_tab(xk(attrs, XK_POSITION));
+    if (a) {
+        if (tv_tab(xk(seen, XK_POSITION)) != a || version_differs(xk(seen, XK_POSITIONV), a)) return 1;
+    }
+    Table *nrm = tv_tab(xk(attrs, XK_NORMAL)), *cl = tv_tab(xk(attrs, XK_COLOR)), *uv = tv_tab(xk(attrs, XK_UV));
+    const TValue *ixv = xk(g, XK_INDEX);
+    Table *ix = tv_tab(ixv);
+    if (nrm && version_differs(xk(seen, XK_NORMALV), nrm)) return 1;
+    if (cl && version_differs(xk(seen, XK_COLORV), cl)) return 1;
+    if (uv && version_differs(xk(seen, XK_UVV), uv)) return 1;
+    const TValue *six = xk(seen, XK_INDEX);
+    int ix_nil = isempty(ixv) || ttisnil(ixv), six_nil = isempty(six) || ttisnil(six);
+    if (ix_nil != six_nil || (!ix_nil && !(ttistable(six) && hvalue(six) == ix))) return 1;
+    if (ix && version_differs(xk(seen, XK_INDEXV), ix)) return 1;
+    return 0;
+}
+static int l_frame(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    rbox_t *box = (rbox_t *)lua_touserdata(L, 2);
+    if (!box || !box->r) return luaL_error(L, "frame: not a renderer");
+    luaL_checktype(L, 5, LUA_TTABLE);
+    lua_settop(L, 5);
+    Table *ctx = tab_at(L, 1);
+    Table *dirty = tv_tab(xk(ctx, XK_DIRTY)), *filled = tv_tab(xk(ctx, XK_FILLED));
+    if (!dirty || !filled) return luaL_error(L, "frame: ctx");
+    /* flushDirty */
+    om_flush(L, dirty, xk(ctx, XK_FLUSHKEPT));
+    /* the geometries, when any changed */
+    Table *gc = tv_tab(xk(ctx, XK_GEOCHANGES));
+    if (gc) {
+        const TValue *gn = luaH_getshortstr(gc, wkey[WK_N]);
+        TValue *seen = (TValue *)xk(ctx, XK_GEOSEEN);
+        if (!ttisnumber(seen) || !ttisnumber(gn) || tv_num(seen) != tv_num(gn)) {
+            lua_pushvalue(L, 1); setobj2s(L, L->top.p, gn); L->top.p++; lua_setfield(L, -2, getstr(xkey[XK_GEOSEEN])); lua_pop(L, 1);
+            setobj2s(L, L->top.p, xk(ctx, XK_GEOS)); L->top.p++;        /* 6: geos */
+            if (lua_istable(L, 6)) {
+                lua_pushnil(L);
+                while (lua_next(L, 6)) {
+                    lua_pop(L, 1);
+                    if (lua_istable(L, -1) && geometry_changed(tab_at(L, -1))) {
+                        setobj2s(L, L->top.p, xk(ctx, XK_SYNCGEOMETRY)); L->top.p++;
+                        lua_pushvalue(L, -2);
+                        lua_call(L, 1, 0);
+                    }
+                }
+            }
+            lua_settop(L, 5);
+        }
+    }
+    /* materials, textures, lights: the Lua-visible kernels, so a test can replace them */
+    Table *t3t = NULL;
+    lua_getglobal(L, "t3");
+    if (lua_istable(L, -1)) t3t = tab_at(L, -1);
+    lua_pop(L, 1);
+    if (!t3t) return luaL_error(L, "frame: no t3");
+    lua_getglobal(L, "t3"); lua_getfield(L, -1, "sync_materials"); lua_remove(L, -2);
+    setobj2s(L, L->top.p, xk(ctx, XK_MATDIRTY)); L->top.p++;
+    setobj2s(L, L->top.p, xk(ctx, XK_MAPPED)); L->top.p++;
+    setobj2s(L, L->top.p, xk(ctx, XK_SYNCTEXTURE)); L->top.p++;
+    setobj2s(L, L->top.p, xk(ctx, XK_SYNCMATERIAL)); L->top.p++;
+    lua_call(L, 4, 0);
+    lua_getglobal(L, "t3"); lua_getfield(L, -1, "sync_textures"); lua_remove(L, -2);
+    setobj2s(L, L->top.p, xk(ctx, XK_MAPPED)); L->top.p++;
+    setobj2s(L, L->top.p, xk(ctx, XK_SYNCTEXTURE)); L->top.p++;
+    lua_call(L, 2, 0);
+    Table *lights = tv_tab(xk(ctx, XK_LIGHTS));
+    const TValue *ln = lights ? luaH_getshortstr(lights, wkey[WK_N]) : NULL;
+    lua_getglobal(L, "t3"); lua_getfield(L, -1, "sync_lights"); lua_remove(L, -2);
+    setobj2s(L, L->top.p, xk(ctx, XK_LIGHTS)); L->top.p++;
+    lua_pushinteger(L, ln && ttisinteger(ln) ? ivalue(ln) : 0);
+    setobj2s(L, L->top.p, xk(ctx, XK_SYNCLIGHT)); L->top.p++;
+    lua_call(L, 3, 0);
+    /* the render */
+    t3_renderer *r = box->r;
+    if (!wcl_r2d_active()) { lua_pushinteger(L, 0); lua_pushinteger(L, 0); lua_pushboolean(L, 0); return 3; }
+    wcl_r2d__flush_for_external_gl();
+    aim(r);
+    uint32_t before = t3_world_recompute_count();
+    t3_renderer_render(r, (t3_scene *)P(L, 3), (t3_camera *)P(L, 4));
+    hand_back(r);
+    if (t3_world_recompute_count() != before) bump_c(L, tv_tab(xk(ctx, XK_FILLED)));
+    const t3_render_info *info = t3_renderer_info(r);
+    lua_pushinteger(L, info->calls); lua_setfield(L, 5, getstr(xkey[XK_CALLS]));
+    lua_pushinteger(L, info->triangles); lua_setfield(L, 5, getstr(xkey[XK_TRIANGLES]));
+    lua_pushinteger(L, info->calls);
+    lua_pushinteger(L, info->triangles);
+    lua_pushboolean(L, t3_renderer_last_error(r) != NULL);
+    return 3;
+}
 static int l_renderer(lua_State *L) {
     /* no GL this frame (a headless host, the CPU path): nil, and three.lua
      * renders with its Lua renderer as it did before three.c */
@@ -5427,7 +5546,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "frame_setup", l_frame_setup }, { "raycast_records", l_raycast_records }, { "sync_materials", l_sync_materials }, { "renderer_get", l_renderer_get }, { "scene_get", l_scene_get }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "uuid", l_uuid }, { "camera_methods", l_camera_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "frame_setup", l_frame_setup }, { "frame", l_frame }, { "raycast_records", l_raycast_records }, { "sync_materials", l_sync_materials }, { "renderer_get", l_renderer_get }, { "scene_get", l_scene_get }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "uuid", l_uuid }, { "camera_methods", l_camera_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at }, { "ray_from_camera", l_ray_from_camera },
 #endif
@@ -5571,6 +5690,15 @@ void wcl_open_three_c(lua_State *L) {
     for (int i = 0; i < HK_COUNT; i++) {
         lua_pushstring(L, hnames[i]);
         hkey[i] = (TString *)lua_topointer(L, -1);
+        luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    static const char *const cnames2[XK_COUNT] = { "dirty", "filled", "flushKept", "geoChanges", "geos", "syncGeometry", "matDirty",
+                                                   "mapped", "syncTexture", "syncMaterial", "lights", "syncLight", "geoSeen", "_t3v",
+                                                   "attributes", "position", "position#", "normal", "normal#", "color", "color#", "uv",
+                                                   "uv#", "index", "index#", "_gpuDirty", "version", "calls", "triangles" };
+    for (int i = 0; i < XK_COUNT; i++) {
+        lua_pushstring(L, cnames2[i]);
+        xkey[i] = (TString *)lua_topointer(L, -1);
         luaL_ref(L, LUA_REGISTRYINDEX);
     }
     static const char *const wnames[WK_COUNT] = { "x", "y", "z", "order", "_x", "_y", "_z", "_order", "_srcq",
