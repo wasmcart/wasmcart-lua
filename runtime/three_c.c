@@ -2997,6 +2997,33 @@ static int l_update_world_matrix(lua_State *L) {
     lua_pushboolean(L, t3_world_recompute_count() != before);
     return 1;
 }
+/* t3.world_position_into(h, target, vector3Class) -> worldChanged | nil:
+ * updateWorldMatrix(true, false), then the world position written into a
+ * plain Vector3 target (nil, nothing written, when the target is another
+ * kind: the caller then sets it from t3.world_position) */
+static int l_world_position_into(lua_State *L) {
+    t3_object *o = (t3_object *)P(L, 1);
+    uint32_t before = t3_world_recompute_count();
+    t3_object_update_world_matrix(o, true, false);
+    int changed = t3_world_recompute_count() != before;
+    if (!lua_istable(L, 2) || tab_at(L, 2)->metatable != (Table *)lua_topointer(L, 3)) {
+        lua_pushboolean(L, changed); lua_pushboolean(L, 0); return 2;
+    }
+    Table *tg = tab_at(L, 2);
+    TValue *s[3];
+    for (int d = 0; d < 3; d++) {
+        s[d] = (TValue *)luaH_getshortstr(tg, fkey[FK_X + d]);
+        if (isabstkey(s[d])) { lua_pushboolean(L, changed); lua_pushboolean(L, 0); return 2; }
+    }
+#ifdef T3_F64_MATH
+    const double *e = o->_mwd;
+#else
+    const float *e = o->matrix_world.e;
+#endif
+    setfltvalue(s[0], e[12]); setfltvalue(s[1], e[13]); setfltvalue(s[2], e[14]);
+    lua_pushboolean(L, changed); lua_pushboolean(L, 1);
+    return 2;
+}
 /* t3.world_position(h) -> x, y, z (no update: call update_world_matrix first) */
 static int l_world_position(lua_State *L) {
 #ifdef T3_F64_MATH
@@ -3782,7 +3809,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at },
 #endif
