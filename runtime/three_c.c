@@ -345,7 +345,7 @@ static int l_flush(lua_State *L) {
 /* ── animation: the per-track step of AnimationAction:_update ─────────── */
 
 enum { AK_PP, AK_SV, AK_VS, AK_CI, AK_BUF, AK_CW, AK_RB, AK_MK, AK_CWA, AK_BINDING, AK_SETV, AK_RP, AK_ONCH,
-       AK_X, AK_Y, AK_Z, AK_W, AK_TO, AK_MWNU, AK_COUNT };
+       AK_X, AK_Y, AK_Z, AK_W, AK_TO, AK_MWNU, AK_N, AK_LO, AK_HI, AK_COUNT };
 static TString *anim_key[AK_COUNT];
 
 static TValue *tab_slot(Table *t, int i) { return (TValue *)tab_geti(t, i); }
@@ -1573,6 +1573,134 @@ fail:
     NO_KERNEL;
 }
 
+/* ── curves ─────────────────────────────────────────────────────────────── */
+
+static lua_Integer lua_imod(lua_Integer a, lua_Integer b) {   /* Lua's integer %: floored */
+    lua_Integer m = a % b;
+    if (m != 0 && (m ^ b) < 0) m += b;
+    return m;
+}
+static int point3(Table *pts, lua_Integer i, double out[3]) {   /* points[i] as x, y, z numbers */
+    Table *p = tv_tab(tab_geti(pts, (int)i));
+    if (!p) return 0;
+    for (int k = 0; k < 3; k++)
+        if (!tv_dbl(luaH_getshortstr(p, fkey[FK_X + k]), &out[k])) return 0;
+    return 1;
+}
+static double cr_nonuniform(double x0, double x1, double x2, double x3, double r0, double r1, double r2, double r01,
+                            double r12, double dt1, double w) {
+    double t1 = ((x1 - x0) * r0 - (x2 - x0) * r01 + (x2 - x1) * r1) * dt1;
+    double t2 = ((x2 - x1) * r1 - (x3 - x1) * r12 + (x3 - x2) * r2) * dt1;
+    double c2 = -3 * x1 + 3 * x2 - 2 * t1 - t2;
+    double c3 = 2 * x1 - 2 * x2 + t1 + t2;
+    double w2 = w * w;
+    return x1 + t1 * w + c2 * w2 + c3 * w2 * w;
+}
+static double cr_uniform(double x0, double x1, double x2, double x3, double tension, double w) {
+    double t1 = tension * (x2 - x0);
+    double t2 = tension * (x3 - x1);
+    double c2 = -3 * x1 + 3 * x2 - 2 * t1 - t2;
+    double c3 = 2 * x1 - 2 * x2 + t1 + t2;
+    return x1 + t1 * w + c2 * w * w + c3 * w * w * w;
+}
+
+/* t3.catmull_rom(points, closed, curveType, tension, t, endCache) -> x, y, z
+ * | false: CatmullRomCurve3:getPoint's arithmetic. false when Lua must run
+ * it: the end cache missing or stale (Lua builds it), a point that is not
+ * plain numbers, or a uniform result Lua would keep integer. */
+static int l_catmull_rom(lua_State *L) {
+    if (!lua_istable(L, 1) || !lua_isnumber(L, 5)) NO_KERNEL;
+    Table *pts = tab_at(L, 1);
+    int closed = lua_toboolean(L, 2);
+    const char *ct = lua_tostring(L, 3);
+    int mode = !ct ? -1 : !strcmp(ct, "centripetal") ? 1 : !strcmp(ct, "chordal") ? 2 : 0;
+    if (mode < 0) NO_KERNEL;
+    lua_Integer l = (lua_Integer)luaH_getn(pts);
+    if (l < 2) NO_KERNEL;
+    int t_int = lua_isinteger(L, 5);
+    double t = lua_tonumber(L, 5);
+    double p = (double)(l - (closed ? 0 : 1)) * t;
+    double fl = floor(p);
+    if (!(fl > -1e15 && fl < 1e15)) NO_KERNEL;
+    lua_Integer intPoint = (lua_Integer)fl;
+    double weight = p - (double)intPoint;
+    int weight_int = t_int;
+    if (closed) {
+        intPoint = intPoint + (intPoint > 0 ? 0 : ((lua_Integer)floor((double)llabs(intPoint) / (double)l) + 1) * l);
+    } else if (weight == 0 && intPoint == l - 1) {
+        intPoint = l - 2;
+        weight = 1;
+        weight_int = 1;
+    }
+    double p0[3], p1[3], p2[3], p3[3];
+    Table *cache = NULL;
+    int need_lo = !(closed || intPoint > 0), need_hi = !(closed || intPoint + 2 < l);
+    if (need_lo || need_hi) {
+        cache = lua_istable(L, 6) ? tab_at(L, 6) : NULL;
+        if (!cache) NO_KERNEL;
+        const TValue *cn = luaH_getshortstr(cache, anim_key[AK_N]);
+        if (!ttisinteger(cn) || ivalue(cn) != l) NO_KERNEL;
+    }
+    if (need_lo) {
+        Table *lo = tv_tab(luaH_getshortstr(cache, anim_key[AK_LO]));
+        if (!lo) NO_KERNEL;
+        for (int k = 0; k < 3; k++) if (!tv_dbl(luaH_getshortstr(lo, fkey[FK_X + k]), &p0[k])) NO_KERNEL;
+    } else if (!point3(pts, lua_imod(intPoint - 1, l) + 1, p0)) NO_KERNEL;
+    if (!point3(pts, lua_imod(intPoint, l) + 1, p1) || !point3(pts, lua_imod(intPoint + 1, l) + 1, p2)) NO_KERNEL;
+    if (need_hi) {
+        Table *hi = tv_tab(luaH_getshortstr(cache, anim_key[AK_HI]));
+        if (!hi) NO_KERNEL;
+        for (int k = 0; k < 3; k++) if (!tv_dbl(luaH_getshortstr(hi, fkey[FK_X + k]), &p3[k])) NO_KERNEL;
+    } else if (!point3(pts, lua_imod(intPoint + 2, l) + 1, p3)) NO_KERNEL;
+    double r[3];
+    if (mode) {
+        double pw = mode == 2 ? 0.5 : 0.25;
+        double e1x = p1[0] - p2[0], e1y = p1[1] - p2[1], e1z = p1[2] - p2[2];
+        double e0x = p0[0] - p1[0], e0y = p0[1] - p1[1], e0z = p0[2] - p1[2];
+        double e2x = p2[0] - p3[0], e2y = p2[1] - p3[1], e2z = p2[2] - p3[2];
+        double dt0 = pow(e0x * e0x + e0y * e0y + e0z * e0z, pw);
+        double dt1 = pow(e1x * e1x + e1y * e1y + e1z * e1z, pw);
+        double dt2 = pow(e2x * e2x + e2y * e2y + e2z * e2z, pw);
+        if (dt1 < 1e-4) dt1 = 1.0;
+        if (dt0 < 1e-4) dt0 = dt1;
+        if (dt2 < 1e-4) dt2 = dt1;
+        double r0 = 1 / dt0, r1 = 1 / dt1, r2 = 1 / dt2, r01 = 1 / (dt0 + dt1), r12 = 1 / (dt1 + dt2);
+        for (int k = 0; k < 3; k++) r[k] = cr_nonuniform(p0[k], p1[k], p2[k], p3[k], r0, r1, r2, r01, r12, dt1, weight);
+    } else {
+        if (weight_int) NO_KERNEL;   /* integer points and tension could stay integers */
+        double tension = lua_isnumber(L, 4) ? lua_tonumber(L, 4) : 0.5;
+        for (int k = 0; k < 3; k++) r[k] = cr_uniform(p0[k], p1[k], p2[k], p3[k], tension, weight);
+    }
+    lua_pushnumber(L, r[0]); lua_pushnumber(L, r[1]); lua_pushnumber(L, r[2]);
+    return 3;
+}
+
+/* t3.bezier3(t, v0, v1, v2, v3, dims) -> x, y[, z] | false: the cubic
+ * Bezier getPoint, number subtypes as Lua's (integer t and points stay
+ * integers) */
+static void push_num(lua_State *L, num_t v) {
+    if (v.i) lua_pushinteger(L, (lua_Integer)v.d);
+    else lua_pushnumber(L, v.d);
+}
+static int l_bezier3(lua_State *L) {
+    if (!lua_isnumber(L, 1)) NO_KERNEL;
+    int dims = (int)luaL_checkinteger(L, 6);
+    if (dims != 2 && dims != 3) NO_KERNEL;
+    num_t t = lua_isinteger(L, 1) ? nint((double)lua_tointeger(L, 1)) : nflt(lua_tonumber(L, 1));
+    num_t v[4][3];
+    for (int i = 0; i < 4; i++) if (!get_fields(L, 2 + i, dims, v[i], NULL)) NO_KERNEL;
+    num_bail = 0;
+    num_t k = nsub(nint(1), t), three = nint(3);
+    num_t r[3];
+    for (int d = 0; d < dims; d++)
+        r[d] = nadd(nadd(nadd(nmul(nmul(nmul(k, k), k), v[0][d]), nmul(nmul(nmul(nmul(three, k), k), t), v[1][d])),
+                         nmul(nmul(nmul(nmul(three, k), t), t), v[2][d])),
+                    nmul(nmul(nmul(t, t), t), v[3][d]));
+    if (num_bail) NO_KERNEL;
+    for (int d = 0; d < dims; d++) push_num(L, r[d]);
+    return dims;
+}
+
 /* t3.quat_from_euler(x, y, z, order) -> qx, qy, qz, qw (double precision) */
 static int l_quat_from_euler(lua_State *L) {
     double x = lua_tonumber(L, 1), y = lua_tonumber(L, 2), z = lua_tonumber(L, 3);
@@ -2438,7 +2566,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "deindex", l_deindex }, { "gen_sphere", l_gen_sphere }, { "gen_torus", l_gen_torus }, { "gen_torus_knot", l_gen_torus_knot }, { "gen_cylinder", l_gen_cylinder }, { "gen_box", l_gen_box }, { "gen_polyhedron", l_gen_polyhedron }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "deindex", l_deindex }, { "gen_sphere", l_gen_sphere }, { "gen_torus", l_gen_torus }, { "catmull_rom", l_catmull_rom }, { "bezier3", l_bezier3 }, { "gen_torus_knot", l_gen_torus_knot }, { "gen_cylinder", l_gen_cylinder }, { "gen_box", l_gen_box }, { "gen_polyhedron", l_gen_polyhedron }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
     { "matrix", l_matrix },
     { "world", l_world }, { "local_matrix", l_local }, { "camera_matrices", l_camera_matrices },
     { "update_world", l_update_world }, { "update_world_matrix", l_update_world_matrix },
@@ -2480,7 +2608,7 @@ void wcl_open_three_c(lua_State *L) {
                                                   "buffer", "cumulativeWeight", "resultBuffer", "_t3mk",
                                                   "cumulativeWeightAdditive", "binding", "setValue",
                                                   "resolvedProperty", "_onChange", "x", "y", "z", "w",
-                                                  "targetObject", "matrixWorldNeedsUpdate" };
+                                                  "targetObject", "matrixWorldNeedsUpdate", "n", "lo", "hi" };
     for (int i = 0; i < AK_COUNT; i++) {
         lua_pushstring(L, anames[i]);
         anim_key[i] = (TString *)lua_topointer(L, -1);
