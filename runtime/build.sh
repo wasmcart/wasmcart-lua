@@ -206,7 +206,8 @@ fi
 THREE_C="${THREE_C:-../../three.c}"
 THREE_FLAGS=""
 if [ -f "$THREE_C/include/three.h" ]; then
-  T3_SRC="math core geometry curves animation raycaster loaders gltf program renderer gen/shaderlib"
+  # every library source (three.c adds files: pmrem.c came with the cartwheel merge)
+  T3_SRC=$(cd "$THREE_C/src" && ls *.c gen/*.c | sed "s/\.c$//")
   newest=$(ls -t "$THREE_C"/src/*.c "$THREE_C"/src/*.h "$THREE_C"/src/gen/*.c "$THREE_C"/include/*.h | head -1)
   if [ ! -f vendor/libthree_c.a ] || [ "$newest" -nt vendor/libthree_c.a ]; then
     mkdir -p vendor/three-c-obj && rm -f vendor/three-c-obj/*.o
