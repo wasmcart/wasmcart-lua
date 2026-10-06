@@ -2644,6 +2644,7 @@ static void wk_mark_t(lua_State *L, Table *rec, Table *d) {
     else luaH_setint(L, d, n, &rv);
     luaC_barrierback(L, obj2gco(d), &rv);
 }
+static TString *wmkey_t3rec, *wmkey_rec, *wmkey_mau, *wmkey_mask;
 #define UPV(i) (&clCvalue(s2v(L->ci->func.p))->upvalue[(i) - 1])
 /* the component slot for key k (x y z, w when nslots is 4), else 0 */
 static int wv_slot(const TValue *k, int nslots) {
@@ -2699,7 +2700,8 @@ static int l_wv_newindex(lua_State *L) {
     TValue *slot = (TValue *)tab_geti(t, f);
     if (isabstkey(slot)) { lua_settop(L, 3); lua_rawseti(L, 1, f); t = tab_at(L, 1); }
     else { setobj(L, slot, s2v(L->ci->func.p + 3)); luaC_barrierback(L, obj2gco(t), slot); }
-    Table *rec = tv_tab(luaH_getshortstr(t, wkey[WK_REC]));
+    /* the vector's record is its _rec (an Euler's is _t3rec) */
+    Table *rec = tv_tab(luaH_getshortstr(t, wmkey_rec));
     if (rec) wk_mark_t(L, rec, hvalue(UPV(1)));
     return 0;
 }
@@ -2727,7 +2729,7 @@ static int l_watched_vector_mm(lua_State *L) {
  * Writes: the hidden field, then the mode's action: the record's flags and
  * dirty mark (1, 5; matrixAutoUpdate also into rec[8]), onWrite(t, k, v)
  * in Lua (2, 3), changes.n + 1 (4). */
-static TString *wmkey_t3rec, *wmkey_rec, *wmkey_mau, *wmkey_mask;
+
 static const TValue *cls_get(lua_State *L, int up_cls, const TValue *k, int *pushed) {
     *pushed = 0;
     const TValue *cv = UPV(up_cls);
@@ -3514,6 +3516,202 @@ static int l_light_shadow(lua_State *L) {
     return 0;
 }
 
+/* t3.sync_lights(lights, n, viaLua): the Lua syncLight for every registered
+ * light in one call, reading the light's fields as Lua would (the field,
+ * the watched hidden field, then the class chain) and setting the twin
+ * directly. A light this cannot read fully (a target in a tree without an
+ * attached twin, an unreadable field) is handed to viaLua(light). */
+enum { LK_T3, LK_COLOR, LK_GCOLOR, LK_R, LK_G, LK_B, LK_INT, LK_DIST, LK_DECAY, LK_ANGLE, LK_PEN,
+       LK_TARGET, LK_ATT, LK_PARENT, LK_POS, LK_SHADOW, LK_CAST, LK_WCAST, LK_CAM, LK_MS, LK_BIAS, LK_NBIAS,
+       LK_RAD, LK_NEAR, LK_FAR, LK_LEFT, LK_RIGHT, LK_TOP, LK_BOTTOM, LK_FOV, LK_T3CLASS, LK_COUNT };
+static TString *lkey[LK_COUNT];
+/* o[k] as Lua's indexing would resolve it for a (watched) object: the raw
+ * field, the hidden field (watched keys), then the class chain. NULL when
+ * the chain has a function __index this cannot follow. */
+static const TValue *obj_get(lua_State *L, Table *o, TString *k, TString *hidden) {
+    const TValue *v = luaH_getshortstr(o, k);
+    if (!isempty(v)) return v;
+    if (hidden) { v = luaH_getshortstr(o, hidden); if (!isempty(v)) return v; }
+    Table *mt = o->metatable;
+    if (!mt) return v;
+    const TValue *cv = luaH_getshortstr(mt, lkey[LK_T3CLASS]);
+    if (!ttistable(cv)) cv = luaH_getshortstr(mt, G(L)->tmname[TM_INDEX]);
+    if (isempty(cv) || ttisnil(cv)) return v;
+    if (!ttistable(cv)) return NULL;
+    Table *cls = hvalue(cv);
+    v = luaH_getshortstr(cls, k);
+    for (int depth = 0; isempty(v) && cls->metatable && depth < 32; depth++) {
+        const TValue *ix = luaH_getshortstr(cls->metatable, G(L)->tmname[TM_INDEX]);
+        if (isempty(ix) || ttisnil(ix)) break;
+        if (!ttistable(ix)) return NULL;
+        cls = hvalue(ix);
+        v = luaH_getshortstr(cls, k);
+    }
+    return v;
+}
+/* `v or def` as a float (lua_tonumber's 0 for a non-number) */
+static int lk_num(lua_State *L, Table *o, int k, double def, float *out) {
+    const TValue *v = obj_get(L, o, lkey[k], NULL);
+    if (!v) return 0;
+    if (isempty(v) || l_isfalse(v)) { *out = (float)def; return 1; }
+    *out = (float)tv_num(v);
+    return 1;
+}
+/* x, y, z of a Vector3: fields, or the slots of a watched one */
+static void vec3_read(Table *t, double out[3]) {
+    const TValue *x = luaH_getshortstr(t, fkey[FK_X]);
+    if (!isempty(x)) {
+        out[0] = tv_num(x); out[1] = tv_num(luaH_getshortstr(t, fkey[FK_Y])); out[2] = tv_num(luaH_getshortstr(t, fkey[FK_Z]));
+    } else {
+        out[0] = tab_num(t, 1); out[1] = tab_num(t, 2); out[2] = tab_num(t, 3);
+    }
+}
+static void light_target_set(t3_light *l, double x, double y, double z) {
+    t3_object *t = l->target;
+    if (!t) return;
+    t->position.x = (float)x; t->position.y = (float)y; t->position.z = (float)z;
+    t3_mat4_identity(&t->matrix_world);
+    t->matrix_world.e[12] = t->position.x;
+    t->matrix_world.e[13] = t->position.y;
+    t->matrix_world.e[14] = t->position.z;
+    t->_world_version++;
+}
+static int lk_int(double d) { return d == (double)(long long)d ? (int)(long long)d : 0; }
+/* one light; 0 = hand it to Lua */
+static int sync_light_c(lua_State *L, Table *o) {
+    t3_light *l = (t3_light *)tv_handle(luaH_getshortstr(o, lkey[LK_T3]));
+    if (!l) return 0;
+    Table *c = tv_tab(luaH_getshortstr(o, lkey[LK_COLOR]));
+    if (!c) return 0;
+    t3_color col = { (float)tv_num(luaH_getshortstr(c, lkey[LK_R])), (float)tv_num(luaH_getshortstr(c, lkey[LK_G])),
+                     (float)tv_num(luaH_getshortstr(c, lkey[LK_B])) };
+    float in, di, de, an, pe;
+    if (!lk_num(L, o, LK_INT, 1, &in) || !lk_num(L, o, LK_DIST, 0, &di) || !lk_num(L, o, LK_DECAY, 1, &de)
+        || !lk_num(L, o, LK_ANGLE, 1.0471975512, &an) || !lk_num(L, o, LK_PEN, 0, &pe)) return 0;
+    const TValue *gcv = obj_get(L, o, lkey[LK_GCOLOR], NULL);
+    if (!gcv) return 0;
+    Table *gc = tv_tab(gcv);
+    l->color = col;
+    l->intensity = in; l->distance = di; l->decay = de; l->angle = an; l->penumbra = pe;
+    if (gc) {
+        t3_color g = { (float)tv_num(luaH_getshortstr(gc, lkey[LK_R])), (float)tv_num(luaH_getshortstr(gc, lkey[LK_G])),
+                       (float)tv_num(luaH_getshortstr(gc, lkey[LK_B])) };
+        l->ground_color = g;
+    }
+    const TValue *tv = obj_get(L, o, lkey[LK_TARGET], NULL);
+    if (!tv) return 0;
+    Table *t = tv_tab(tv);
+    if (t) {
+        t3_object *th = (t3_object *)tv_handle(luaH_getshortstr(t, lkey[LK_T3]));
+        if (th && tv_true(luaH_getshortstr(t, lkey[LK_ATT]))) {
+#ifdef T3_F64_MATH
+            const double *e = th->_mwd;
+#else
+            const float *e = th->matrix_world.e;
+#endif
+            light_target_set(l, e[12], e[13], e[14]);
+        } else {
+            const TValue *pv = obj_get(L, t, lkey[LK_PARENT], NULL);
+            if (!pv) return 0;
+            if (tv_true(pv)) return 0;      /* getWorldPosition: Lua */
+            const TValue *pos = obj_get(L, t, lkey[LK_POS], NULL);
+            Table *p = pos ? tv_tab(pos) : NULL;
+            if (!p) return 0;
+            double xyz[3];
+            vec3_read(p, xyz);
+            light_target_set(l, xyz[0], xyz[1], xyz[2]);
+        }
+    }
+    const TValue *sv = obj_get(L, o, lkey[LK_SHADOW], NULL);
+    if (!sv) return 0;
+    Table *s = tv_tab(sv);
+    if (s) {
+        const TValue *cs = obj_get(L, o, lkey[LK_CAST], lkey[LK_WCAST]);
+        if (!cs) return 0;
+        if (tv_true(cs)) {
+            t3_light_shadow *sh = l->shadow;
+            const TValue *camv = obj_get(L, s, lkey[LK_CAM], NULL);
+            const TValue *msv = obj_get(L, s, lkey[LK_MS], NULL);
+            if (!camv || !msv) return 0;
+            Table *cam = tv_tab(camv), *ms = tv_tab(msv);
+            float bias, nbias, rad;
+            if (!lk_num(L, s, LK_BIAS, 0, &bias) || !lk_num(L, s, LK_NBIAS, 0, &nbias) || !lk_num(L, s, LK_RAD, 1, &rad)) return 0;
+            int mw = 512, mh = 512;
+            if (ms) {
+                const TValue *x = luaH_getshortstr(ms, fkey[FK_X]), *y = luaH_getshortstr(ms, fkey[FK_Y]);
+                mw = (isempty(x) || l_isfalse(x)) ? 512 : lk_int(tv_num(x));
+                mh = (isempty(y) || l_isfalse(y)) ? 512 : lk_int(tv_num(y));
+            }
+            float near = 0.5f, far = 500, lft = 0, rgt = 0, top = 0, bot = 0, fov = 0;
+            int has_lrtb = 0, has_fov = 0;
+            if (cam) {
+                if (!lk_num(L, cam, LK_NEAR, 0.5, &near) || !lk_num(L, cam, LK_FAR, 500, &far)) return 0;
+                const TValue *lv = obj_get(L, cam, lkey[LK_LEFT], NULL);
+                if (!lv) return 0;
+                if (!isempty(lv) && !ttisnil(lv)) {
+                    has_lrtb = 1;
+                    lft = (float)tv_num(lv);
+                    const TValue *rv = obj_get(L, cam, lkey[LK_RIGHT], NULL), *tv2 = obj_get(L, cam, lkey[LK_TOP], NULL),
+                                 *bv = obj_get(L, cam, lkey[LK_BOTTOM], NULL);
+                    if (!rv || !tv2 || !bv) return 0;
+                    rgt = (float)tv_num(rv); top = (float)tv_num(tv2); bot = (float)tv_num(bv);
+                }
+                const TValue *fv = obj_get(L, cam, lkey[LK_FOV], NULL);
+                if (!fv) return 0;
+                if (!isempty(fv) && !ttisnil(fv)) { has_fov = 1; fov = (float)tv_num(fv); }
+            }
+            if (sh) {
+                sh->map_width = mw; sh->map_height = mh;
+                sh->bias = bias; sh->normal_bias = nbias; sh->radius = rad;
+                t3_camera *sc = sh->camera;
+                if (sc) {
+                    sc->near = near; sc->far = far;
+                    if (has_lrtb) { sc->left = lft; sc->right = rgt; sc->top = top; sc->bottom = bot; }
+                    if (has_fov) sc->fov = fov;
+                    t3_camera_update_projection_matrix(sc);
+                }
+            }
+        }
+    }
+    return 1;
+}
+/* t3.light_get(h): the twin's values, for checking a sync: r, g, b,
+ * intensity, distance, decay, angle, penumbra, gr, gg, gb, tx, ty, tz,
+ * mapW, mapH, bias, normalBias, radius, near, far, left, right, top,
+ * bottom, fov (the shadow ones 0 without a shadow) */
+static int l_light_get(lua_State *L) {
+    t3_light *l = (t3_light *)P(L, 1);
+    lua_pushnumber(L, l->color.r); lua_pushnumber(L, l->color.g); lua_pushnumber(L, l->color.b);
+    lua_pushnumber(L, l->intensity); lua_pushnumber(L, l->distance); lua_pushnumber(L, l->decay);
+    lua_pushnumber(L, l->angle); lua_pushnumber(L, l->penumbra);
+    lua_pushnumber(L, l->ground_color.r); lua_pushnumber(L, l->ground_color.g); lua_pushnumber(L, l->ground_color.b);
+    t3_object *t = l->target;
+    lua_pushnumber(L, t ? t->matrix_world.e[12] : 0); lua_pushnumber(L, t ? t->matrix_world.e[13] : 0);
+    lua_pushnumber(L, t ? t->matrix_world.e[14] : 0);
+    t3_light_shadow *s = l->shadow;
+    t3_camera *c = s ? s->camera : NULL;
+    lua_pushinteger(L, s ? s->map_width : 0); lua_pushinteger(L, s ? s->map_height : 0);
+    lua_pushnumber(L, s ? s->bias : 0); lua_pushnumber(L, s ? s->normal_bias : 0); lua_pushnumber(L, s ? s->radius : 0);
+    lua_pushnumber(L, c ? c->near : 0); lua_pushnumber(L, c ? c->far : 0);
+    lua_pushnumber(L, c ? c->left : 0); lua_pushnumber(L, c ? c->right : 0); lua_pushnumber(L, c ? c->top : 0);
+    lua_pushnumber(L, c ? c->bottom : 0); lua_pushnumber(L, c ? c->fov : 0);
+    return 26;
+}
+static int l_sync_lights(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    lua_Integer n = luaL_checkinteger(L, 2);
+    luaL_checktype(L, 3, LUA_TFUNCTION);
+    lua_settop(L, 3);
+    for (lua_Integer i = 1; i <= n; i++) {
+        Table *o = tv_tab(tab_geti(tab_at(L, 1), (int)i));
+        if (o && sync_light_c(L, o)) continue;
+        lua_pushvalue(L, 3);
+        lua_rawgeti(L, 1, i);
+        lua_call(L, 1, 0);
+    }
+    return 0;
+}
+
 /* ── scene ───────────────────────────────────────────────────────────── */
 
 /* t3.scene_set(scene, hasBackground, r,g,b, fogType, fr,fg,fb, near, far, density, autoUpdate) */
@@ -4089,7 +4287,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at }, { "ray_from_camera", l_ray_from_camera },
 #endif
@@ -4101,7 +4299,7 @@ static const luaL_Reg t3_lib[] = {
     { "perspective", l_perspective }, { "orthographic", l_orthographic }, { "camera_set", l_camera_set },
     { "camera_projection", l_camera_projection },
     { "light", l_light }, { "light_set", l_light_set }, { "light_target", l_light_target },
-    { "light_shadow", l_light_shadow },
+    { "light_shadow", l_light_shadow }, { "light_get", l_light_get },
     { "scene_set", l_scene_set },
     { "geometry", l_geometry }, { "geo_attr", l_geo_attr }, { "geo_index", l_geo_index },
     { "geo_groups", l_geo_groups }, { "geo_range", l_geo_range }, { "geo_bounds", l_geo_bounds },
@@ -4151,6 +4349,16 @@ void wcl_open_three_c(lua_State *L) {
         static TString **const ks[] = { &wmkey_t3rec, &wmkey_rec, &wmkey_mau, &wmkey_mask };
         static const char *const kn[] = { "_t3rec", "_rec", "matrixAutoUpdate", "mask" };
         for (int i = 0; i < 4; i++) { lua_pushstring(L, kn[i]); *ks[i] = (TString *)lua_topointer(L, -1); luaL_ref(L, LUA_REGISTRYINDEX); }
+    }
+    static const char *const lnames[LK_COUNT] = { "_t3", "color", "groundColor", "r", "g", "b", "intensity", "distance",
+                                                  "decay", "angle", "penumbra", "target", "_t3attached", "parent", "position",
+                                                  "shadow", "castShadow", "_w_castShadow", "camera", "mapSize", "bias",
+                                                  "normalBias", "radius", "near", "far", "left", "right", "top", "bottom",
+                                                  "fov", "__t3class" };
+    for (int i = 0; i < LK_COUNT; i++) {
+        lua_pushstring(L, lnames[i]);
+        lkey[i] = (TString *)lua_topointer(L, -1);
+        luaL_ref(L, LUA_REGISTRYINDEX);
     }
     static const char *const wnames[WK_COUNT] = { "x", "y", "z", "order", "_x", "_y", "_z", "_order", "_srcq",
                                                   "_onChange", "_t3cb", "_t3q", "_t3rec", "n" };
