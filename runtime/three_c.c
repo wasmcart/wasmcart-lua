@@ -4822,6 +4822,128 @@ static int l_anim_update(lua_State *L) {
     return 1;
 }
 
+/* t3.flush_kept_fn(dirty, setMeshData, meshRaycast, noRaycast) -> flushKept(keep):
+ * three.lua's flushKept in C: for each record t3.flush kept (flags or a
+ * hand-set matrix written), the matrix pushed (matrix:toArray()), the flags
+ * (the hidden fields, the layers mask, whether the object's raycast is its
+ * own: customRaycast), a changed geometry / material (setMeshData, Lua), an
+ * instance count; the list emptied. */
+enum { FKK_LAYERS, FKK_VISIBLE, FKK_FRUSTUM, FKK_CAST, FKK_RECEIVE, FKK_RENDERORDER, FKK_MAU, FKK_GEOMETRY, FKK_MATERIAL,
+       FKK_T3G, FKK_T3M, FKK_COUNT_, FKK_T3COUNT, FKK_RAYCAST, FKK_ISMESH, FKK_ISINSTANCED, FKK_ISSKINNED, FKK_ISLINE, FKK_MATRIX,
+       FKK_TOARRAY, FKK_N };
+static TString *fkkey[FKK_N], *wkey_wraycast;
+static int l_flags(lua_State *L);
+static int l_matrix(lua_State *L);
+static int l_instance_count(lua_State *L);
+/* customRaycast(o): 0 / 1, -1 when unreadable */
+static int custom_raycast(lua_State *L, Table *o, const TValue *meshRc, const TValue *noRc) {
+    const TValue *r = obj_get(L, o, fkkey[FKK_RAYCAST], wkey_wraycast);
+    if (!r) return -1;
+    if (isempty(r)) r = NULL;
+    if (r && luaV_rawequalobj(r, noRc)) return 0;
+    const TValue *v;
+#define T(k) ((v = obj_get(L, o, fkkey[k], NULL)) ? (!isempty(v) && tv_true(v)) : -1)
+    int im = T(FKK_ISMESH), ii = T(FKK_ISINSTANCED), is = T(FKK_ISSKINNED), il = T(FKK_ISLINE);
+#undef T
+    if (im < 0 || ii < 0 || is < 0 || il < 0) return -1;
+    if (r && luaV_rawequalobj(r, meshRc) && im && !ii && !is) return 0;
+    return !(il || ii || is);
+}
+/* upvalues: 1 dirty, 2 setMeshData, 3 meshRaycast, 4 noRaycast */
+static int l_flush_kept(lua_State *L) {
+    lua_Integer keep = luaL_checkinteger(L, 1);
+    lua_settop(L, 1);
+    Table *dirty = hvalue(UPV(1));
+    for (lua_Integer i = 1; i <= keep; i++) {
+        lua_rawgeti(L, lua_upvalueindex(1), i);               /* 2: rec */
+        lua_pushnil(L); lua_rawseti(L, lua_upvalueindex(1), i);
+        Table *rec = lua_istable(L, 2) ? tab_at(L, 2) : NULL;
+        if (!rec) { lua_settop(L, 1); continue; }
+        const TValue *hv = tab_geti(rec, 1);
+        void *h = tv_handle(hv);
+        Table *o = tv_tab(tab_geti(rec, 6));
+        if (!h || !o) { lua_settop(L, 1); continue; }
+        if (!tv_true(tab_geti(rec, 8)) && tv_true(tab_geti(rec, 10))) {
+            TValue *mx = tab_slot(rec, 10);
+            if (!isabstkey(mx)) setbfvalue(mx);
+            /* t3.matrix(h, o.matrix:toArray()) */
+            sethvalue2s(L, L->top.p, o); L->top.p++;
+            lua_getfield(L, -1, getstr(fkkey[FKK_MATRIX]));
+            lua_getfield(L, -1, getstr(fkkey[FKK_TOARRAY]));
+            lua_pushvalue(L, -2);
+            lua_call(L, 1, 1);
+            if (lua_istable(L, -1)) {
+                lua_pushcfunction(L, l_matrix);
+                setobj2s(L, L->top.p, hv); L->top.p++;
+                lua_pushvalue(L, -3);
+                lua_call(L, 2, 0);
+            }
+            lua_settop(L, 2);
+            rec = tab_at(L, 2);
+        }
+        if (tv_true(tab_geti(rec, 9))) {
+            TValue *fl = tab_slot(rec, 9);
+            if (!isabstkey(fl)) setbfvalue(fl);
+            Table *ly = tv_tab(luaH_getshortstr(o, fkkey[FKK_LAYERS]));
+            const TValue *lm = ly ? tab_geti(ly, 1) : NULL;
+            int cr = custom_raycast(L, o, UPV(3), UPV(4));
+            if (cr < 0) return luaL_error(L, "flushKept: an object this cannot read");
+            const TValue *v;
+#define FLD(k) (v = obj_get(L, o, fkkey[k], NULL))
+            lua_pushcfunction(L, l_flags);
+            setobj2s(L, L->top.p, hv); L->top.p++;
+            lua_pushboolean(L, FLD(FKK_VISIBLE) && !isempty(v) && tv_true(v));
+            lua_pushboolean(L, FLD(FKK_FRUSTUM) && !isempty(v) && tv_true(v));
+            lua_pushboolean(L, FLD(FKK_CAST) && !isempty(v) && tv_true(v));
+            lua_pushboolean(L, FLD(FKK_RECEIVE) && !isempty(v) && tv_true(v));
+            if (FLD(FKK_RENDERORDER) && !isempty(v) && !ttisnil(v) && !l_isfalse(v)) { setobj2s(L, L->top.p, v); L->top.p++; } else lua_pushinteger(L, 0);
+            lua_pushboolean(L, FLD(FKK_MAU) && !isempty(v) && tv_true(v));
+            if (lm && !isempty(lm) && !ttisnil(lm) && !l_isfalse(lm)) { setobj2s(L, L->top.p, lm); L->top.p++; } else lua_pushinteger(L, 1);
+            lua_pushboolean(L, cr);
+#undef FLD
+            lua_call(L, 9, 0);
+            o = tv_tab(tab_geti(tab_at(L, 2), 6));
+            const TValue *g = luaH_getshortstr(o, fkkey[FKK_GEOMETRY]), *m = luaH_getshortstr(o, fkkey[FKK_MATERIAL]);
+            if (!isempty(g) && tv_true(g)) {
+                const TValue *tg = luaH_getshortstr(o, fkkey[FKK_T3G]), *tm = luaH_getshortstr(o, fkkey[FKK_T3M]);
+                int gsame = !isempty(tg) && luaV_rawequalobj(g, tg);
+                int msame = (isempty(m) || ttisnil(m)) ? (isempty(tm) || ttisnil(tm)) : (!isempty(tm) && luaV_rawequalobj(m, tm));
+                if (!gsame || !msame) {
+                    lua_pushvalue(L, lua_upvalueindex(2));
+                    sethvalue2s(L, L->top.p, o); L->top.p++;
+                    lua_call(L, 1, 0);
+                    o = tv_tab(tab_geti(tab_at(L, 2), 6));
+                }
+            }
+            const TValue *cnt = luaH_getshortstr(o, fkkey[FKK_T3COUNT]);
+            if (!isempty(cnt) && tv_true(cnt)) {
+                const TValue *wc = luaH_getshortstr(o, fkkey[FKK_COUNT_]);
+                if (!luaV_rawequalobj(wc, cnt)) {
+                    lua_pushcfunction(L, l_instance_count);
+                    setobj2s(L, L->top.p, hv); L->top.p++;
+                    setobj2s(L, L->top.p, wc); L->top.p++;
+                    lua_call(L, 2, 0);
+                    sethvalue2s(L, L->top.p, o); L->top.p++;
+                    setobj2s(L, L->top.p, wc); L->top.p++;
+                    lua_setfield(L, -2, getstr(fkkey[FKK_T3COUNT]));
+                    lua_pop(L, 1);
+                }
+            }
+        }
+        lua_settop(L, 1);
+    }
+    TValue *nv = (TValue *)luaH_getshortstr(dirty, wkey[WK_N]);
+    if (ttisinteger(nv)) { setivalue(nv, 0); }
+    else { lua_pushinteger(L, 0); lua_setfield(L, lua_upvalueindex(1), "n"); }
+    return 0;
+}
+static int l_flush_kept_fn(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE); luaL_checktype(L, 2, LUA_TFUNCTION);
+    luaL_checktype(L, 3, LUA_TFUNCTION); luaL_checktype(L, 4, LUA_TFUNCTION);
+    lua_settop(L, 4);
+    lua_pushcclosure(L, l_flush_kept, 4);
+    return 1;
+}
 static int l_object_methods(lua_State *L) {
     luaL_checktype(L, 1, LUA_TTABLE); luaL_checktype(L, 2, LUA_TTABLE); luaL_checktype(L, 3, LUA_TFUNCTION);
     luaL_checktype(L, 4, LUA_TTABLE); luaL_checktype(L, 5, LUA_TFUNCTION); luaL_checktype(L, 6, LUA_TFUNCTION);
@@ -6014,7 +6136,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "anim_update", l_anim_update }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "curve_methods", l_curve_methods }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "frame_setup", l_frame_setup }, { "frame", l_frame }, { "raycast_records", l_raycast_records }, { "sync_materials", l_sync_materials }, { "renderer_get", l_renderer_get }, { "scene_get", l_scene_get }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "uuid", l_uuid }, { "camera_methods", l_camera_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "anim_update", l_anim_update }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "curve_methods", l_curve_methods }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "frame_setup", l_frame_setup }, { "frame", l_frame }, { "raycast_records", l_raycast_records }, { "sync_materials", l_sync_materials }, { "renderer_get", l_renderer_get }, { "scene_get", l_scene_get }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "flush_kept_fn", l_flush_kept_fn }, { "uuid", l_uuid }, { "camera_methods", l_camera_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at }, { "ray_from_camera", l_ray_from_camera },
 #endif
@@ -6186,6 +6308,16 @@ void wcl_open_three_c(lua_State *L) {
     for (int i = 0; i < AU_COUNT; i++) {
         lua_pushstring(L, aunames[i]);
         aukey[i] = (TString *)lua_topointer(L, -1);
+        luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    static const char *const fknames[FKK_N] = { "layers", "_w_visible", "_w_frustumCulled", "_w_castShadow", "_w_receiveShadow",
+                                                "_w_renderOrder", "_w_matrixAutoUpdate", "_w_geometry", "_w_material", "_t3g", "_t3m",
+                                                "_w_count", "_t3count", "raycast", "isMesh", "isInstancedMesh", "isSkinnedMesh", "isLine",
+                                                "matrix", "toArray" };
+    lua_pushstring(L, "_w_raycast"); wkey_wraycast = (TString *)lua_topointer(L, -1); luaL_ref(L, LUA_REGISTRYINDEX);
+    for (int i = 0; i < FKK_N; i++) {
+        lua_pushstring(L, fknames[i]);
+        fkkey[i] = (TString *)lua_topointer(L, -1);
         luaL_ref(L, LUA_REGISTRYINDEX);
     }
     static const char *const wnames[WK_COUNT] = { "x", "y", "z", "order", "_x", "_y", "_z", "_order", "_srcq",
