@@ -1697,20 +1697,15 @@ static double cr_uniform(double x0, double x1, double x2, double x3, double tens
  * | false: CatmullRomCurve3:getPoint's arithmetic. false when Lua must run
  * it: the end cache missing or stale (Lua builds it), a point that is not
  * plain numbers, or a uniform result Lua would keep integer. */
-static int l_catmull_rom(lua_State *L) {
-    if (!lua_istable(L, 1) || !lua_isnumber(L, 5)) NO_KERNEL;
-    Table *pts = tab_at(L, 1);
-    int closed = lua_toboolean(L, 2);
-    const char *ct = lua_tostring(L, 3);
-    int mode = !ct ? -1 : !strcmp(ct, "centripetal") ? 1 : !strcmp(ct, "chordal") ? 2 : 0;
-    if (mode < 0) NO_KERNEL;
+/* CatmullRomCurve3:getPoint at t for the curve's points / closed / mode
+ * (0 uniform, 1 centripetal, 2 chordal) / tension and end cache: 1 and the
+ * point in r, or 0 when Lua must do it */
+static int cr_eval(Table *pts, int closed, int mode, double tension, double t, int t_int, Table *ecache, double r[3]) {
     lua_Integer l = (lua_Integer)luaH_getn(pts);
-    if (l < 2) NO_KERNEL;
-    int t_int = lua_isinteger(L, 5);
-    double t = lua_tonumber(L, 5);
+    if (l < 2) return 0;
     double p = (double)(l - (closed ? 0 : 1)) * t;
     double fl = floor(p);
-    if (!(fl > -1e15 && fl < 1e15)) NO_KERNEL;
+    if (!(fl > -1e15 && fl < 1e15)) return 0;
     lua_Integer intPoint = (lua_Integer)fl;
     double weight = p - (double)intPoint;
     int weight_int = t_int;
@@ -1722,26 +1717,23 @@ static int l_catmull_rom(lua_State *L) {
         weight_int = 1;
     }
     double p0[3], p1[3], p2[3], p3[3];
-    Table *cache = NULL;
     int need_lo = !(closed || intPoint > 0), need_hi = !(closed || intPoint + 2 < l);
     if (need_lo || need_hi) {
-        cache = lua_istable(L, 6) ? tab_at(L, 6) : NULL;
-        if (!cache) NO_KERNEL;
-        const TValue *cn = luaH_getshortstr(cache, anim_key[AK_N]);
-        if (!ttisinteger(cn) || ivalue(cn) != l) NO_KERNEL;
+        if (!ecache) return 0;
+        const TValue *cn = luaH_getshortstr(ecache, anim_key[AK_N]);
+        if (!ttisinteger(cn) || ivalue(cn) != l) return 0;
     }
     if (need_lo) {
-        Table *lo = tv_tab(luaH_getshortstr(cache, anim_key[AK_LO]));
-        if (!lo) NO_KERNEL;
-        for (int k = 0; k < 3; k++) if (!tv_dbl(luaH_getshortstr(lo, fkey[FK_X + k]), &p0[k])) NO_KERNEL;
-    } else if (!point3(pts, lua_imod(intPoint - 1, l) + 1, p0)) NO_KERNEL;
-    if (!point3(pts, lua_imod(intPoint, l) + 1, p1) || !point3(pts, lua_imod(intPoint + 1, l) + 1, p2)) NO_KERNEL;
+        Table *lo = tv_tab(luaH_getshortstr(ecache, anim_key[AK_LO]));
+        if (!lo) return 0;
+        for (int k = 0; k < 3; k++) if (!tv_dbl(luaH_getshortstr(lo, fkey[FK_X + k]), &p0[k])) return 0;
+    } else if (!point3(pts, lua_imod(intPoint - 1, l) + 1, p0)) return 0;
+    if (!point3(pts, lua_imod(intPoint, l) + 1, p1) || !point3(pts, lua_imod(intPoint + 1, l) + 1, p2)) return 0;
     if (need_hi) {
-        Table *hi = tv_tab(luaH_getshortstr(cache, anim_key[AK_HI]));
-        if (!hi) NO_KERNEL;
-        for (int k = 0; k < 3; k++) if (!tv_dbl(luaH_getshortstr(hi, fkey[FK_X + k]), &p3[k])) NO_KERNEL;
-    } else if (!point3(pts, lua_imod(intPoint + 2, l) + 1, p3)) NO_KERNEL;
-    double r[3];
+        Table *hi = tv_tab(luaH_getshortstr(ecache, anim_key[AK_HI]));
+        if (!hi) return 0;
+        for (int k = 0; k < 3; k++) if (!tv_dbl(luaH_getshortstr(hi, fkey[FK_X + k]), &p3[k])) return 0;
+    } else if (!point3(pts, lua_imod(intPoint + 2, l) + 1, p3)) return 0;
     if (mode) {
         double pw = mode == 2 ? 0.5 : 0.25;
         double e1x = p1[0] - p2[0], e1y = p1[1] - p2[1], e1z = p1[2] - p2[2];
@@ -1756,12 +1748,63 @@ static int l_catmull_rom(lua_State *L) {
         double r0 = 1 / dt0, r1 = 1 / dt1, r2 = 1 / dt2, r01 = 1 / (dt0 + dt1), r12 = 1 / (dt1 + dt2);
         for (int k = 0; k < 3; k++) r[k] = cr_nonuniform(p0[k], p1[k], p2[k], p3[k], r0, r1, r2, r01, r12, dt1, weight);
     } else {
-        if (weight_int) NO_KERNEL;   /* integer points and tension could stay integers */
-        double tension = lua_isnumber(L, 4) ? lua_tonumber(L, 4) : 0.5;
+        if (weight_int) return 0;   /* integer points and tension could stay integers */
         for (int k = 0; k < 3; k++) r[k] = cr_uniform(p0[k], p1[k], p2[k], p3[k], tension, weight);
     }
+    return 1;
+}
+static int cr_mode(lua_State *L, int idx) {
+    const char *ct = lua_tostring(L, idx);
+    return !ct ? -1 : !strcmp(ct, "centripetal") ? 1 : !strcmp(ct, "chordal") ? 2 : 0;
+}
+
+static int l_catmull_rom(lua_State *L) {
+    if (!lua_istable(L, 1) || !lua_isnumber(L, 5)) NO_KERNEL;
+    int mode = cr_mode(L, 3);
+    if (mode < 0) NO_KERNEL;
+    double tension = lua_isnumber(L, 4) ? lua_tonumber(L, 4) : 0.5;
+    double r[3];
+    if (!cr_eval(tab_at(L, 1), lua_toboolean(L, 2), mode, tension, lua_tonumber(L, 5), lua_isinteger(L, 5),
+                 lua_istable(L, 6) ? tab_at(L, 6) : NULL, r)) NO_KERNEL;
     lua_pushnumber(L, r[0]); lua_pushnumber(L, r[1]); lua_pushnumber(L, r[2]);
     return 3;
+}
+
+/* t3.cr_lengths(points, closed, curveType, tension, endCache, divisions,
+ * cache) -> true | false: Curve:getLengths for a CatmullRomCurve3, the
+ * cumulative distances between getPoint(p / divisions) written into
+ * cache[1 .. divisions + 1] (cache[1] the integer 0, as Lua sets it) */
+static int l_cr_lengths(lua_State *L) {
+    if (!lua_istable(L, 1) || !lua_istable(L, 7)) NO_KERNEL;
+    int mode = cr_mode(L, 3);
+    if (mode < 0) NO_KERNEL;
+    double tension = lua_isnumber(L, 4) ? lua_tonumber(L, 4) : 0.5;
+    Table *pts = tab_at(L, 1), *ec = lua_istable(L, 5) ? tab_at(L, 5) : NULL;
+    int closed = lua_toboolean(L, 2);
+    lua_Integer div = luaL_checkinteger(L, 6);
+    if (div < 1 || div > (1 << 20)) NO_KERNEL;
+    double *sums = (double *)malloc(sizeof(double) * (size_t)div);
+    if (!sums) NO_KERNEL;
+    double prev[3], cur[3];
+    if (!cr_eval(pts, closed, mode, tension, 0, 1, ec, prev)) { free(sums); NO_KERNEL; }   /* getPoint(0) */
+    double sum = 0;
+    for (lua_Integer p = 1; p <= div; p++) {
+        if (!cr_eval(pts, closed, mode, tension, (double)p / (double)div, 0, ec, cur)) { free(sums); NO_KERNEL; }
+        double dx = cur[0] - prev[0], dy = cur[1] - prev[1], dz = cur[2] - prev[2];
+        sum = sum + sqrt(dx * dx + dy * dy + dz * dz);
+        sums[p - 1] = sum;
+        memcpy(prev, cur, sizeof prev);
+    }
+    lua_settop(L, 7);
+    lua_pushinteger(L, 0);
+    lua_rawseti(L, 7, 1);
+    for (lua_Integer p = 1; p <= div; p++) {
+        lua_pushnumber(L, sums[p - 1]);
+        lua_rawseti(L, 7, p + 1);
+    }
+    free(sums);
+    lua_pushboolean(L, 1);
+    return 1;
 }
 
 /* t3.bezier3(t, v0, v1, v2, v3, dims) -> x, y[, z] | false: the cubic
@@ -1788,6 +1831,84 @@ static int l_bezier3(lua_State *L) {
     if (num_bail) NO_KERNEL;
     for (int d = 0; d < dims; d++) push_num(L, r[d]);
     return dims;
+}
+
+/* t3.ellipse(curve, t) -> x, y | false: EllipseCurve:getPoint's arithmetic
+ * on the curve's aX aY xRadius yRadius aStartAngle aEndAngle aClockwise
+ * aRotation (every result a float in Lua too) */
+enum { EK_AX, EK_AY, EK_XR, EK_YR, EK_AS, EK_AE, EK_CW, EK_ROT, EK_COUNT };
+static TString *ekey[EK_COUNT];
+static int l_ellipse(lua_State *L) {
+    if (!lua_istable(L, 1) || !lua_isnumber(L, 2)) NO_KERNEL;
+    Table *c = tab_at(L, 1);
+    double f[EK_COUNT];
+    for (int k = 0; k < EK_COUNT; k++) {
+        if (k == EK_CW) continue;
+        if (!tv_dbl(luaH_getshortstr(c, ekey[k]), &f[k])) NO_KERNEL;
+    }
+    int clockwise = !l_isfalse(luaH_getshortstr(c, ekey[EK_CW]));
+    double t = lua_tonumber(L, 2);
+    double twoPi = L_PI * 2;
+    double deltaAngle = f[EK_AE] - f[EK_AS];
+    if (!isfinite(deltaAngle)) NO_KERNEL;   /* Lua's while loops would not end on inf */
+    int samePoints = fabs(deltaAngle) < 1e-10;
+    while (deltaAngle < 0) deltaAngle = deltaAngle + twoPi;
+    while (deltaAngle > twoPi) deltaAngle = deltaAngle - twoPi;
+    if (deltaAngle < 1e-10) deltaAngle = samePoints ? 0 : twoPi;
+    if (clockwise && !samePoints) deltaAngle = (deltaAngle == twoPi) ? -twoPi : (deltaAngle - twoPi);
+    double angle = f[EK_AS] + t * deltaAngle;
+    double x = f[EK_AX] + f[EK_XR] * cos(angle);
+    double y = f[EK_AY] + f[EK_YR] * sin(angle);
+    if (f[EK_ROT] != 0) {
+        double cs = cos(f[EK_ROT]), sn = sin(f[EK_ROT]);
+        double tx = x - f[EK_AX], ty = y - f[EK_AY];
+        x = tx * cs - ty * sn + f[EK_AX];
+        y = tx * sn + ty * cs + f[EK_AY];
+    }
+    lua_pushnumber(L, x);
+    lua_pushnumber(L, y);
+    return 2;
+}
+
+/* t3.u_to_t(arcLengths, u, distance|nil) -> t | false: getUtoTmapping's
+ * search and interpolation over a cumulative-length table */
+static int l_u_to_t(lua_State *L) {
+    if (!lua_istable(L, 1)) NO_KERNEL;
+    Table *a = tab_at(L, 1);
+    lua_Integer il = (lua_Integer)luaH_getn(a);
+    if (il < 1) NO_KERNEL;
+    double last;
+    if (!tv_dbl(tab_geti(a, (int)il), &last)) NO_KERNEL;
+    double target;
+    if (!lua_isnoneornil(L, 3) && lua_toboolean(L, 3)) {
+        if (!lua_isnumber(L, 3)) NO_KERNEL;
+        target = lua_tonumber(L, 3);
+    } else {
+        if (!lua_isnumber(L, 2)) NO_KERNEL;
+        target = lua_tonumber(L, 2) * last;
+    }
+    lua_Integer low = 1, high = il, i = 1;
+    while (low <= high) {
+        i = (lua_Integer)floor((double)low + (double)(high - low) / 2);
+        double ai;
+        if (!tv_dbl(tab_geti(a, (int)i), &ai)) NO_KERNEL;
+        double comparison = ai - target;
+        if (comparison < 0) low = i + 1;
+        else if (comparison > 0) high = i - 1;
+        else { high = i; break; }
+    }
+    i = high;
+    if (i < 1) i = 1;
+    double before;
+    if (!tv_dbl(tab_geti(a, (int)i), &before)) NO_KERNEL;
+    if (before == target) { lua_pushnumber(L, (double)(i - 1) / (double)(il - 1)); return 1; }
+    double after = before;
+    const TValue *nx = tab_geti(a, (int)(i + 1));
+    if (!ttisnil(nx) && !tv_dbl(nx, &after)) NO_KERNEL;
+    double seg = after - before;
+    double frac = seg == 0 ? 0 : (target - before) / seg;
+    lua_pushnumber(L, ((double)(i - 1) + frac) / (double)(il - 1));
+    return 1;
 }
 
 /* t3.quat_from_euler(x, y, z, order) -> qx, qy, qz, qw (double precision) */
@@ -2662,7 +2783,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "anim_register_more", l_anim_register_more }, { "deindex", l_deindex }, { "gen_sphere", l_gen_sphere }, { "gen_torus", l_gen_torus }, { "catmull_rom", l_catmull_rom }, { "bezier3", l_bezier3 }, { "gen_torus_knot", l_gen_torus_knot }, { "gen_cylinder", l_gen_cylinder }, { "gen_box", l_gen_box }, { "gen_polyhedron", l_gen_polyhedron }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "anim_register_more", l_anim_register_more }, { "deindex", l_deindex }, { "gen_sphere", l_gen_sphere }, { "gen_torus", l_gen_torus }, { "catmull_rom", l_catmull_rom }, { "cr_lengths", l_cr_lengths }, { "bezier3", l_bezier3 }, { "ellipse", l_ellipse }, { "u_to_t", l_u_to_t }, { "gen_torus_knot", l_gen_torus_knot }, { "gen_cylinder", l_gen_cylinder }, { "gen_box", l_gen_box }, { "gen_polyhedron", l_gen_polyhedron }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
     { "matrix", l_matrix },
     { "world", l_world }, { "local_matrix", l_local }, { "camera_matrices", l_camera_matrices },
     { "update_world", l_update_world }, { "update_world_matrix", l_update_world_matrix },
@@ -2714,6 +2835,13 @@ void wcl_open_three_c(lua_State *L) {
     for (int i = 0; i < FK_COUNT; i++) {
         lua_pushstring(L, fnames[i]);
         fkey[i] = (TString *)lua_topointer(L, -1);
+        luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    static const char *const enames[EK_COUNT] = { "aX", "aY", "xRadius", "yRadius", "aStartAngle", "aEndAngle",
+                                                  "aClockwise", "aRotation" };
+    for (int i = 0; i < EK_COUNT; i++) {
+        lua_pushstring(L, enames[i]);
+        ekey[i] = (TString *)lua_topointer(L, -1);
         luaL_ref(L, LUA_REGISTRYINDEX);
     }
     luaL_newmetatable(L, HANDLE_MT);
