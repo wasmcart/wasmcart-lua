@@ -2622,6 +2622,7 @@ enum { TK_MAP, TK_NORMAL, TK_AO, TK_EMISSIVE, TK_ROUGH, TK_METAL, TK_ALPHA, TK_N
        TK_ENC, TK_OFFSET, TK_REPEAT, TK_CENTER, TK_ROT, TK_ANISO, TK_COUNT };
 static TString *tkey[TK_COUNT], *tkey_hidden[TK_NMAPS];
 static int sync_texture_c(Table *tex);
+static const TValue *obj_get(lua_State *L, Table *o, TString *k, TString *hidden);
 static void fill(lua_State *L, int t, const float *e, int n);
 static void fill_d(lua_State *L, int t, const double *e, int n);
 /* rec[7] = true and onto the dirty list, unless it is there already */
@@ -3239,7 +3240,10 @@ static void push_other(t3_object *o, void *p) {
  * distance, world point xyz, local point xyz, faceIndex, a, b, c,
  * materialIndex. others gets the objects three.c left to Lua (their own
  * raycast), in traversal order. */
-static int l_raycast(lua_State *L) {
+/* the ray and the roots from the arguments (1..11), the cast; the hits and
+ * the objects handed back (pushed into others_idx). 0 when some object in
+ * the list has no twin. */
+static int raycast_run(lua_State *L, int others_idx, const t3_intersection **hits, int *nh, int *nothers) {
     if (!g_rc) g_rc = t3_raycaster_new();
     t3_raycaster_set(g_rc, t3_v3(F(1), F(2), F(3)), t3_v3(F(4), F(5), F(6)));
     g_rc->near = F(7);
@@ -3256,7 +3260,7 @@ static int l_raycast(lua_State *L) {
         Table *o = tv_tab(tab_geti(objs, i + 1));
         const TValue *h = o ? luaH_getshortstr(o, key_t3) : NULL;
         tmp[i] = h ? (t3_object *)tv_handle(h) : NULL;
-        if (!tmp[i]) { free(tmp); lua_pushnil(L); return 1; }
+        if (!tmp[i]) { free(tmp); return 0; }
     }
     if (n != g_roots_n || memcmp(tmp, g_roots, sizeof(*tmp) * (size_t)n)) {
         free(g_roots);
@@ -3265,9 +3269,15 @@ static int l_raycast(lua_State *L) {
     } else {
         free(tmp);
     }
-    other_ctx ctx = { L, 13, 0 };
+    other_ctx ctx = { L, others_idx, 0 };
+    *nh = t3_raycaster_intersect_objects_ex(g_rc, g_roots, n, recursive, hits, push_other, &ctx);
+    *nothers = ctx.n;
+    return 1;
+}
+static int l_raycast(lua_State *L) {
     const t3_intersection *hits;
-    int nh = t3_raycaster_intersect_objects_ex(g_rc, g_roots, n, recursive, &hits, push_other, &ctx);
+    int nh, no;
+    if (!raycast_run(L, 13, &hits, &nh, &no)) { lua_pushnil(L); return 1; }
     for (int k = 0; k < nh; k++) {
         const t3_intersection *h = &hits[k];
         int b = k * 13;
@@ -3289,8 +3299,157 @@ static int l_raycast(lua_State *L) {
         lua_pushinteger(L, h->material_index); lua_rawseti(L, 12, b + 13);
     }
     lua_pushinteger(L, nh);
-    lua_pushinteger(L, ctx.n);
+    lua_pushinteger(L, no);
     return 2;
+}
+/* t3.raycast_records(ox,oy,oz, dx,dy,dz, near, far, layers, objects,
+ * recursive, intersects, others, byPtr, Vector3, Vector2) -> hits, others
+ *   | nil (something is not as this expects: Lua builds the records)
+ * The cast as t3.raycast, and the intersection records three.lua's
+ * B.raycast would build appended to intersects: distance, point, object,
+ * faceIndex, face { a, b, c, normal, materialIndex }, uv and uv2 when the
+ * geometry has them; the face normal and the uvs with Lua's arithmetic on
+ * the attribute arrays (integer-valued where Lua's would be). */
+enum { HK_GEOMETRY, HK_WGEOMETRY, HK_ATTRIBUTES, HK_POSITION, HK_UV, HK_UV2, HK_ARRAY, HK_ITEMSIZE, HK_DISTANCE, HK_POINT,
+       HK_OBJECT, HK_FACEINDEX, HK_FACE, HK_A, HK_B, HK_C, HK_NORMAL, HK_MATERIALINDEX, HK_COUNT };
+static TString *hkey[HK_COUNT];
+static int tv_nt(const TValue *v, num_t *o) {
+    if (ttisfloat(v)) { *o = nflt(fltvalue(v)); return 1; }
+    if (ttisinteger(v)) { *o = nint((double)ivalue(v)); return 1; }
+    return 0;
+}
+typedef struct { Table *array; int item_size; } attr_t;
+static int attr_of(Table *attrs, int k, attr_t *out) {
+    Table *a = tv_tab(luaH_getshortstr(attrs, hkey[k]));
+    if (!a) return 0;
+    out->array = tv_tab(luaH_getshortstr(a, hkey[HK_ARRAY]));
+    const TValue *is = luaH_getshortstr(a, hkey[HK_ITEMSIZE]);
+    if (!out->array || !ttisinteger(is)) return -1;
+    out->item_size = (int)ivalue(is);
+    return 1;
+}
+static int attr_read(const attr_t *a, uint32_t i, int n, num_t *out) {
+    for (int d = 0; d < n; d++) if (!tv_nt(tab_geti(a->array, (int)(i * (uint32_t)a->item_size) + d + 1), &out[d])) return 0;
+    return 1;
+}
+typedef struct {
+    Table *object;
+    num_t normal[3], uv[2], uv2[2];
+    int has_uv, has_uv2;
+} hit_rec_t;
+static void push_vec(lua_State *L, int cls_idx, const num_t *v, int n) {
+    lua_createtable(L, 0, n);
+    for (int d = 0; d < n; d++) { push_num(L, v[d]); lua_setfield(L, -2, getstr(fkey[FK_X + d])); }
+    lua_pushvalue(L, cls_idx);
+    lua_setmetatable(L, -2);
+}
+static int l_raycast_records(lua_State *L) {
+    lua_settop(L, 16);
+    const t3_intersection *hits;
+    int nh, no;
+    if (!lua_istable(L, 12) || !lua_istable(L, 13) || !lua_istable(L, 14) || !lua_istable(L, 15) || !lua_istable(L, 16)) { lua_pushnil(L); return 1; }
+    if (!raycast_run(L, 13, &hits, &nh, &no)) { lua_pushnil(L); return 1; }
+    Table *by = tab_at(L, 14);
+    hit_rec_t *recs = (hit_rec_t *)calloc((size_t)(nh > 0 ? nh : 1), sizeof(*recs));
+    num_bail = 0;
+    for (int k = 0; k < nh; k++) {
+        const t3_intersection *h = &hits[k];
+        TValue key;
+        setpvalue(&key, h->object);
+        Table *o = tv_tab(luaH_get(by, &key));
+        recs[k].object = o;
+        if (!o) continue;   /* Lua skips a hit whose object is gone */
+        const TValue *gv = obj_get(L, o, hkey[HK_GEOMETRY], hkey[HK_WGEOMETRY]);
+        Table *g = gv ? tv_tab(gv) : NULL;
+        Table *attrs = g ? tv_tab(luaH_getshortstr(g, hkey[HK_ATTRIBUTES])) : NULL;
+        attr_t pos, uv, uv2;
+        if (!attrs || attr_of(attrs, HK_POSITION, &pos) != 1) goto bail;
+        int hu = attr_of(attrs, HK_UV, &uv), hu2 = attr_of(attrs, HK_UV2, &uv2);
+        if (hu < 0 || hu2 < 0) goto bail;
+        num_t va[3], vb[3], vc[3];
+        if (!attr_read(&pos, h->a, 3, va) || !attr_read(&pos, h->b, 3, vb) || !attr_read(&pos, h->c, 3, vc)) goto bail;
+        /* Triangle.getNormal(a, b, c): t = c - b, v0 = a - b, t = t x v0, normalized */
+        num_t t[3], v0[3];
+        for (int d = 0; d < 3; d++) { t[d] = nsub(vc[d], vb[d]); v0[d] = nsub(va[d], vb[d]); }
+        num_t cx = nsub(nmul(t[1], v0[2]), nmul(t[2], v0[1]));
+        num_t cy = nsub(nmul(t[2], v0[0]), nmul(t[0], v0[2]));
+        num_t cz = nsub(nmul(t[0], v0[1]), nmul(t[1], v0[0]));
+        num_t lsq = nadd(nadd(nmul(cx, cx), nmul(cy, cy)), nmul(cz, cz));
+        if (lsq.d > 0) {
+            num_t s = nflt(1 / sqrt(lsq.d));
+            recs[k].normal[0] = nmul(cx, s); recs[k].normal[1] = nmul(cy, s); recs[k].normal[2] = nmul(cz, s);
+        } else { recs[k].normal[0] = nint(0); recs[k].normal[1] = nint(0); recs[k].normal[2] = nint(0); }
+        if (hu || hu2) {
+            /* Triangle.getBarycoord(localPoint, a, b, c) */
+            t3_mat4 inv;
+            t3_mat4_invert(&inv, &h->object->matrix_world);
+            t3_vec3 lp = t3_vec3_apply_mat4(h->point, &inv);
+            num_t p[3] = { nflt(lp.x), nflt(lp.y), nflt(lp.z) };
+            num_t e0[3], e1[3], e2[3];
+            for (int d = 0; d < 3; d++) { e0[d] = nsub(vc[d], va[d]); e1[d] = nsub(vb[d], va[d]); e2[d] = nsub(p[d], va[d]); }
+#define DOT(x, y) nadd(nadd(nmul(x[0], y[0]), nmul(x[1], y[1])), nmul(x[2], y[2]))
+            num_t d00 = DOT(e0, e0), d01 = DOT(e0, e1), d02 = DOT(e0, e2), d11 = DOT(e1, e1), d12 = DOT(e1, e2);
+#undef DOT
+            num_t denom = nsub(nmul(d00, d11), nmul(d01, d01));
+            num_t bary[3];
+            if (denom.d == 0) { bary[0] = nint(-2); bary[1] = nint(-1); bary[2] = nint(-1); }
+            else {
+                num_t inv_d = nflt(1 / denom.d);
+                num_t u = nmul(nsub(nmul(d11, d02), nmul(d01, d12)), inv_d);
+                num_t v = nmul(nsub(nmul(d00, d12), nmul(d01, d02)), inv_d);
+                bary[0] = nsub(nsub(nint(1), u), v); bary[1] = v; bary[2] = u;
+            }
+            for (int which = 0; which < 2; which++) {
+                const attr_t *at = which ? &uv2 : &uv;
+                if (!(which ? hu2 : hu)) continue;
+                num_t u1[2], u2[2], u3[2];
+                if (!attr_read(at, h->a, 2, u1) || !attr_read(at, h->b, 2, u2) || !attr_read(at, h->c, 2, u3)) goto bail;
+                num_t *out = which ? recs[k].uv2 : recs[k].uv;
+                for (int d = 0; d < 2; d++) {
+                    num_t acc = nint(0);
+                    acc = nadd(acc, nmul(u1[d], bary[0]));
+                    acc = nadd(acc, nmul(u2[d], bary[1]));
+                    acc = nadd(acc, nmul(u3[d], bary[2]));
+                    out[d] = acc;
+                }
+                if (which) recs[k].has_uv2 = 1; else recs[k].has_uv = 1;
+            }
+        }
+    }
+    if (num_bail) goto bail;
+    {
+        lua_Integer n = (lua_Integer)lua_rawlen(L, 12);
+        for (int k = 0; k < nh; k++) {
+            const t3_intersection *h = &hits[k];
+            if (!recs[k].object) continue;
+            lua_createtable(L, 0, 7);
+            lua_pushnumber(L, h->distance); lua_setfield(L, -2, getstr(hkey[HK_DISTANCE]));
+            num_t pt[3] = { nflt(h->point.x), nflt(h->point.y), nflt(h->point.z) };
+            push_vec(L, 15, pt, 3); lua_setfield(L, -2, getstr(hkey[HK_POINT]));
+            sethvalue2s(L, L->top.p, recs[k].object); L->top.p++; lua_setfield(L, -2, getstr(hkey[HK_OBJECT]));
+            lua_pushinteger(L, h->face_index); lua_setfield(L, -2, getstr(hkey[HK_FACEINDEX]));
+            lua_createtable(L, 0, 5);
+            lua_pushinteger(L, h->a); lua_setfield(L, -2, getstr(hkey[HK_A]));
+            lua_pushinteger(L, h->b); lua_setfield(L, -2, getstr(hkey[HK_B]));
+            lua_pushinteger(L, h->c); lua_setfield(L, -2, getstr(hkey[HK_C]));
+            push_vec(L, 15, recs[k].normal, 3); lua_setfield(L, -2, getstr(hkey[HK_NORMAL]));
+            lua_pushinteger(L, h->material_index); lua_setfield(L, -2, getstr(hkey[HK_MATERIALINDEX]));
+            lua_setfield(L, -2, getstr(hkey[HK_FACE]));
+            if (recs[k].has_uv) { push_vec(L, 16, recs[k].uv, 2); lua_setfield(L, -2, getstr(hkey[HK_UV])); }
+            if (recs[k].has_uv2) { push_vec(L, 16, recs[k].uv2, 2); lua_setfield(L, -2, getstr(hkey[HK_UV2])); }
+            lua_rawseti(L, 12, ++n);
+        }
+    }
+    free(recs);
+    lua_pushinteger(L, nh);
+    lua_pushinteger(L, no);
+    return 2;
+bail:
+    free(recs);
+    /* the others already pushed into the list: cleared, Lua redoes the cast */
+    for (int i = 1; i <= no; i++) { lua_pushnil(L); lua_rawseti(L, 13, i); }
+    lua_pushnil(L);
+    return 1;
 }
 
 /* t3.visible(h, visible) */
@@ -5067,7 +5226,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "frame_setup", l_frame_setup }, { "sync_materials", l_sync_materials }, { "renderer_get", l_renderer_get }, { "scene_get", l_scene_get }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "frame_setup", l_frame_setup }, { "raycast_records", l_raycast_records }, { "sync_materials", l_sync_materials }, { "renderer_get", l_renderer_get }, { "scene_get", l_scene_get }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at }, { "ray_from_camera", l_ray_from_camera },
 #endif
@@ -5194,6 +5353,14 @@ void wcl_open_three_c(lua_State *L) {
     for (int i = 0; i < TK_NMAPS; i++) {
         lua_pushfstring(L, "_t3%s", tnames[i]);
         tkey_bound[i] = (TString *)lua_topointer(L, -1);
+        luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    static const char *const hnames[HK_COUNT] = { "geometry", "_w_geometry", "attributes", "position", "uv", "uv2", "array",
+                                                  "itemSize", "distance", "point", "object", "faceIndex", "face", "a", "b", "c",
+                                                  "normal", "materialIndex" };
+    for (int i = 0; i < HK_COUNT; i++) {
+        lua_pushstring(L, hnames[i]);
+        hkey[i] = (TString *)lua_topointer(L, -1);
         luaL_ref(L, LUA_REGISTRYINDEX);
     }
     static const char *const wnames[WK_COUNT] = { "x", "y", "z", "order", "_x", "_y", "_z", "_order", "_srcq",
