@@ -4151,24 +4151,128 @@ static int l_tex_update_image(lua_State *L) {
 
 /* t3.tex_set(h, wrapS, wrapT, magFilter, minFilter, flipY, generateMipmaps,
  *            encoding, offx, offy, repx, repy, cx, cy, rotation, anisotropy) */
-static int l_tex_set(lua_State *L) {
-    t3_texture *t = (t3_texture *)P(L, 1);
-    t3_wrapping ws = (t3_wrapping)I(2), wt = (t3_wrapping)I(3);
-    t3_filter mag = (t3_filter)I(4), min = (t3_filter)I(5);
-    bool fy = B(6), gm = B(7);
-    t3_encoding enc = (t3_encoding)I(8);
-    if (t->wrap_s != ws || t->wrap_t != wt || t->mag_filter != mag || t->min_filter != min || t->flip_y != fy ||
-        t->generate_mipmaps != gm || t->encoding != enc) {
-        t->wrap_s = ws; t->wrap_t = wt; t->mag_filter = mag; t->min_filter = min;
-        t->flip_y = fy; t->generate_mipmaps = gm; t->encoding = enc;
+static void tex_apply(t3_texture *t, int ws, int wt, int mag, int min, bool fy, bool gm, int enc,
+                      float ox, float oy, float rx, float ry, float cx, float cy, float rot, float aniso, int has_aniso) {
+    if (t->wrap_s != (t3_wrapping)ws || t->wrap_t != (t3_wrapping)wt || t->mag_filter != (t3_filter)mag
+        || t->min_filter != (t3_filter)min || t->flip_y != fy || t->generate_mipmaps != gm || t->encoding != (t3_encoding)enc) {
+        t->wrap_s = (t3_wrapping)ws; t->wrap_t = (t3_wrapping)wt; t->mag_filter = (t3_filter)mag; t->min_filter = (t3_filter)min;
+        t->flip_y = fy; t->generate_mipmaps = gm; t->encoding = (t3_encoding)enc;
         t->version++;
     }
-    t->offset.x = F(9); t->offset.y = F(10);
-    t->repeat.x = F(11); t->repeat.y = F(12);
-    t->center.x = F(13); t->center.y = F(14);
-    t->rotation = F(15);
-    if (!lua_isnoneornil(L, 16)) t->anisotropy = F(16);
+    t->offset.x = ox; t->offset.y = oy;
+    t->repeat.x = rx; t->repeat.y = ry;
+    t->center.x = cx; t->center.y = cy;
+    t->rotation = rot;
+    if (has_aniso) t->anisotropy = aniso;
+}
+static int l_tex_set(lua_State *L) {
+    tex_apply((t3_texture *)P(L, 1), I(2), I(3), I(4), I(5), B(6), B(7), I(8), F(9), F(10), F(11), F(12), F(13), F(14), F(15),
+              F(16), !lua_isnoneornil(L, 16));
     return 0;
+}
+/* t3.tex_get(h): wrapS, wrapT, magFilter, minFilter, flipY, generateMipmaps,
+ * encoding, offset x y, repeat x y, center x y, rotation, anisotropy,
+ * version (for checking a sync) */
+static int l_tex_get(lua_State *L) {
+    t3_texture *t = (t3_texture *)P(L, 1);
+    lua_pushinteger(L, t->wrap_s); lua_pushinteger(L, t->wrap_t); lua_pushinteger(L, t->mag_filter); lua_pushinteger(L, t->min_filter);
+    lua_pushboolean(L, t->flip_y); lua_pushboolean(L, t->generate_mipmaps); lua_pushinteger(L, t->encoding);
+    lua_pushnumber(L, t->offset.x); lua_pushnumber(L, t->offset.y); lua_pushnumber(L, t->repeat.x); lua_pushnumber(L, t->repeat.y);
+    lua_pushnumber(L, t->center.x); lua_pushnumber(L, t->center.y); lua_pushnumber(L, t->rotation); lua_pushnumber(L, t->anisotropy);
+    lua_pushinteger(L, t->version);
+    return 16;
+}
+/* t3.sync_textures(mapped, viaLua): the per-frame part of three.lua's
+ * syncTexture for every map of every mapped material (the sampling
+ * parameters and the transform to the twin), reading the texture's fields
+ * as Lua does; a texture without a twin, with a new version, or with a
+ * field missing goes to viaLua(tex). */
+enum { TK_MAP, TK_NORMAL, TK_AO, TK_EMISSIVE, TK_ROUGH, TK_METAL, TK_ALPHA, TK_NMAPS,
+       TK_T3 = TK_NMAPS, TK_VERSION, TK_T3VER, TK_WRAPS, TK_WRAPT, TK_MAG, TK_MIN, TK_FLIPY, TK_ISDATA, TK_MIPS,
+       TK_ENC, TK_OFFSET, TK_REPEAT, TK_CENTER, TK_ROT, TK_ANISO, TK_COUNT };
+static TString *tkey[TK_COUNT], *tkey_hidden[TK_NMAPS];
+/* a field: 1 and its number (`v or def` when nil / false), 0 when missing */
+static int tk_num(Table *t, int k, double def, double *out) {
+    const TValue *v = luaH_getshortstr(t, tkey[k]);
+    if (isempty(v)) return 0;
+    *out = l_isfalse(v) ? def : tv_num(v);
+    return 1;
+}
+static int tk_vec2(Table *t, int k, double dx, double dy, double *x, double *y) {
+    const TValue *v = luaH_getshortstr(t, tkey[k]);
+    if (isempty(v)) return 0;
+    Table *vt = tv_tab(v);
+    if (!vt) { *x = dx; *y = dy; return 1; }
+    *x = tv_num(luaH_getshortstr(vt, fkey[FK_X])); *y = tv_num(luaH_getshortstr(vt, fkey[FK_Y]));
+    return 1;
+}
+static int sync_texture_c(Table *tex) {
+    t3_texture *t = (t3_texture *)tv_handle(luaH_getshortstr(tex, tkey[TK_T3]));
+    if (!t) return 0;
+    const TValue *vv = luaH_getshortstr(tex, tkey[TK_VERSION]);
+    double v = (isempty(vv) || l_isfalse(vv)) ? 0 : tv_num(vv);
+    const TValue *sv = luaH_getshortstr(tex, tkey[TK_T3VER]);
+    if (isempty(sv) || !(ttisnumber(sv)) || tv_num(sv) != v) return 0;
+    double ws, wt, mag, min, enc, rot, aniso, ox, oy, rx, ry, cx, cy;
+    if (!tk_num(tex, TK_WRAPS, 1001, &ws) || !tk_num(tex, TK_WRAPT, 1001, &wt) || !tk_num(tex, TK_MAG, 1006, &mag)
+        || !tk_num(tex, TK_MIN, 1008, &min) || !tk_num(tex, TK_ENC, 3000, &enc) || !tk_num(tex, TK_ROT, 0, &rot)
+        || !tk_num(tex, TK_ANISO, 1, &aniso)) return 0;
+    if (!tk_vec2(tex, TK_OFFSET, 0, 0, &ox, &oy) || !tk_vec2(tex, TK_REPEAT, 1, 1, &rx, &ry)
+        || !tk_vec2(tex, TK_CENTER, 0, 0, &cx, &cy)) return 0;
+    const TValue *fy = luaH_getshortstr(tex, tkey[TK_FLIPY]), *gm = luaH_getshortstr(tex, tkey[TK_MIPS]);
+    if (isempty(fy) || isempty(gm)) return 0;
+    int isdata = tv_true(luaH_getshortstr(tex, tkey[TK_ISDATA]));
+    tex_apply(t, lk_int(ws), lk_int(wt), lk_int(mag), lk_int(min), !(ttisboolean(fy) && l_isfalse(fy)) && !isdata,
+              !(ttisboolean(gm) && l_isfalse(gm)) && !isdata, lk_int(enc), (float)ox, (float)oy, (float)rx, (float)ry,
+              (float)cx, (float)cy, (float)rot, (float)aniso, 1);
+    return 1;
+}
+static int l_sync_textures(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+    lua_settop(L, 2);
+    lua_pushnil(L);
+    while (lua_next(L, 1)) {
+        lua_pop(L, 1);                      /* the key (a material) stays */
+        Table *m = lua_istable(L, -1) ? tab_at(L, -1) : NULL;
+        for (int slot = 0; m && slot < TK_NMAPS; slot++) {
+            const TValue *tv = luaH_getshortstr(m, tkey[slot]);
+            if (isempty(tv)) tv = luaH_getshortstr(m, tkey_hidden[slot]);
+            Table *tex = tv_tab(tv);
+            if (!tex || sync_texture_c(tex)) continue;
+            lua_pushvalue(L, 2);
+            sethvalue2s(L, L->top.p, tex); L->top.p++;
+            lua_call(L, 1, 0);
+        }
+    }
+    return 0;
+}
+/* t3.euler_index(fresh, Euler) -> the __index: a pending Euler brought up
+ * to date (fresh, Lua), then x y z order from the backing fields, else the
+ * class */
+static int l_euler_index(lua_State *L) {
+    Table *e = tab_at(L, 1);
+    const TValue *srcq = luaH_getshortstr(e, wkey[WK_SRCQ]);
+    if (!l_isfalse(srcq) && !isabstkey(srcq)) {
+        lua_pushvalue(L, lua_upvalueindex(1)); lua_pushvalue(L, 1); lua_call(L, 1, 0);
+        e = tab_at(L, 1);
+    }
+    const TValue *k = s2v(L->ci->func.p + 2);
+    TString *ks = ttisshrstring(k) ? tsvalue(k) : NULL;
+    int f = -1;
+    if (ks == wkey[WK_X]) f = WK_UX; else if (ks == wkey[WK_Y]) f = WK_UY;
+    else if (ks == wkey[WK_Z]) f = WK_UZ; else if (ks == wkey[WK_ORDER]) f = WK_UORDER;
+    const TValue *v = f >= 0 ? luaH_getshortstr(e, wkey[f]) : luaH_get(hvalue(UPV(2)), k);
+    if (isempty(v)) lua_pushnil(L);
+    else { setobj2s(L, L->top.p, v); L->top.p++; }
+    return 1;
+}
+static int l_make_euler_index(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    lua_settop(L, 2);
+    lua_pushcclosure(L, l_euler_index, 2);
+    return 1;
 }
 
 /* t3.tex_update(h, rgba): new pixels, same size (texture.needsUpdate) */
@@ -4453,7 +4557,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "object_methods", l_object_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at }, { "ray_from_camera", l_ray_from_camera },
 #endif
@@ -4531,6 +4635,20 @@ void wcl_open_three_c(lua_State *L) {
         lua_pushstring(L, onames[i]);
         okey[i] = (TString *)lua_topointer(L, -1);
         luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    static const char *const tnames[TK_COUNT] = { "map", "normalMap", "aoMap", "emissiveMap", "roughnessMap", "metalnessMap",
+                                                  "alphaMap", "_t3", "version", "_t3ver", "wrapS", "wrapT", "magFilter", "minFilter",
+                                                  "flipY", "isDataTexture", "generateMipmaps", "encoding", "offset", "repeat_",
+                                                  "center", "rotation", "anisotropy" };
+    for (int i = 0; i < TK_COUNT; i++) {
+        lua_pushstring(L, tnames[i]);
+        tkey[i] = (TString *)lua_topointer(L, -1);
+        luaL_ref(L, LUA_REGISTRYINDEX);
+        if (i < TK_NMAPS) {
+            lua_pushfstring(L, "_w_%s", tnames[i]);
+            tkey_hidden[i] = (TString *)lua_topointer(L, -1);
+            luaL_ref(L, LUA_REGISTRYINDEX);
+        }
     }
     static const char *const wnames[WK_COUNT] = { "x", "y", "z", "order", "_x", "_y", "_z", "_order", "_srcq",
                                                   "_onChange", "_t3cb", "_t3q", "_t3rec", "n" };
