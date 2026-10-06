@@ -1247,6 +1247,332 @@ static int l_gen_torus(lua_State *L) {
     return 4;
 }
 
+/* t3.gen_torus_knot(radius, tube, tubularSegments, radialSegments, p, q) */
+static void knot_point(double u, double radius, double p, double q, double out[3]) {
+    double cu = cos(u), su = sin(u);
+    double quOverP = q / p * u;
+    double cs = cos(quOverP);
+    out[0] = radius * (2 + cs) * 0.5 * cu;
+    out[1] = radius * (2 + cs) * su * 0.5;
+    out[2] = radius * sin(quOverP) * 0.5;
+}
+static void v3_normalize_d(double v[3]) {   /* Vector3:normalize */
+    double l = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (l == 0) return;
+    double inv = 1 / l;
+    v[0] = v[0] * inv; v[1] = v[1] * inv; v[2] = v[2] * inv;
+}
+static void v3_cross_d(double out[3], const double a[3], const double b[3]) {   /* crossVectors */
+    double ax = a[0], ay = a[1], az = a[2], bx = b[0], by = b[1], bz = b[2];
+    out[0] = ay * bz - az * by;
+    out[1] = az * bx - ax * bz;
+    out[2] = ax * by - ay * bx;
+}
+static int l_gen_torus_knot(lua_State *L) {
+    for (int i = 1; i <= 6; i++) if (!lua_isnumber(L, i)) NO_KERNEL;
+    if (!lua_isinteger(L, 3) || !lua_isinteger(L, 4)) NO_KERNEL;
+    double radius = lua_tonumber(L, 1), tube = lua_tonumber(L, 2), p = lua_tonumber(L, 5), q = lua_tonumber(L, 6);
+    lua_Integer ts = lua_tointeger(L, 3), rs = lua_tointeger(L, 4);
+    if (rs < 1 || ts < 1 || (rs + 1) * (ts + 1) > (1 << 22)) NO_KERNEL;
+    lua_Integer nv = (rs + 1) * (ts + 1);
+    double *ring = (double *)malloc(sizeof(double) * 3 * (size_t)(rs + 1));
+    if (!ring) NO_KERNEL;
+    for (lua_Integer j = 0; j <= rs; j++) {
+        double v = (double)j / (double)rs * L_PI * 2;
+        ring[j * 3] = -tube * cos(v);
+        ring[j * 3 + 1] = tube * sin(v);
+        ring[j * 3 + 2] = (double)j / (double)rs;
+    }
+    Table *ti = new_array(L, ts * rs * 6);
+    Table *tp = new_array(L, nv * 3);
+    Table *tn = new_array(L, nv * 3);
+    Table *tu = new_array(L, nv * 2);
+    TValue *P = tp->array, *N = tn->array, *U = tu->array;
+    for (lua_Integer i = 0; i <= ts; i++) {
+        double u = (double)i / (double)ts * p * L_PI * 2;
+        double P1[3], P2[3], T[3], Nv[3], B[3];
+        knot_point(u, radius, p, q, P1);
+        knot_point(u + 0.01, radius, p, q, P2);
+        T[0] = P2[0] - P1[0]; T[1] = P2[1] - P1[1]; T[2] = P2[2] - P1[2];
+        Nv[0] = P2[0] + P1[0]; Nv[1] = P2[1] + P1[1]; Nv[2] = P2[2] + P1[2];
+        v3_cross_d(B, T, Nv);
+        v3_cross_d(Nv, B, T);
+        v3_normalize_d(B);
+        v3_normalize_d(Nv);
+        double uCoord = (double)i / (double)ts;
+        for (lua_Integer j = 0; j <= rs; j++) {
+            double cx = ring[j * 3], cy = ring[j * 3 + 1];
+            double x = P1[0] + (cx * Nv[0] + cy * B[0]);
+            double y = P1[1] + (cx * Nv[1] + cy * B[1]);
+            double z = P1[2] + (cx * Nv[2] + cy * B[2]);
+            setfltvalue(P, x); setfltvalue(P + 1, y); setfltvalue(P + 2, z); P += 3;
+            double nx = x - P1[0], ny = y - P1[1], nz = z - P1[2];
+            double nl = sqrt(nx * nx + ny * ny + nz * nz);
+            if (nl == 0) nl = 1;
+            setfltvalue(N, nx / nl); setfltvalue(N + 1, ny / nl); setfltvalue(N + 2, nz / nl); N += 3;
+            setfltvalue(U, uCoord); setfltvalue(U + 1, ring[j * 3 + 2]); U += 2;
+        }
+    }
+    free(ring);
+    TValue *I = ti->array;
+    for (lua_Integer j = 1; j <= ts; j++)
+        for (lua_Integer i = 1; i <= rs; i++) {
+            lua_Integer a = (rs + 1) * (j - 1) + (i - 1), b = (rs + 1) * j + (i - 1);
+            lua_Integer c = (rs + 1) * j + i, d = (rs + 1) * (j - 1) + i;
+            setivalue(I, a); setivalue(I + 1, b); setivalue(I + 2, d);
+            setivalue(I + 3, b); setivalue(I + 4, c); setivalue(I + 5, d);
+            I += 6;
+        }
+    return 4;
+}
+
+/* t3.gen_cylinder(radiusTop, radiusBottom, height, radialSegments,
+ * heightSegments, openEnded, thetaStart, thetaLength): the torso, then the
+ * top cap (radiusTop > 0), then the bottom one (radiusBottom > 0), as
+ * three.lua emits them. Cap values that are integers in Lua (0, sign) stay
+ * integers. */
+static int l_gen_cylinder(lua_State *L) {
+    for (int i = 1; i <= 5; i++) if (!lua_isnumber(L, i)) NO_KERNEL;
+    if (!lua_isnumber(L, 7) || !lua_isnumber(L, 8)) NO_KERNEL;
+    if (!lua_isinteger(L, 4) || !lua_isinteger(L, 5)) NO_KERNEL;
+    double rt = lua_tonumber(L, 1), rb = lua_tonumber(L, 2), height = lua_tonumber(L, 3);
+    lua_Integer rs = lua_tointeger(L, 4), hs = lua_tointeger(L, 5);
+    int openEnded = lua_toboolean(L, 6);
+    double thetaStart = lua_tonumber(L, 7), thetaLength = lua_tonumber(L, 8);
+    if (rs < 1 || hs < 1 || (rs + 1) * (hs + 1) > (1 << 22)) NO_KERNEL;
+    int top = !openEnded && rt > 0, bottom = !openEnded && rb > 0;
+    lua_Integer ncap = rs + rs + 1;
+    lua_Integer nv = (rs + 1) * (hs + 1) + (top ? ncap : 0) + (bottom ? ncap : 0);
+    lua_Integer ni = rs * hs * 6 + (top ? rs * 3 : 0) + (bottom ? rs * 3 : 0);
+    double halfHeight = height / 2;
+    double slope = (rb - rt) / height;
+    Table *ti = new_array(L, ni);
+    Table *tp = new_array(L, nv * 3);
+    Table *tn = new_array(L, nv * 3);
+    Table *tu = new_array(L, nv * 2);
+    TValue *P = tp->array, *N = tn->array, *U = tu->array, *I = ti->array;
+    for (lua_Integer y = 0; y <= hs; y++) {
+        double v = (double)y / (double)hs;
+        double radius = v * (rb - rt) + rt;
+        for (lua_Integer x = 0; x <= rs; x++) {
+            double u = (double)x / (double)rs;
+            double theta = u * thetaLength + thetaStart;
+            double sinTheta = sin(theta), cosTheta = cos(theta);
+            setfltvalue(P, radius * sinTheta); setfltvalue(P + 1, -v * height + halfHeight);
+            setfltvalue(P + 2, radius * cosTheta); P += 3;
+            double n[3] = { sinTheta, slope, cosTheta };
+            v3_normalize_d(n);
+            setfltvalue(N, n[0]); setfltvalue(N + 1, n[1]); setfltvalue(N + 2, n[2]); N += 3;
+            setfltvalue(U, u); setfltvalue(U + 1, 1 - v); U += 2;
+        }
+    }
+    for (lua_Integer x = 1; x <= rs; x++)
+        for (lua_Integer y = 1; y <= hs; y++) {
+            /* indexArray[y][x] = (y - 1) * (rs + 1) + x - 1 */
+            lua_Integer a = (y - 1) * (rs + 1) + x - 1, b = y * (rs + 1) + x - 1;
+            lua_Integer c = y * (rs + 1) + x, d = (y - 1) * (rs + 1) + x;
+            setivalue(I, a); setivalue(I + 1, b); setivalue(I + 2, d);
+            setivalue(I + 3, b); setivalue(I + 4, c); setivalue(I + 5, d);
+            I += 6;
+        }
+    lua_Integer index = (rs + 1) * (hs + 1);
+    for (int cap = 0; cap < 2; cap++) {
+        int isTop = cap == 0;
+        if (isTop ? !top : !bottom) continue;
+        double radius = isTop ? rt : rb;
+        lua_Integer sign = isTop ? 1 : -1;
+        lua_Integer centerIndexStart = index;
+        for (lua_Integer k = 0; k < rs; k++) {
+            setivalue(P, 0); setfltvalue(P + 1, halfHeight * (double)sign); setivalue(P + 2, 0); P += 3;
+            setivalue(N, 0); setivalue(N + 1, sign); setivalue(N + 2, 0); N += 3;
+            setfltvalue(U, 0.5); setfltvalue(U + 1, 0.5); U += 2;
+            index++;
+        }
+        lua_Integer centerIndexEnd = index;
+        for (lua_Integer x = 0; x <= rs; x++) {
+            double u = (double)x / (double)rs;
+            double theta = u * thetaLength + thetaStart;
+            double cosTheta = cos(theta), sinTheta = sin(theta);
+            setfltvalue(P, radius * sinTheta); setfltvalue(P + 1, halfHeight * (double)sign);
+            setfltvalue(P + 2, radius * cosTheta); P += 3;
+            setivalue(N, 0); setivalue(N + 1, sign); setivalue(N + 2, 0); N += 3;
+            setfltvalue(U, (sinTheta * 0.5 * (double)sign) + 0.5); setfltvalue(U + 1, (cosTheta * 0.5) + 0.5); U += 2;
+            index++;
+        }
+        for (lua_Integer x = 0; x < rs; x++) {
+            lua_Integer c = centerIndexStart + x, i = centerIndexEnd + x;
+            if (isTop) { setivalue(I, i); setivalue(I + 1, i + 1); setivalue(I + 2, c); }
+            else { setivalue(I, i + 1); setivalue(I + 1, i); setivalue(I + 2, c); }
+            I += 3;
+        }
+    }
+    if (I != ti->array + ni || P != tp->array + nv * 3) return luaL_error(L, "t3.gen_cylinder: count");
+    return 4;
+}
+
+/* t3.gen_box(width, height, depth, widthSegments, heightSegments,
+ * depthSegments): the six buildPlane calls (positions and uvs floats,
+ * normals the integers 0 / 1 / -1, as in Lua) */
+static void box_plane(int u, int v, int w, double udir, double vdir, double width, double height, double depth,
+                      lua_Integer gx, lua_Integer gy, TValue **P, TValue **N, TValue **U, TValue **I, lua_Integer *nverts) {
+    double segWidth = width / (double)gx, segHeight = height / (double)gy;
+    double widthHalf = width / 2, heightHalf = height / 2, depthHalf = depth / 2;
+    lua_Integer nsign = depth > 0 ? 1 : -1;
+    for (lua_Integer iy = 0; iy <= gy; iy++) {
+        double y = (double)iy * segHeight - heightHalf;
+        for (lua_Integer ix = 0; ix <= gx; ix++) {
+            double x = (double)ix * segWidth - widthHalf;
+            double vec[3];
+            vec[u] = x * udir; vec[v] = y * vdir; vec[w] = depthHalf;
+            setfltvalue(*P, vec[0]); setfltvalue(*P + 1, vec[1]); setfltvalue(*P + 2, vec[2]); *P += 3;
+            lua_Integer nv3[3];
+            nv3[u] = 0; nv3[v] = 0; nv3[w] = nsign;
+            setivalue(*N, nv3[0]); setivalue(*N + 1, nv3[1]); setivalue(*N + 2, nv3[2]); *N += 3;
+            setfltvalue(*U, (double)ix / (double)gx); setfltvalue(*U + 1, 1 - ((double)iy / (double)gy)); *U += 2;
+        }
+    }
+    lua_Integer base = *nverts;
+    for (lua_Integer iy = 0; iy < gy; iy++)
+        for (lua_Integer ix = 0; ix < gx; ix++) {
+            lua_Integer a = base + ix + (gx + 1) * iy, b = base + ix + (gx + 1) * (iy + 1);
+            lua_Integer c = base + (ix + 1) + (gx + 1) * (iy + 1), d = base + (ix + 1) + (gx + 1) * iy;
+            TValue *o = *I;
+            setivalue(o, a); setivalue(o + 1, b); setivalue(o + 2, d);
+            setivalue(o + 3, b); setivalue(o + 4, c); setivalue(o + 5, d);
+            *I += 6;
+        }
+    *nverts += (gx + 1) * (gy + 1);
+}
+static int l_gen_box(lua_State *L) {
+    for (int i = 1; i <= 6; i++) if (!lua_isnumber(L, i)) NO_KERNEL;
+    for (int i = 4; i <= 6; i++) if (!lua_isinteger(L, i)) NO_KERNEL;
+    double width = lua_tonumber(L, 1), height = lua_tonumber(L, 2), depth = lua_tonumber(L, 3);
+    lua_Integer ws = lua_tointeger(L, 4), hs = lua_tointeger(L, 5), ds = lua_tointeger(L, 6);
+    if (ws < 1 || hs < 1 || ds < 1 || ws > 4096 || hs > 4096 || ds > 4096) NO_KERNEL;
+    lua_Integer nv = 2 * ((ds + 1) * (hs + 1) + (ws + 1) * (ds + 1) + (ws + 1) * (hs + 1));
+    lua_Integer ni = 12 * (ds * hs + ws * ds + ws * hs);
+    Table *ti = new_array(L, ni);
+    Table *tp = new_array(L, nv * 3);
+    Table *tn = new_array(L, nv * 3);
+    Table *tu = new_array(L, nv * 2);
+    TValue *P = tp->array, *N = tn->array, *U = tu->array, *I = ti->array;
+    lua_Integer nverts = 0;
+    enum { X, Y, Z };
+    box_plane(Z, Y, X, -1, -1, depth, height, width, ds, hs, &P, &N, &U, &I, &nverts);
+    box_plane(Z, Y, X, 1, -1, depth, height, -width, ds, hs, &P, &N, &U, &I, &nverts);
+    box_plane(X, Z, Y, 1, 1, width, depth, height, ws, ds, &P, &N, &U, &I, &nverts);
+    box_plane(X, Z, Y, 1, -1, width, depth, -height, ws, ds, &P, &N, &U, &I, &nverts);
+    box_plane(X, Y, Z, 1, -1, width, height, depth, ws, hs, &P, &N, &U, &I, &nverts);
+    box_plane(X, Y, Z, -1, -1, width, height, -depth, ws, hs, &P, &N, &U, &I, &nverts);
+    if (I != ti->array + ni || nverts != nv) return luaL_error(L, "t3.gen_box: count");
+    return 4;
+}
+
+/* t3.gen_polyhedron(vertices, indices, radius, detail) -> positions,
+ * normals, uvs: subdivide, applyRadius, normals, generateUVs, correctUVs,
+ * correctSeam (every value a float in Lua too) */
+static int l_gen_polyhedron(lua_State *L) {
+    if (!lua_istable(L, 1) || !lua_istable(L, 2) || !lua_isnumber(L, 3) || !lua_isinteger(L, 4)) NO_KERNEL;
+    Table *vt = tab_at(L, 1), *it = tab_at(L, 2);
+    double radius = lua_tonumber(L, 3);
+    lua_Integer detail = lua_tointeger(L, 4);
+    lua_Integer nidx = (lua_Integer)luaH_getn(it);
+    if (detail < 0 || detail > 64 || nidx % 3) NO_KERNEL;
+    lua_Integer cols = detail + 1, stride = cols + 1;
+    lua_Integer nv = nidx / 3 * cols * cols * 3;
+    if (nv > (1 << 22)) NO_KERNEL;
+    double *g = (double *)malloc(sizeof(double) * 3 * (size_t)(stride * stride));
+    double *vb = (double *)malloc(sizeof(double) * 3 * (size_t)(nv ? nv : 1));
+    double *uv = (double *)malloc(sizeof(double) * 2 * (size_t)(nv ? nv : 1));
+    if (!g || !vb || !uv) { free(g); free(vb); free(uv); NO_KERNEL; }
+    lua_Integer nb = 0;
+    for (lua_Integer f = 1; f <= nidx; f += 3) {
+        double c3[3][3];
+        for (int k = 0; k < 3; k++) {
+            lua_Integer ix = tv_index(tab_geti(it, (int)(f + k)));
+            if (ix < 0) goto fail;
+            for (int d = 0; d < 3; d++)
+                if (!tv_dbl(tab_geti(vt, (int)(ix * 3 + d + 1)), &c3[k][d])) goto fail;
+        }
+        double vax = c3[0][0], vay = c3[0][1], vaz = c3[0][2], vbx = c3[1][0], vby = c3[1][1], vbz = c3[1][2];
+        double vcx = c3[2][0], vcy = c3[2][1], vcz = c3[2][2];
+        for (lua_Integer i = 0; i <= cols; i++) {
+            double fi = (double)i / (double)cols;
+            double ajx = vax + (vcx - vax) * fi, ajy = vay + (vcy - vay) * fi, ajz = vaz + (vcz - vaz) * fi;
+            double bjx = vbx + (vcx - vbx) * fi, bjy = vby + (vcy - vby) * fi, bjz = vbz + (vcz - vbz) * fi;
+            lua_Integer rows = cols - i;
+            for (lua_Integer j = 0; j <= rows; j++) {
+                double *o = g + (i * stride + j) * 3;
+                if (j == 0 && i == cols) { o[0] = ajx; o[1] = ajy; o[2] = ajz; }
+                else {
+                    double fj = (double)j / (double)rows;
+                    o[0] = ajx + (bjx - ajx) * fj; o[1] = ajy + (bjy - ajy) * fj; o[2] = ajz + (bjz - ajz) * fj;
+                }
+            }
+        }
+#define EMIT(ii, jj) do { const double *o_ = g + ((ii) * stride + (jj)) * 3; \
+        vb[nb * 3] = o_[0]; vb[nb * 3 + 1] = o_[1]; vb[nb * 3 + 2] = o_[2]; nb++; } while (0)
+        for (lua_Integer i = 0; i <= cols - 1; i++)
+            for (lua_Integer j = 0; j <= 2 * (cols - i) - 2; j++) {
+                lua_Integer k = j / 2;
+                if (j % 2 == 0) { EMIT(i, k + 1); EMIT(i + 1, k); EMIT(i, k); }
+                else { EMIT(i, k + 1); EMIT(i + 1, k + 1); EMIT(i + 1, k); }
+            }
+#undef EMIT
+    }
+    if (nb != nv) goto fail;
+    Table *tp = new_array(L, nv * 3);
+    Table *tn = new_array(L, nv * 3);
+    Table *tu = new_array(L, nv * 2);
+    for (lua_Integer k = 0; k < nv; k++) {
+        double x = vb[k * 3], y = vb[k * 3 + 1], z = vb[k * 3 + 2];
+        double len = sqrt(x * x + y * y + z * z);
+        if (len == 0) len = 1;
+        double inv = 1 / len;
+        x = x * inv * radius; y = y * inv * radius; z = z * inv * radius;
+        vb[k * 3] = x; vb[k * 3 + 1] = y; vb[k * 3 + 2] = z;
+        double nlen = sqrt(x * x + y * y + z * z);
+        if (nlen == 0) nlen = 1;
+        double ninv = 1 / nlen;
+        setfltvalue(&tn->array[k * 3], x * ninv);
+        setfltvalue(&tn->array[k * 3 + 1], y * ninv);
+        setfltvalue(&tn->array[k * 3 + 2], z * ninv);
+        uv[k * 2] = atan2(z, -x) / 2 / L_PI + 0.5;
+        uv[k * 2 + 1] = 1 - (atan2(-y, sqrt(x * x + z * z)) / L_PI + 0.5);
+    }
+    double third = 1.0 / 3;
+    for (lua_Integer f = 0, j = 0; f < nv; f += 3, j += 6) {
+        double ax = vb[f * 3], az = vb[f * 3 + 2], bx = vb[f * 3 + 3], bz = vb[f * 3 + 5];
+        double cx = vb[f * 3 + 6], cz = vb[f * 3 + 8];
+        double azi = atan2((az + bz + cz) * third, -((ax + bx + cx) * third));
+        double poleU = azi / 2 / L_PI + 0.5;
+        double *s0 = uv + j;
+        if (azi < 0 && s0[0] == 1) s0[0] = s0[0] - 1;
+        if (ax == 0 && az == 0) s0[0] = poleU;
+        if (azi < 0 && s0[2] == 1) s0[2] = s0[2] - 1;
+        if (bx == 0 && bz == 0) s0[2] = poleU;
+        if (azi < 0 && s0[4] == 1) s0[4] = s0[4] - 1;
+        if (cx == 0 && cz == 0) s0[4] = poleU;
+    }
+    for (lua_Integer i = 0; i + 4 < nv * 2; i += 6) {
+        double x0 = uv[i], x1 = uv[i + 2], x2 = uv[i + 4];
+        double mx = x0; if (mx < x1) mx = x1; if (mx < x2) mx = x2;   /* math.max */
+        double mn = x0; if (x1 < mn) mn = x1; if (x2 < mn) mn = x2;   /* math.min */
+        if (mx > 0.9 && mn < 0.1) {
+            if (x0 < 0.2) uv[i] = x0 + 1;
+            if (x1 < 0.2) uv[i + 2] = x1 + 1;
+            if (x2 < 0.2) uv[i + 4] = x2 + 1;
+        }
+    }
+    for (lua_Integer k = 0; k < nv * 3; k++) setfltvalue(&tp->array[k], vb[k]);
+    for (lua_Integer k = 0; k < nv * 2; k++) setfltvalue(&tu->array[k], uv[k]);
+    free(g); free(vb); free(uv);
+    return 3;
+fail:
+    free(g); free(vb); free(uv);
+    NO_KERNEL;
+}
+
 /* t3.quat_from_euler(x, y, z, order) -> qx, qy, qz, qw (double precision) */
 static int l_quat_from_euler(lua_State *L) {
     double x = lua_tonumber(L, 1), y = lua_tonumber(L, 2), z = lua_tonumber(L, 3);
@@ -2112,7 +2438,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "deindex", l_deindex }, { "gen_sphere", l_gen_sphere }, { "gen_torus", l_gen_torus }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "deindex", l_deindex }, { "gen_sphere", l_gen_sphere }, { "gen_torus", l_gen_torus }, { "gen_torus_knot", l_gen_torus_knot }, { "gen_cylinder", l_gen_cylinder }, { "gen_box", l_gen_box }, { "gen_polyhedron", l_gen_polyhedron }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
     { "matrix", l_matrix },
     { "world", l_world }, { "local_matrix", l_local }, { "camera_matrices", l_camera_matrices },
     { "update_world", l_update_world }, { "update_world_matrix", l_update_world_matrix },
