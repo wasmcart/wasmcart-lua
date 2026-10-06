@@ -2557,7 +2557,7 @@ static t3_renderer *R(lua_State *L, int i) {
 }
 
 /* t3.renderer_set(r, clearHex, clearAlpha, autoClear, shadowsOn, shadowType,
- *                 outputEncoding, antialiasSamples) */
+ *                 outputEncoding, antialiasSamples [, physicallyCorrectLights]) */
 static int l_renderer_set(lua_State *L) {
     t3_renderer *r = R(L, 1);
     t3_renderer_set_clear_color(r, (uint32_t)lua_tointeger(L, 2), F(3));
@@ -2565,6 +2565,7 @@ static int l_renderer_set(lua_State *L) {
     t3_renderer_set_shadow_map(r, B(5), (t3_shadow_map_type)I(6));
     t3_renderer_set_output_encoding(r, (t3_encoding)I(7));
     if (!lua_isnoneornil(L, 8)) t3_renderer_set_antialias(r, I(8));
+    if (!lua_isnoneornil(L, 9)) t3_renderer_set_physically_correct_lights(r, B(9));
     return 0;
 }
 
