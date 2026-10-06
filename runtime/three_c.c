@@ -2669,6 +2669,131 @@ static int l_make_euler_newindex(lua_State *L) {
     return 1;
 }
 
+/* t3.curve_method(kind, luaGetPoint, ctor, class) -> getPoint(self, t, target) in C:
+ * the curve's kernel (1 catmull_rom, 2 bezier3 3D, 3 bezier3 2D, 4 ellipse),
+ * the point written straight into a plain target's x / y (/ z), a new one
+ * made with ctor() when none is given, a watched target through its set.
+ * Whatever the kernel declines runs the Lua getPoint (luaGetPoint). */
+/* a table's fields x, y[, z] as typed numbers (0 if not all numbers) */
+static int tab_fields_n(Table *t, int n, num_t *out) {
+    for (int i = 0; i < n; i++) {
+        const TValue *v = luaH_getshortstr(t, fkey[FK_X + i]);
+        if (ttisfloat(v)) out[i] = nflt(fltvalue(v));
+        else if (ttisinteger(v)) out[i] = nint((double)ivalue(v));
+        else return 0;
+    }
+    return 1;
+}
+/* EllipseCurve:getPoint's arithmetic on the curve table (as l_ellipse) */
+static int ellipse_eval(Table *c, double t, double out[2]) {
+    double f[EK_COUNT];
+    for (int k = 0; k < EK_COUNT; k++) {
+        if (k == EK_CW) continue;
+        if (!tv_dbl(luaH_getshortstr(c, ekey[k]), &f[k])) return 0;
+    }
+    int clockwise = !l_isfalse(luaH_getshortstr(c, ekey[EK_CW]));
+    double twoPi = L_PI * 2;
+    double deltaAngle = f[EK_AE] - f[EK_AS];
+    if (!isfinite(deltaAngle)) return 0;
+    int samePoints = fabs(deltaAngle) < 1e-10;
+    while (deltaAngle < 0) deltaAngle = deltaAngle + twoPi;
+    while (deltaAngle > twoPi) deltaAngle = deltaAngle - twoPi;
+    if (deltaAngle < 1e-10) deltaAngle = samePoints ? 0 : twoPi;
+    if (clockwise && !samePoints) deltaAngle = (deltaAngle == twoPi) ? -twoPi : (deltaAngle - twoPi);
+    double angle = f[EK_AS] + t * deltaAngle;
+    double x = f[EK_AX] + f[EK_XR] * cos(angle);
+    double y = f[EK_AY] + f[EK_YR] * sin(angle);
+    if (f[EK_ROT] != 0) {
+        double cs = cos(f[EK_ROT]), sn = sin(f[EK_ROT]);
+        double tx = x - f[EK_AX], ty = y - f[EK_AY];
+        x = tx * cs - ty * sn + f[EK_AX];
+        y = tx * sn + ty * cs + f[EK_AY];
+    }
+    out[0] = x; out[1] = y;
+    return 1;
+}
+static int l_curve_getpoint(lua_State *L) {
+    int kind = (int)lua_tointeger(L, lua_upvalueindex(1));
+    lua_settop(L, 3);                               /* self, t, target */
+    num_t r[3];
+    int nres = 0;
+    if (lua_istable(L, 1) && lua_isnumber(L, 2)) {
+        Table *cv = tab_at(L, 1);
+        int t_int = lua_isinteger(L, 2);
+        double t = lua_tonumber(L, 2);
+        if (kind == 1) {
+            Table *pts = tv_tab(luaH_getshortstr(cv, ckey[CK_POINTS]));
+            const TValue *ct = luaH_getshortstr(cv, ckey[CK_CTYPE]);
+            const char *cs = ttisstring(ct) ? getstr(tsvalue(ct)) : NULL;
+            int mode = !cs ? -1 : !strcmp(cs, "centripetal") ? 1 : !strcmp(cs, "chordal") ? 2 : 0;
+            const TValue *tv = luaH_getshortstr(cv, ckey[CK_TENSION]);
+            double tension = ttisnumber(tv) ? tv_num(tv) : 0.5;
+            double o[3];
+            if (pts && mode >= 0 &&
+                cr_eval(pts, !l_isfalse(luaH_getshortstr(cv, ckey[CK_CLOSED])), mode, tension, t, t_int,
+                        tv_tab(luaH_getshortstr(cv, ckey[CK_ENDC])), o)) {
+                for (int d = 0; d < 3; d++) r[d] = nflt(o[d]);
+                nres = 3;
+            }
+        } else if (kind == 2 || kind == 3) {
+            int dims = kind == 2 ? 3 : 2;
+            num_t p[4][3];
+            int ok = 1;
+            for (int k = 0; k < 4 && ok; k++) {
+                Table *vk = tv_tab(luaH_getshortstr(cv, ckey[CK_V0 + k]));
+                ok = vk && tab_fields_n(vk, dims, p[k]);
+            }
+            if (ok) {
+                num_t tn = t_int ? nint(t) : nflt(t);
+                num_bail = 0;
+                num_t k1 = nsub(nint(1), tn), three = nint(3);
+                for (int d = 0; d < dims; d++)
+                    r[d] = nadd(nadd(nadd(nmul(nmul(nmul(k1, k1), k1), p[0][d]), nmul(nmul(nmul(nmul(three, k1), k1), tn), p[1][d])),
+                                     nmul(nmul(nmul(nmul(three, k1), tn), tn), p[2][d])),
+                                nmul(nmul(nmul(tn, tn), tn), p[3][d]));
+                if (!num_bail) nres = dims;
+            }
+        } else {
+            double o[2];
+            if (ellipse_eval(cv, t, o)) { r[0] = nflt(o[0]); r[1] = nflt(o[1]); nres = 2; }
+        }
+    }
+    if (!nres) {
+        lua_pushvalue(L, lua_upvalueindex(2));
+        lua_insert(L, 1);
+        lua_call(L, 3, 1);
+        return 1;
+    }
+    if (lua_isnil(L, 3)) { lua_pushvalue(L, lua_upvalueindex(3)); lua_call(L, 0, 1); lua_replace(L, 3); }
+    if (lua_istable(L, 3) && tab_at(L, 3)->metatable == (Table *)lua_topointer(L, lua_upvalueindex(4))) {
+        Table *tg = tab_at(L, 3);
+        TValue *s[3];
+        int plain = 1;
+        for (int d = 0; d < nres; d++) {
+            s[d] = (TValue *)luaH_getshortstr(tg, fkey[FK_X + d]);
+            if (isabstkey(s[d])) plain = 0;
+        }
+        if (plain) {
+            for (int d = 0; d < nres; d++) set_tv(s[d], r[d]);
+            return 1;
+        }
+    }
+    lua_getfield(L, 3, "set");
+    lua_pushvalue(L, 3);
+    for (int d = 0; d < nres; d++) push_num(L, r[d]);
+    lua_call(L, 1 + nres, 1);
+    return 1;
+}
+static int l_curve_method(lua_State *L) {
+    luaL_checkinteger(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+    luaL_checktype(L, 3, LUA_TFUNCTION);
+    luaL_checktype(L, 4, LUA_TTABLE);
+    lua_settop(L, 4);
+    lua_pushcclosure(L, l_curve_getpoint, 4);
+    return 1;
+}
+
 /* t3.quat_from_euler(x, y, z, order) -> qx, qy, qz, qw (double precision) */
 static int l_quat_from_euler(lua_State *L) {
     double x = lua_tonumber(L, 1), y = lua_tonumber(L, 2), z = lua_tonumber(L, 3);
@@ -3657,7 +3782,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "euler_newindex", l_make_euler_newindex }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at },
 #endif
