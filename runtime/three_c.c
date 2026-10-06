@@ -2767,6 +2767,120 @@ static int l_world_position(lua_State *L) {
     return 3;
 }
 
+#ifdef T3_F64_MATH
+/* three.lua's Vector3 normalize (a zero vector stays as it is) */
+static void lk_normalize(double v[3]) {
+    double l = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (l == 0) return;
+    double inv = 1 / l;
+    v[0] = v[0] * inv; v[1] = v[1] * inv; v[2] = v[2] * inv;
+}
+/* three.lua's Quaternion:setFromRotationMatrix on the rotation part
+ * m11..m33 (row r, column c) */
+static void lk_quat_from_rot(double m11, double m12, double m13, double m21, double m22, double m23, double m31,
+                             double m32, double m33, double q[4]) {
+    double trace = m11 + m22 + m33;
+    if (trace > 0) {
+        double s = 0.5 / sqrt(trace + 1.0);
+        q[3] = 0.25 / s; q[0] = (m32 - m23) * s; q[1] = (m13 - m31) * s; q[2] = (m21 - m12) * s;
+    } else if (m11 > m22 && m11 > m33) {
+        double s = 2.0 * sqrt(1.0 + m11 - m22 - m33);
+        q[3] = (m32 - m23) / s; q[0] = 0.25 * s; q[1] = (m12 + m21) / s; q[2] = (m13 + m31) / s;
+    } else if (m22 > m33) {
+        double s = 2.0 * sqrt(1.0 + m22 - m11 - m33);
+        q[3] = (m13 - m31) / s; q[0] = (m12 + m21) / s; q[1] = 0.25 * s; q[2] = (m23 + m32) / s;
+    } else {
+        double s = 2.0 * sqrt(1.0 + m33 - m11 - m22);
+        q[3] = (m21 - m12) / s; q[0] = (m13 + m31) / s; q[1] = (m23 + m32) / s; q[2] = 0.25 * s;
+    }
+}
+/* t3.look_at(h, tx, ty, tz, upx, upy, upz, eyeIsSelf, q) -> worldChanged:
+ * Object3D:lookAt for a mirrored object, three.lua's arithmetic in doubles:
+ * updateWorldMatrix(true, false), Matrix4:lookAt (eye and target swapped
+ * unless a camera / light, eyeIsSelf), setFromRotationMatrix, and with a
+ * parent the inverse of its world rotation premultiplied. The quaternion
+ * goes into q's slots 1..4 (a watched quaternion; slot 5, its stale flag,
+ * cleared); Lua marks the object and fires q's change callback. */
+/* a vector's x, y, z: plain fields, or a watched vector's slots 1..3 */
+static int lk_vec3(lua_State *L, int idx, double out[3]) {
+    if (!lua_istable(L, idx)) return 0;
+    Table *t = tab_at(L, idx);
+    num_t f[3];
+    if (get_fields(L, idx, 3, f, NULL)) { out[0] = f[0].d; out[1] = f[1].d; out[2] = f[2].d; return 1; }
+    for (int i = 0; i < 3; i++) if (!tv_dbl(tab_geti(t, i + 1), &out[i])) return 0;
+    return 1;
+}
+/* t3.look_at(h, target | x, y, z, up, eyeIsSelf, q) -> true, worldChanged
+ * | false (q not a watched quaternion, or the vectors not numbers: Lua's
+ * path then) */
+static int l_look_at(lua_State *L) {
+    t3_object *o = (t3_object *)P(L, 1);
+    double t[3], up[3];
+    int a = 2;
+    if (lua_istable(L, 2)) { if (!lk_vec3(L, 2, t)) NO_KERNEL; a = 3; }
+    else {
+        if (!lua_isnumber(L, 2) || !lua_isnumber(L, 3) || !lua_isnumber(L, 4)) NO_KERNEL;
+        t[0] = lua_tonumber(L, 2); t[1] = lua_tonumber(L, 3); t[2] = lua_tonumber(L, 4);
+        a = 5;
+    }
+    if (!lk_vec3(L, a, up)) NO_KERNEL;
+    int eyeIsSelf = lua_toboolean(L, a + 1);
+    if (!lua_istable(L, a + 2)) NO_KERNEL;
+    Table *qt = tab_at(L, a + 2);
+    TValue *sl[5];
+    for (int i = 0; i < 5; i++) {
+        sl[i] = tab_slot(qt, i + 1);
+        if (isabstkey(sl[i])) NO_KERNEL;
+    }
+    uint32_t before = t3_world_recompute_count();
+    t3_object_update_world_matrix(o, true, false);
+    int changed = t3_world_recompute_count() != before;
+    const double *we = o->_mwd;
+    double pos[3] = { we[12], we[13], we[14] };
+    const double *eye = eyeIsSelf ? pos : t, *target = eyeIsSelf ? t : pos;
+    /* Matrix4:lookAt(eye, target, up) */
+    double z[3] = { eye[0] - target[0], eye[1] - target[1], eye[2] - target[2] };
+    if (z[0] * z[0] + z[1] * z[1] + z[2] * z[2] == 0) z[2] = 1;
+    lk_normalize(z);
+    double x[3] = { up[1] * z[2] - up[2] * z[1], up[2] * z[0] - up[0] * z[2], up[0] * z[1] - up[1] * z[0] };
+    if (x[0] * x[0] + x[1] * x[1] + x[2] * x[2] == 0) {
+        if (fabs(up[2]) == 1) z[0] = z[0] + 0.0001; else z[2] = z[2] + 0.0001;
+        lk_normalize(z);
+        x[0] = up[1] * z[2] - up[2] * z[1]; x[1] = up[2] * z[0] - up[0] * z[2]; x[2] = up[0] * z[1] - up[1] * z[0];
+    }
+    lk_normalize(x);
+    double y[3] = { z[1] * x[2] - z[2] * x[1], z[2] * x[0] - z[0] * x[2], z[0] * x[1] - z[1] * x[0] };
+    /* te[1], te[5], te[9] = x.x, y.x, z.x (column-major: m11 = te[1], m12 = te[5], m13 = te[9]) */
+    double q[4];
+    lk_quat_from_rot(x[0], y[0], z[0], x[1], y[1], z[1], x[2], y[2], z[2], q);
+    if (o->parent) {
+        const double *me = o->parent->_mwd;
+        double l0 = sqrt(me[0] * me[0] + me[1] * me[1] + me[2] * me[2]);
+        double l1 = sqrt(me[4] * me[4] + me[5] * me[5] + me[6] * me[6]);
+        double l2 = sqrt(me[8] * me[8] + me[9] * me[9] + me[10] * me[10]);
+        double sx = 1 / l0, sy = 1 / l1, sz = 1 / l2;
+        double r[9] = { me[0] * sx, me[1] * sx, me[2] * sx, me[4] * sy, me[5] * sy, me[6] * sy, me[8] * sz, me[9] * sz,
+                        me[10] * sz };
+        double pq[4];
+        /* m11 = te[1] = r[0], m12 = te[5] = r[3], m13 = te[9] = r[6], ... */
+        lk_quat_from_rot(r[0], r[3], r[6], r[1], r[4], r[7], r[2], r[5], r[8], pq);
+        pq[0] = -pq[0]; pq[1] = -pq[1]; pq[2] = -pq[2];   /* invert (the conjugate) */
+        /* premultiply: q = pq * q (multiplyQuaternions(a = pq, b = q)) */
+        double qax = pq[0], qay = pq[1], qaz = pq[2], qaw = pq[3];
+        double qbx = q[0], qby = q[1], qbz = q[2], qbw = q[3];
+        q[0] = qax * qbw + qaw * qbx + qay * qbz - qaz * qby;
+        q[1] = qay * qbw + qaw * qby + qaz * qbx - qax * qbz;
+        q[2] = qaz * qbw + qaw * qbz + qax * qby - qay * qbx;
+        q[3] = qaw * qbw - qax * qbx - qay * qby - qaz * qbz;
+    }
+    for (int i = 0; i < 4; i++) setfltvalue(sl[i], q[i]);
+    setbfvalue(sl[4]);
+    lua_pushboolean(L, 1);
+    lua_pushboolean(L, changed);
+    return 2;
+}
+#endif
+
 /* ── cameras and lights ──────────────────────────────────────────────── */
 
 static int l_perspective(lua_State *L) {
@@ -3427,7 +3541,11 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "f64a", l_f64a }, { "curve_sample", l_curve_sample }, { "u_to_t_array", l_u_to_t_array }, { "v3a_add", l_v3a_add }, { "v3a_sub", l_v3a_sub }, { "v3a_set_scaled", l_v3a_set_scaled }, { "v3a_normalize", l_v3a_normalize }, { "v3a_cross", l_v3a_cross }, { "v3a_measure", l_v3a_measure }, { "v3a_apply_qa", l_v3a_apply_qa }, { "f64a_sum", l_f64a_sum }, { "qa_from_axis_angle", l_qa_from_axis_angle }, { "qa_slerp", l_qa_slerp }, { "qa_normalize", l_qa_normalize }, { "m4a_multiply", l_m4a_multiply }, { "m4a_invert", l_m4a_invert }, { "f64a_get", l_f64a_get }, { "f64a_set", l_f64a_set }, { "f64a_fill", l_f64a_fill }, { "f64a_copy", l_f64a_copy }, { "v3a_add_xyz", l_v3a_add_xyz }, { "v3a_add_scaled", l_v3a_add_scaled }, { "v3a_multiply_scalar", l_v3a_multiply_scalar }, { "v3a_apply_m4a", l_v3a_apply_m4a }, { "v3a_sum", l_v3a_sum }, { "qa_from_euler_scaled", l_qa_from_euler_scaled }, { "m4a_compose", l_m4a_compose }, { "m4a_to_instanced", l_m4a_to_instanced }, { "array_part", l_array_part }, { "anim_register_more", l_anim_register_more }, { "deindex", l_deindex }, { "gen_sphere", l_gen_sphere }, { "gen_torus", l_gen_torus }, { "catmull_rom", l_catmull_rom }, { "cr_lengths", l_cr_lengths }, { "bezier3", l_bezier3 }, { "ellipse", l_ellipse }, { "u_to_t", l_u_to_t }, { "gen_torus_knot", l_gen_torus_knot }, { "gen_cylinder", l_gen_cylinder }, { "gen_box", l_gen_box }, { "gen_polyhedron", l_gen_polyhedron }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register },
+#ifdef T3_F64_MATH
+    { "look_at", l_look_at },
+#endif
+    { "f64a", l_f64a }, { "curve_sample", l_curve_sample }, { "u_to_t_array", l_u_to_t_array }, { "v3a_add", l_v3a_add }, { "v3a_sub", l_v3a_sub }, { "v3a_set_scaled", l_v3a_set_scaled }, { "v3a_normalize", l_v3a_normalize }, { "v3a_cross", l_v3a_cross }, { "v3a_measure", l_v3a_measure }, { "v3a_apply_qa", l_v3a_apply_qa }, { "f64a_sum", l_f64a_sum }, { "qa_from_axis_angle", l_qa_from_axis_angle }, { "qa_slerp", l_qa_slerp }, { "qa_normalize", l_qa_normalize }, { "m4a_multiply", l_m4a_multiply }, { "m4a_invert", l_m4a_invert }, { "f64a_get", l_f64a_get }, { "f64a_set", l_f64a_set }, { "f64a_fill", l_f64a_fill }, { "f64a_copy", l_f64a_copy }, { "v3a_add_xyz", l_v3a_add_xyz }, { "v3a_add_scaled", l_v3a_add_scaled }, { "v3a_multiply_scalar", l_v3a_multiply_scalar }, { "v3a_apply_m4a", l_v3a_apply_m4a }, { "v3a_sum", l_v3a_sum }, { "qa_from_euler_scaled", l_qa_from_euler_scaled }, { "m4a_compose", l_m4a_compose }, { "m4a_to_instanced", l_m4a_to_instanced }, { "array_part", l_array_part }, { "anim_register_more", l_anim_register_more }, { "deindex", l_deindex }, { "gen_sphere", l_gen_sphere }, { "gen_torus", l_gen_torus }, { "catmull_rom", l_catmull_rom }, { "cr_lengths", l_cr_lengths }, { "bezier3", l_bezier3 }, { "ellipse", l_ellipse }, { "u_to_t", l_u_to_t }, { "gen_torus_knot", l_gen_torus_knot }, { "gen_cylinder", l_gen_cylinder }, { "gen_box", l_gen_box }, { "gen_polyhedron", l_gen_polyhedron }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
     { "matrix", l_matrix },
     { "world", l_world }, { "local_matrix", l_local }, { "camera_matrices", l_camera_matrices },
     { "update_world", l_update_world }, { "update_world_matrix", l_update_world_matrix },
