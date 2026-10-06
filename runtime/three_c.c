@@ -1916,6 +1916,189 @@ static int l_array_part(lua_State *L) {
     return 0;
 }
 
+/* ── packed double arrays and bulk math ──────────────────────────────────
+ * A Vector3Array / QuaternionArray / Matrix4Array keeps its items as packed
+ * doubles in one userdata (stride 3 / 4 / 16), so an operation over all of
+ * them is one call and a C loop instead of N Lua method calls. The
+ * expressions are three.lua's (three.js r128's), item by item, so a bulk op
+ * gives the same doubles as the per-object methods. Indices are 0-based. */
+#define F64A_MT "t3.f64a"
+typedef struct { int n, stride; double *d; } f64a_t;
+
+static f64a_t *f64a_check(lua_State *L, int idx) { return (f64a_t *)luaL_checkudata(L, idx, F64A_MT); }
+static f64a_t *f64a_of(lua_State *L, int idx, int stride) {
+    f64a_t *a = f64a_check(L, idx);
+    if (a->stride != stride) luaL_error(L, "t3: array of stride %d where %d expected", a->stride, stride);
+    return a;
+}
+static void f64a_same_n(lua_State *L, const f64a_t *a, const f64a_t *b) {
+    if (a->n != b->n) luaL_error(L, "t3: arrays of %d and %d items", a->n, b->n);
+}
+
+/* t3.f64a(n, stride) -> array (zeroed) */
+static int l_f64a(lua_State *L) {
+    lua_Integer n = luaL_checkinteger(L, 1), stride = luaL_checkinteger(L, 2);
+    if (n < 0 || n > (1 << 22) || stride < 1 || stride > 16) return luaL_error(L, "t3.f64a: bad size");
+    size_t bytes = (size_t)n * (size_t)stride * sizeof(double);
+    f64a_t *a = (f64a_t *)lua_newuserdatauv(L, sizeof(f64a_t) + 16 + bytes, 0);
+    a->n = (int)n;
+    a->stride = (int)stride;
+    a->d = (double *)(((uintptr_t)(a + 1) + 15) & ~(uintptr_t)15);
+    memset(a->d, 0, bytes);
+    luaL_setmetatable(L, F64A_MT);
+    return 1;
+}
+/* t3.f64a_get(a, i) -> stride numbers */
+static int l_f64a_get(lua_State *L) {
+    f64a_t *a = f64a_check(L, 1);
+    lua_Integer i = luaL_checkinteger(L, 2);
+    if (i < 0 || i >= a->n) return luaL_error(L, "t3: index %d out of range (%d)", (int)i, a->n);
+    const double *p = a->d + i * a->stride;
+    luaL_checkstack(L, a->stride, NULL);
+    for (int k = 0; k < a->stride; k++) lua_pushnumber(L, p[k]);
+    return a->stride;
+}
+/* t3.f64a_set(a, i, ...) */
+static int l_f64a_set(lua_State *L) {
+    f64a_t *a = f64a_check(L, 1);
+    lua_Integer i = luaL_checkinteger(L, 2);
+    if (i < 0 || i >= a->n) return luaL_error(L, "t3: index %d out of range (%d)", (int)i, a->n);
+    double *p = a->d + i * a->stride;
+    for (int k = 0; k < a->stride; k++) p[k] = luaL_checknumber(L, 3 + k);
+    return 0;
+}
+/* t3.f64a_fill(a, ...) : every item the same */
+static int l_f64a_fill(lua_State *L) {
+    f64a_t *a = f64a_check(L, 1);
+    double v[16];
+    for (int k = 0; k < a->stride; k++) v[k] = luaL_checknumber(L, 2 + k);
+    for (int i = 0; i < a->n; i++) memcpy(a->d + i * a->stride, v, sizeof(double) * a->stride);
+    return 0;
+}
+/* t3.f64a_copy(dst, src) */
+static int l_f64a_copy(lua_State *L) {
+    f64a_t *a = f64a_check(L, 1), *b = f64a_of(L, 2, f64a_check(L, 1)->stride);
+    f64a_same_n(L, a, b);
+    memmove(a->d, b->d, sizeof(double) * (size_t)a->n * a->stride);
+    return 0;
+}
+
+/* t3.v3a_add_xyz(a, x, y, z): each item += (x, y, z) (Vector3:add) */
+static int l_v3a_add_xyz(lua_State *L) {
+    f64a_t *a = f64a_of(L, 1, 3);
+    double x = luaL_checknumber(L, 2), y = luaL_checknumber(L, 3), z = luaL_checknumber(L, 4);
+    double *p = a->d;
+    for (int i = 0; i < a->n; i++, p += 3) { p[0] = p[0] + x; p[1] = p[1] + y; p[2] = p[2] + z; }
+    return 0;
+}
+/* t3.v3a_add_scaled(a, b, s): a[i] += b[i] * s (Vector3:addScaledVector) */
+static int l_v3a_add_scaled(lua_State *L) {
+    f64a_t *a = f64a_of(L, 1, 3), *b = f64a_of(L, 2, 3);
+    f64a_same_n(L, a, b);
+    double s = luaL_checknumber(L, 3);
+    double *p = a->d;
+    const double *q = b->d;
+    for (int i = 0; i < a->n * 3; i++) p[i] = p[i] + q[i] * s;
+    return 0;
+}
+/* t3.v3a_multiply_scalar(a, s) */
+static int l_v3a_multiply_scalar(lua_State *L) {
+    f64a_t *a = f64a_of(L, 1, 3);
+    double s = luaL_checknumber(L, 2);
+    for (int i = 0; i < a->n * 3; i++) a->d[i] = a->d[i] * s;
+    return 0;
+}
+/* t3.v3a_apply_m4a(a, ma): a[i]:applyMatrix4(ma[i]) */
+static int l_v3a_apply_m4a(lua_State *L) {
+    f64a_t *a = f64a_of(L, 1, 3), *m = f64a_of(L, 2, 16);
+    f64a_same_n(L, a, m);
+    double *p = a->d;
+    const double *e = m->d;
+    for (int i = 0; i < a->n; i++, p += 3, e += 16) {
+        double x = p[0], y = p[1], z = p[2];
+        double w = e[3] * x + e[7] * y + e[11] * z + e[15];
+        w = (w == 0) ? 1 : (1 / w);
+        p[0] = (e[0] * x + e[4] * y + e[8] * z + e[12]) * w;
+        p[1] = (e[1] * x + e[5] * y + e[9] * z + e[13]) * w;
+        p[2] = (e[2] * x + e[6] * y + e[10] * z + e[14]) * w;
+    }
+    return 0;
+}
+/* t3.v3a_sum(a) -> sx, sy, sz (summed in item order) */
+static int l_v3a_sum(lua_State *L) {
+    f64a_t *a = f64a_of(L, 1, 3);
+    double sx = 0, sy = 0, sz = 0;
+    const double *p = a->d;
+    for (int i = 0; i < a->n; i++, p += 3) { sx = sx + p[0]; sy = sy + p[1]; sz = sz + p[2]; }
+    lua_pushnumber(L, sx); lua_pushnumber(L, sy); lua_pushnumber(L, sz);
+    return 3;
+}
+/* t3.qa_from_euler_scaled(qa, ea, s, order): qa[i]:setFromEuler of the
+ * angles ea[i] * s (order 0 XYZ .. 5 XZY) */
+static void quat_from_euler_lua(double x, double y, double z, int order, double r[4]) {
+    double hx = x * 0.5, hy = y * 0.5, hz = z * 0.5;
+    double c1 = cos(hx), c2 = cos(hy), c3 = cos(hz);
+    double s1 = sin(hx), s2 = sin(hy), s3 = sin(hz);
+    double c1c2 = c1 * c2, s1s2 = s1 * s2, s1c2 = s1 * c2, c1s2 = c1 * s2;
+    double c1c2c3 = c1c2 * c3, s1s2s3 = s1s2 * s3, s1c2c3 = s1c2 * c3, c1s2s3 = c1s2 * s3;
+    double c1s2c3 = c1s2 * c3, s1c2s3 = s1c2 * s3, c1c2s3 = c1c2 * s3, s1s2c3 = s1s2 * c3;
+    switch (order) {
+    default:
+    case 0: r[0] = s1c2c3 + c1s2s3; r[1] = c1s2c3 - s1c2s3; r[2] = c1c2s3 + s1s2c3; r[3] = c1c2c3 - s1s2s3; break;
+    case 1: r[0] = s1c2c3 + c1s2s3; r[1] = c1s2c3 - s1c2s3; r[2] = c1c2s3 - s1s2c3; r[3] = c1c2c3 + s1s2s3; break;
+    case 2: r[0] = s1c2c3 - c1s2s3; r[1] = c1s2c3 + s1c2s3; r[2] = c1c2s3 + s1s2c3; r[3] = c1c2c3 - s1s2s3; break;
+    case 3: r[0] = s1c2c3 - c1s2s3; r[1] = c1s2c3 + s1c2s3; r[2] = c1c2s3 - s1s2c3; r[3] = c1c2c3 + s1s2s3; break;
+    case 4: r[0] = s1c2c3 + c1s2s3; r[1] = c1s2c3 + s1c2s3; r[2] = c1c2s3 - s1s2c3; r[3] = c1c2c3 - s1s2s3; break;
+    case 5: r[0] = s1c2c3 - c1s2s3; r[1] = c1s2c3 - s1c2s3; r[2] = c1c2s3 + s1s2c3; r[3] = c1c2c3 + s1s2s3; break;
+    }
+}
+static int l_qa_from_euler_scaled(lua_State *L) {
+    f64a_t *q = f64a_of(L, 1, 4), *e = f64a_of(L, 2, 3);
+    f64a_same_n(L, q, e);
+    double s = luaL_checknumber(L, 3);
+    int order = (int)luaL_optinteger(L, 4, 0);
+    double *o = q->d;
+    const double *a = e->d;
+    for (int i = 0; i < q->n; i++, o += 4, a += 3) quat_from_euler_lua(a[0] * s, a[1] * s, a[2] * s, order, o);
+    return 0;
+}
+/* t3.m4a_compose(ma, pa, qa, sa | nil, sx, sy, sz): ma[i]:compose(pa[i],
+ * qa[i], sa[i] or the one scale (sx, sy, sz)) */
+static int l_m4a_compose(lua_State *L) {
+    f64a_t *m = f64a_of(L, 1, 16), *pa = f64a_of(L, 2, 3), *qa = f64a_of(L, 3, 4);
+    f64a_t *sa = lua_isnoneornil(L, 4) ? NULL : f64a_of(L, 4, 3);
+    f64a_same_n(L, m, pa); f64a_same_n(L, m, qa);
+    if (sa) f64a_same_n(L, m, sa);
+    double s1[3] = { luaL_optnumber(L, 5, 1), luaL_optnumber(L, 6, 1), luaL_optnumber(L, 7, 1) };
+    for (int i = 0; i < m->n; i++) {
+        const double *p = pa->d + i * 3, *q = qa->d + i * 4, *sc = sa ? sa->d + i * 3 : s1;
+        double *te = m->d + i * 16;
+        double x = q[0], y = q[1], z = q[2], w = q[3];
+        double x2 = x + x, y2 = y + y, z2 = z + z;
+        double xx = x * x2, xy = x * y2, xz = x * z2;
+        double yy = y * y2, yz = y * z2, zz = z * z2;
+        double wx = w * x2, wy = w * y2, wz = w * z2;
+        double sx = sc[0], sy = sc[1], sz = sc[2];
+        te[0] = (1 - (yy + zz)) * sx; te[1] = (xy + wz) * sx; te[2] = (xz - wy) * sx; te[3] = 0;
+        te[4] = (xy - wz) * sy; te[5] = (1 - (xx + zz)) * sy; te[6] = (yz + wx) * sy; te[7] = 0;
+        te[8] = (xz + wy) * sz; te[9] = (yz - wx) * sz; te[10] = (1 - (xx + yy)) * sz; te[11] = 0;
+        te[12] = p[0]; te[13] = p[1]; te[14] = p[2]; te[15] = 1;
+    }
+    return 0;
+}
+/* t3.m4a_to_instanced(ma, h [, first]): the matrices into an InstancedMesh's
+ * instanceMatrix (float, as setMatrixAt stores them) */
+static int l_m4a_to_instanced(lua_State *L) {
+    f64a_t *m = f64a_of(L, 1, 16);
+    t3_instanced_mesh *im = (t3_instanced_mesh *)P(L, 2);
+    int first = (int)luaL_optinteger(L, 3, 0);
+    if (!im || first < 0 || first + m->n > im->instance_matrix->count) return luaL_error(L, "t3.m4a_to_instanced: range");
+    float *dst = (float *)im->instance_matrix->array + first * 16;
+    for (int i = 0; i < m->n * 16; i++) dst[i] = (float)m->d[i];
+    im->instance_matrix->version++;
+    return 0;
+}
+
 /* t3.quat_from_euler(x, y, z, order) -> qx, qy, qz, qw (double precision) */
 static int l_quat_from_euler(lua_State *L) {
     double x = lua_tonumber(L, 1), y = lua_tonumber(L, 2), z = lua_tonumber(L, 3);
@@ -2788,7 +2971,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "array_part", l_array_part }, { "anim_register_more", l_anim_register_more }, { "deindex", l_deindex }, { "gen_sphere", l_gen_sphere }, { "gen_torus", l_gen_torus }, { "catmull_rom", l_catmull_rom }, { "cr_lengths", l_cr_lengths }, { "bezier3", l_bezier3 }, { "ellipse", l_ellipse }, { "u_to_t", l_u_to_t }, { "gen_torus_knot", l_gen_torus_knot }, { "gen_cylinder", l_gen_cylinder }, { "gen_box", l_gen_box }, { "gen_polyhedron", l_gen_polyhedron }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "f64a", l_f64a }, { "f64a_get", l_f64a_get }, { "f64a_set", l_f64a_set }, { "f64a_fill", l_f64a_fill }, { "f64a_copy", l_f64a_copy }, { "v3a_add_xyz", l_v3a_add_xyz }, { "v3a_add_scaled", l_v3a_add_scaled }, { "v3a_multiply_scalar", l_v3a_multiply_scalar }, { "v3a_apply_m4a", l_v3a_apply_m4a }, { "v3a_sum", l_v3a_sum }, { "qa_from_euler_scaled", l_qa_from_euler_scaled }, { "m4a_compose", l_m4a_compose }, { "m4a_to_instanced", l_m4a_to_instanced }, { "array_part", l_array_part }, { "anim_register_more", l_anim_register_more }, { "deindex", l_deindex }, { "gen_sphere", l_gen_sphere }, { "gen_torus", l_gen_torus }, { "catmull_rom", l_catmull_rom }, { "cr_lengths", l_cr_lengths }, { "bezier3", l_bezier3 }, { "ellipse", l_ellipse }, { "u_to_t", l_u_to_t }, { "gen_torus_knot", l_gen_torus_knot }, { "gen_cylinder", l_gen_cylinder }, { "gen_box", l_gen_box }, { "gen_polyhedron", l_gen_polyhedron }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
     { "matrix", l_matrix },
     { "world", l_world }, { "local_matrix", l_local }, { "camera_matrices", l_camera_matrices },
     { "update_world", l_update_world }, { "update_world_matrix", l_update_world_matrix },
@@ -2852,6 +3035,8 @@ void wcl_open_three_c(lua_State *L) {
     luaL_newmetatable(L, HANDLE_MT);
     lua_pushcfunction(L, handle_gc);
     lua_setfield(L, -2, "__gc");
+    lua_pop(L, 1);
+    luaL_newmetatable(L, F64A_MT);
     lua_pop(L, 1);
     luaL_newmetatable(L, "t3.renderer");
     lua_pushcfunction(L, renderer_gc);
