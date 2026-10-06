@@ -2615,6 +2615,10 @@ static int l_bsphere_maxsq(lua_State *L) {
  * quaternion, a cart's own _onChange) calls into Lua as before. */
 enum { WK_X, WK_Y, WK_Z, WK_ORDER, WK_UX, WK_UY, WK_UZ, WK_UORDER, WK_SRCQ, WK_ONCH, WK_CB, WK_Q, WK_REC, WK_N, WK_COUNT };
 static TString *wkey[WK_COUNT];
+enum { OK_T3, OK_QUAT, OK_STD, OK_EYE, OK_UP, OK_ISCAM, OK_ISLIGHT, OK_ROT, OK_GEN, OK_COUNT };
+static TString *okey[OK_COUNT];
+static void fill(lua_State *L, int t, const float *e, int n);
+static void fill_d(lua_State *L, int t, const double *e, int n);
 /* rec[7] = true and onto the dirty list, unless it is there already */
 static void wk_mark(lua_State *L, Table *rec, int dirty_idx) {
     TValue *flag = tab_slot(rec, 7);
@@ -2730,6 +2734,26 @@ static int l_watched_vector_mm(lua_State *L) {
  * dirty mark (1, 5; matrixAutoUpdate also into rec[8]), onWrite(t, k, v)
  * in Lua (2, 3), changes.n + 1 (4). */
 
+enum { MK_MD, MK_OWNERS, MK_COLOR, MK_EMISSIVE, MK_SPECULAR, MK_COUNT };
+static TString *mkey[MK_COUNT];
+/* markMat(m): the material onto the dirty-materials list (once until synced) */
+static void mark_mat_c(lua_State *L, Table *m, Table *list) {
+    TValue *md = (TValue *)luaH_getshortstr(m, mkey[MK_MD]);
+    if (!isabstkey(md) && !l_isfalse(md)) return;
+    if (isabstkey(md)) {
+        sethvalue2s(L, L->top.p, m); L->top.p++;
+        lua_pushstring(L, getstr(mkey[MK_MD])); lua_pushboolean(L, 1); lua_rawset(L, -3); lua_pop(L, 1);
+    } else setbtvalue(md);
+    TValue *nv = (TValue *)luaH_getshortstr(list, wkey[WK_N]);
+    lua_Integer n = (ttisinteger(nv) ? ivalue(nv) : 0) + 1;
+    setivalue(nv, n);
+    TValue mv;
+    sethvalue(L, &mv, m);
+    TValue *slot = (TValue *)tab_geti(list, (int)n);
+    if (!isabstkey(slot)) { setobj(L, slot, &mv); luaC_barrierback(L, obj2gco(list), &mv); }
+    else luaH_setint(L, list, n, &mv);
+    luaC_barrierback(L, obj2gco(list), &mv);
+}
 static const TValue *cls_get(lua_State *L, int up_cls, const TValue *k, int *pushed) {
     *pushed = 0;
     const TValue *cv = UPV(up_cls);
@@ -2817,12 +2841,145 @@ static int l_wm_newindex(lua_State *L) {
         else if (ttisfloat(nv)) { setfltvalue(nv, fltvalue(nv) + 1); }
         return 0;
     }
-    default:   /* 2, 3: the Lua action */
-        setobj2s(L, L->top.p, UPV(4)); L->top.p++;
-        lua_pushvalue(L, 1); lua_pushvalue(L, 2); lua_pushvalue(L, 3);
-        lua_call(L, 3, 0);
+    case 2: {  /* a material: marked; a colour given to it is watched (Lua) */
+        mark_mat_c(L, tab_at(L, 1), hvalue(UPV(3)));
+        TString *ks = tsvalue(k);
+        if (lua_istable(L, 3) && (ks == mkey[MK_COLOR] || ks == mkey[MK_EMISSIVE] || ks == mkey[MK_SPECULAR])) {
+            setobj2s(L, L->top.p, UPV(4)); L->top.p++;
+            lua_pushvalue(L, 3); lua_pushvalue(L, 1);
+            lua_call(L, 2, 0);
+        }
         return 0;
     }
+    case 3: {  /* a colour: every material it belongs to marked */
+        Table *list = hvalue(UPV(3));
+        lua_pushstring(L, getstr(mkey[MK_OWNERS])); lua_rawget(L, 1);
+        if (lua_istable(L, -1)) {
+            lua_pushnil(L);
+            while (lua_next(L, -2)) { lua_pop(L, 1); if (lua_istable(L, -1)) mark_mat_c(L, tab_at(L, -1), list); }
+        }
+        return 0;
+    }
+    default:
+        return 0;
+    }
+}
+/* t3.proxy_mm(kind, h, filled) -> __index, __newindex of a Matrix4.elements
+ * stand-in for a twin's matrixWorld (kind 1) or a camera's
+ * matrixWorldInverse (2): the table fills itself with C's doubles on its
+ * first read after each world change (and is listed in filled[1..n] to be
+ * emptied by the next bump); further reads are plain. */
+static const double *proxy_src(int kind, void *h) {
+#ifdef T3_F64_MATH
+    return kind == 2 ? ((t3_camera *)h)->_mwid : ((t3_object *)h)->_mwd;
+#else
+    return NULL;
+#endif
+}
+static void proxy_fill(lua_State *L, int kind, void *h, Table *filled) {
+    const double *e = proxy_src(kind, h);
+    Table *p = tab_at(L, 1);
+    if (e) fill_d(L, 1, e, 16);
+    else {
+        const float *f = kind == 2 ? ((t3_camera *)h)->matrix_world_inverse.e : ((t3_object *)h)->matrix_world.e;
+        fill(L, 1, f, 16);
+    }
+    p = tab_at(L, 1);
+    TValue *nv = (TValue *)luaH_getshortstr(filled, wkey[WK_N]);
+    lua_Integer n = (ttisinteger(nv) ? ivalue(nv) : 0) + 1;
+    setivalue(nv, n);
+    TValue pv;
+    sethvalue(L, &pv, p);
+    TValue *slot = (TValue *)tab_geti(filled, (int)n);
+    if (!isabstkey(slot)) { setobj(L, slot, &pv); luaC_barrierback(L, obj2gco(filled), &pv); }
+    else luaH_setint(L, filled, n, &pv);
+    luaC_barrierback(L, obj2gco(filled), &pv);
+}
+/* upvalues: 1 kind, 2 h, 3 filled */
+static int l_px_index(lua_State *L) {
+    Table *p = tab_at(L, 1);
+    const TValue *first = tab_geti(p, 1);
+    if (isempty(first) || ttisnil(first)) { proxy_fill(L, (int)ivalue(UPV(1)), tv_handle(UPV(2)), hvalue(UPV(3))); p = tab_at(L, 1); }
+    const TValue *k = s2v(L->ci->func.p + 2);
+    const TValue *v = ttisinteger(k) ? tab_geti(p, (int)ivalue(k)) : luaH_get(p, k);
+    if (isempty(v)) lua_pushnil(L);
+    else { setobj2s(L, L->top.p, v); L->top.p++; }
+    return 1;
+}
+static int l_px_newindex(lua_State *L) {
+    lua_settop(L, 3);
+    Table *p = tab_at(L, 1);
+    const TValue *first = tab_geti(p, 1);
+    if (isempty(first) || ttisnil(first)) proxy_fill(L, (int)ivalue(UPV(1)), tv_handle(UPV(2)), hvalue(UPV(3)));
+    lua_rawset(L, 1);
+    return 0;
+}
+static int l_proxy_mm(lua_State *L) {
+    lua_Integer kind = luaL_checkinteger(L, 1);
+    luaL_checktype(L, 2, LUA_TUSERDATA);
+    luaL_checktype(L, 3, LUA_TTABLE);
+    lua_settop(L, 3);
+    lua_pushinteger(L, kind); lua_pushvalue(L, 2); lua_pushvalue(L, 3);
+    lua_pushcclosure(L, l_px_index, 3);
+    lua_pushinteger(L, kind); lua_pushvalue(L, 2); lua_pushvalue(L, 3);
+    lua_pushcclosure(L, l_px_newindex, 3);
+    return 2;
+}
+/* t3.proxy_elements_mm(h, real, filled, object, dirty) -> __index,
+ * __newindex of a Matrix4.elements stand-in for a twin's local matrix:
+ * reads come from C (real refilled on the first access after each world
+ * change, real.gen against filled.gen); a write lands in real and marks the
+ * object's record as hand-set (rec[10]) and dirty. */
+static void pe_fresh(lua_State *L) {
+    Table *real = hvalue(UPV(2)), *filled = hvalue(UPV(3));
+    const TValue *g = luaH_getshortstr(filled, okey[OK_GEN]);
+    TValue *seen = (TValue *)luaH_getshortstr(real, okey[OK_GEN]);
+    if (!ttisinteger(g) || isabstkey(seen) || (ttisinteger(seen) && ivalue(seen) == ivalue(g))) return;
+    t3_object *o = (t3_object *)tv_handle(UPV(1));
+    sethvalue2s(L, L->top.p, real); L->top.p++;
+#ifdef T3_F64_MATH
+    fill_d(L, lua_gettop(L), o->_md, 16);
+#else
+    fill(L, lua_gettop(L), o->matrix.e, 16);
+#endif
+    lua_pop(L, 1);
+    seen = (TValue *)luaH_getshortstr(real, okey[OK_GEN]);
+    setivalue(seen, ivalue(g));
+}
+static int l_pe_index(lua_State *L) {
+    pe_fresh(L);
+    const TValue *k = s2v(L->ci->func.p + 2);
+    Table *real = hvalue(UPV(2));
+    const TValue *v = ttisinteger(k) ? tab_geti(real, (int)ivalue(k)) : luaH_get(real, k);
+    if (isempty(v)) lua_pushnil(L);
+    else { setobj2s(L, L->top.p, v); L->top.p++; }
+    return 1;
+}
+static int l_pe_newindex(lua_State *L) {
+    lua_settop(L, 3);
+    pe_fresh(L);
+    sethvalue2s(L, L->top.p, hvalue(UPV(2))); L->top.p++;
+    lua_pushvalue(L, 2); lua_pushvalue(L, 3);
+    lua_rawset(L, -3);
+    lua_pop(L, 1);
+    Table *rec = tv_tab(luaH_getshortstr(hvalue(UPV(4)), wmkey_t3rec));
+    if (rec) {
+        TValue *mx = tab_slot(rec, 10);
+        if (!isabstkey(mx)) setbtvalue(mx);
+        else { TValue t; setbtvalue(&t); luaH_setint(L, rec, 10, &t); }
+        wk_mark_t(L, rec, hvalue(UPV(5)));
+    }
+    return 0;
+}
+static int l_proxy_elements_mm(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TUSERDATA);
+    luaL_checktype(L, 2, LUA_TTABLE); luaL_checktype(L, 3, LUA_TTABLE); luaL_checktype(L, 4, LUA_TTABLE); luaL_checktype(L, 5, LUA_TTABLE);
+    lua_settop(L, 5);
+    for (int c = 0; c < 2; c++) {
+        for (int i = 1; i <= 5; i++) lua_pushvalue(L, i);
+        lua_pushcclosure(L, c == 0 ? l_pe_index : l_pe_newindex, 5);
+    }
+    return 2;
 }
 static int l_watched_mm(lua_State *L) {
     lua_Integer mode = luaL_checkinteger(L, 1);
@@ -3686,8 +3843,6 @@ static int sync_light_c(lua_State *L, Table *o) {
  * flush of pending writes, the twin's world update, the proxies' reset,
  * the result), each falling back to its Lua version for an object without
  * a twin or a case it does not cover. */
-enum { OK_T3, OK_QUAT, OK_STD, OK_EYE, OK_UP, OK_ISCAM, OK_ISLIGHT, OK_ROT, OK_GEN, OK_COUNT };
-static TString *okey[OK_COUNT];
 /* bump(): the world matrices changed; the filled proxies forget their copies */
 static void bump_c(lua_State *L, Table *filled) {
     TValue *g = (TValue *)luaH_getshortstr(filled, okey[OK_GEN]);
@@ -4170,6 +4325,17 @@ static int l_tex_set(lua_State *L) {
               F(16), !lua_isnoneornil(L, 16));
     return 0;
 }
+/* t3.mat_get(h): the twin's colour, emissive, specular, opacity, transparent,
+ * side, visible, wireframe (for checking a sync) */
+static int l_mat_get(lua_State *L) {
+    t3_material *m = (t3_material *)P(L, 1);
+    lua_pushnumber(L, m->color.r); lua_pushnumber(L, m->color.g); lua_pushnumber(L, m->color.b);
+    lua_pushnumber(L, m->emissive.r); lua_pushnumber(L, m->emissive.g); lua_pushnumber(L, m->emissive.b);
+    lua_pushnumber(L, m->specular.r); lua_pushnumber(L, m->specular.g); lua_pushnumber(L, m->specular.b);
+    lua_pushnumber(L, m->opacity); lua_pushboolean(L, m->transparent); lua_pushinteger(L, m->side);
+    lua_pushboolean(L, m->visible); lua_pushboolean(L, m->wireframe);
+    return 14;
+}
 /* t3.tex_get(h): wrapS, wrapT, magFilter, minFilter, flipY, generateMipmaps,
  * encoding, offset x y, repeat x y, center x y, rotation, anisotropy,
  * version (for checking a sync) */
@@ -4557,7 +4723,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at }, { "ray_from_camera", l_ray_from_camera },
 #endif
@@ -4649,6 +4815,12 @@ void wcl_open_three_c(lua_State *L) {
             tkey_hidden[i] = (TString *)lua_topointer(L, -1);
             luaL_ref(L, LUA_REGISTRYINDEX);
         }
+    }
+    static const char *const mnames[MK_COUNT] = { "_t3md", "_w_owners", "color", "emissive", "specular" };
+    for (int i = 0; i < MK_COUNT; i++) {
+        lua_pushstring(L, mnames[i]);
+        mkey[i] = (TString *)lua_topointer(L, -1);
+        luaL_ref(L, LUA_REGISTRYINDEX);
     }
     static const char *const wnames[WK_COUNT] = { "x", "y", "z", "order", "_x", "_y", "_z", "_order", "_srcq",
                                                   "_onChange", "_t3cb", "_t3q", "_t3rec", "n" };
