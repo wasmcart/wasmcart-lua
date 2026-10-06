@@ -787,6 +787,11 @@ static int l_m4_copy(lua_State *L) {
     if (!lua_istable(L, 1) || !lua_istable(L, 2)) { lua_pushboolean(L, 0); return 1; }
     Table *a = tab_at(L, 1), *b = tab_at(L, 2);
     if (a->alimit < 16 || b->alimit < 16) { lua_pushboolean(L, 0); return 1; }
+    /* a matrix stand-in emptied by a world change has its slots but not its
+     * numbers: Lua's element reads refill it (copying the slots would copy
+     * nils, and a camera's inverse was then the inverse of the stand-in's
+     * later refill, C's inverse itself) */
+    for (int i = 0; i < 16; i++) if (!ttisnumber(&b->array[i])) { lua_pushboolean(L, 0); return 1; }
     for (int i = 0; i < 16; i++) setobj(L, &a->array[i], &b->array[i]);
     lua_pushboolean(L, 1);
     return 1;
@@ -2617,6 +2622,7 @@ enum { WK_X, WK_Y, WK_Z, WK_ORDER, WK_UX, WK_UY, WK_UZ, WK_UORDER, WK_SRCQ, WK_O
 static TString *wkey[WK_COUNT];
 enum { OK_T3, OK_QUAT, OK_STD, OK_EYE, OK_UP, OK_ISCAM, OK_ISLIGHT, OK_ROT, OK_GEN, OK_COUNT };
 static TString *okey[OK_COUNT];
+static TString *rkey_mwi, *rkey_elements;
 enum { TK_MAP, TK_NORMAL, TK_AO, TK_EMISSIVE, TK_ROUGH, TK_METAL, TK_ALPHA, TK_NMAPS,
        TK_T3 = TK_NMAPS, TK_VERSION, TK_T3VER, TK_WRAPS, TK_WRAPT, TK_MAG, TK_MIN, TK_FLIPY, TK_ISDATA, TK_MIPS,
        TK_ENC, TK_OFFSET, TK_REPEAT, TK_CENTER, TK_ROT, TK_ANISO, TK_COUNT };
@@ -4151,6 +4157,44 @@ static int l_om_look_at(lua_State *L) {
     lua_settop(L, 1);
     return 1;
 }
+/* t3.camera_methods(dirty, filled, flushKept, luaUpdateMatrixWorld) ->
+ * updateMatrixWorld for a Camera with a twin: the object update, then
+ * matrixWorldInverse.elements = invert(copy(matrixWorld)) with the
+ * m4_invert kernel's arithmetic on the twin's doubles */
+static int l_m4_invert(lua_State *L);
+static int l_cm_update_matrix_world(lua_State *L) {
+    lua_settop(L, 2);
+    Table *o = lua_istable(L, 1) ? tab_at(L, 1) : NULL;
+    t3_object *h = o ? (t3_object *)tv_handle(luaH_getshortstr(o, okey[OK_T3])) : NULL;
+    Table *mwi = o ? tv_tab(luaH_getshortstr(o, rkey_mwi)) : NULL;
+    Table *el = mwi ? tv_tab(luaH_getshortstr(mwi, rkey_elements)) : NULL;
+    if (!h || !el) return om_fallback(L, 4, 2);
+    om_flush(L, hvalue(UPV(1)), UPV(3));
+    uint32_t before = t3_world_recompute_count();
+    t3_object_update_matrix_world(h, B(2));
+    if (t3_world_recompute_count() != before) bump_c(L, hvalue(UPV(2)));
+    sethvalue2s(L, L->top.p, el); L->top.p++;
+#ifdef T3_F64_MATH
+    fill_d(L, lua_gettop(L), h->_mwd, 16);
+#else
+    fill(L, lua_gettop(L), h->matrix_world.e, 16);
+#endif
+    lua_pushcfunction(L, l_m4_invert);
+    lua_pushvalue(L, -2);
+    lua_call(L, 1, 1);
+    int ok = lua_toboolean(L, -1);
+    lua_pop(L, 2);
+    if (!ok) return luaL_error(L, "camera updateMatrixWorld: the inverse kernel declined");
+    lua_settop(L, 1);
+    return 1;
+}
+static int l_camera_methods(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE); luaL_checktype(L, 2, LUA_TTABLE); luaL_checktype(L, 3, LUA_TFUNCTION);
+    luaL_checktype(L, 4, LUA_TFUNCTION);
+    lua_settop(L, 4);
+    lua_pushcclosure(L, l_cm_update_matrix_world, 4);
+    return 1;
+}
 static int l_object_methods(lua_State *L) {
     luaL_checktype(L, 1, LUA_TTABLE); luaL_checktype(L, 2, LUA_TTABLE); luaL_checktype(L, 3, LUA_TFUNCTION);
     luaL_checktype(L, 4, LUA_TTABLE); luaL_checktype(L, 5, LUA_TFUNCTION); luaL_checktype(L, 6, LUA_TFUNCTION);
@@ -5226,7 +5270,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "frame_setup", l_frame_setup }, { "raycast_records", l_raycast_records }, { "sync_materials", l_sync_materials }, { "renderer_get", l_renderer_get }, { "scene_get", l_scene_get }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "frame_setup", l_frame_setup }, { "raycast_records", l_raycast_records }, { "sync_materials", l_sync_materials }, { "renderer_get", l_renderer_get }, { "scene_get", l_scene_get }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "camera_methods", l_camera_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at }, { "ray_from_camera", l_ray_from_camera },
 #endif
@@ -5299,6 +5343,8 @@ void wcl_open_three_c(lua_State *L) {
         lkey[i] = (TString *)lua_topointer(L, -1);
         luaL_ref(L, LUA_REGISTRYINDEX);
     }
+    lua_pushstring(L, "matrixWorldInverse"); rkey_mwi = (TString *)lua_topointer(L, -1); luaL_ref(L, LUA_REGISTRYINDEX);
+    lua_pushstring(L, "elements"); rkey_elements = (TString *)lua_topointer(L, -1); luaL_ref(L, LUA_REGISTRYINDEX);
     static const char *const onames[OK_COUNT] = { "_t3", "quaternion", "_t3std", "_t3lookEye", "up", "isCamera", "isLight", "rotation", "gen" };
     for (int i = 0; i < OK_COUNT; i++) {
         lua_pushstring(L, onames[i]);
