@@ -2462,8 +2462,14 @@ static int l_instance_euler_range(lua_State *L) {
     float *base = (float *)im->instance_matrix->array;
     float v[9];
     Table *tb = tab_at(L, 4);
+    /* the array part read directly when it holds the whole range */
+    const TValue *arr = (lua_Integer)tb->alimit >= (lua_Integer)count * 9 ? tb->array : NULL;
     for (int k = 0; k < count; k++) {
-        for (int j = 0; j < 9; j++) v[j] = (float)tab_num(tb, k * 9 + j + 1);
+        if (arr) {
+            const TValue *src = arr + k * 9;
+            for (int j = 0; j < 9; j++) v[j] = (float)(ttisfloat(&src[j]) ? fltvalue(&src[j]) : tv_num(&src[j]));
+        } else
+            for (int j = 0; j < 9; j++) v[j] = (float)tab_num(tb, k * 9 + j + 1);
         t3_euler e = { v[3], v[4], v[5], order };
         t3_mat4_compose((t3_mat4 *)(base + (first + k) * 16), t3_v3(v[0], v[1], v[2]), t3_quat_from_euler(e),
                         t3_v3(v[6], v[7], v[8]));
