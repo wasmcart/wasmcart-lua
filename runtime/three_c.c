@@ -3318,9 +3318,11 @@ static int renderer_gc(lua_State *L) {
     return 0;
 }
 
-/* t3.renderer(w, h) */
+/* t3.renderer(w, h) -> renderer | nil, why */
 static int l_renderer(lua_State *L) {
-    if (!wcl_r2d_active()) return luaL_error(L, "t3.renderer: needs the GL engine (this frame is on the CPU path)");
+    /* no GL this frame (a headless host, the CPU path): nil, and three.lua
+     * renders with its Lua renderer as it did before three.c */
+    if (!wcl_r2d_active()) { lua_pushnil(L); lua_pushstring(L, "t3.renderer: no GL on this frame (CPU path)"); return 2; }
     wcl_r2d__flush_for_external_gl();
     t3_renderer *r = t3_renderer_new(I(1), I(2));
     wcl_r2d__after_external_gl();
