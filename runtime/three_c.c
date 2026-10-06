@@ -345,7 +345,7 @@ static int l_flush(lua_State *L) {
 /* ── animation: the per-track step of AnimationAction:_update ─────────── */
 
 enum { AK_PP, AK_SV, AK_VS, AK_CI, AK_BUF, AK_CW, AK_RB, AK_MK, AK_CWA, AK_BINDING, AK_SETV, AK_RP, AK_ONCH,
-       AK_X, AK_Y, AK_Z, AK_W, AK_TO, AK_MWNU, AK_N, AK_LO, AK_HI, AK_COUNT };
+       AK_X, AK_Y, AK_Z, AK_W, AK_TO, AK_MWNU, AK_N, AK_LO, AK_HI, AK_REC, AK_PN, AK_COUNT };
 static TString *anim_key[AK_COUNT];
 
 static TValue *tab_slot(Table *t, int i) { return (TValue *)tab_geti(t, i); }
@@ -565,6 +565,19 @@ static int l_anim_step(lua_State *L) {
  * the setter that also sets targetObject.matrixWorldNeedsUpdate (an
  * Object3D's position / quaternion / scale) */
 static const void *anim_fromarray, *anim_v3_mt, *anim_q_mt, *anim_fromarray_mw;
+/* t3.anim_register_more(WV3, WQ, setDirect, setDirectMWNU): a mirrored
+ * object's watched vector / quaternion metatables (three.lua's _t3.lua:
+ * components in array slots, slot 5 a quaternion's stale flag, _rec the
+ * record Lua marks), and the plain-property setters */
+static const void *anim_wv3_mt, *anim_wq_mt, *anim_setdirect, *anim_setdirect_mw;
+static int l_anim_register_more(lua_State *L) {
+    for (int i = 1; i <= 4; i++) { lua_pushvalue(L, i); luaL_ref(L, LUA_REGISTRYINDEX); }
+    anim_wv3_mt = lua_topointer(L, 1);
+    anim_wq_mt = lua_topointer(L, 2);
+    anim_setdirect = lua_topointer(L, 3);
+    anim_setdirect_mw = lua_topointer(L, 4);
+    return 0;
+}
 static int l_anim_register(lua_State *L) {
     for (int i = 1; i <= 4; i++) { lua_pushvalue(L, i); luaL_ref(L, LUA_REGISTRYINDEX); }
     anim_fromarray = lua_topointer(L, 1);
@@ -577,13 +590,42 @@ static int l_anim_register(lua_State *L) {
 /* The binding's write done here when it is the plain fromArray setter on a
  * plain Vector3 / Quaternion (fields present, its own metatable): returns
  * the target, or NULL for Lua's setValue */
-static Table *anim_direct(lua_State *L, Table *mx, int stride, Table *buf, int offset) {
+/* setDirect for a number property that is a plain number field (Lua's
+ * boolean conversion, and a watched field, are left to Lua) */
+static int anim_direct_number(lua_State *L, Table *b, const void *setter, Table *buf, int offset) {
+    TValue *mwnu = NULL;
+    if (setter == anim_setdirect_mw) {
+        Table *to = tab_field_tab(b, AK_TO);
+        if (!to) return 0;
+        mwnu = (TValue *)luaH_getshortstr(to, anim_key[AK_MWNU]);
+        if (isabstkey(mwnu)) return 0;
+    }
+    Table *to = tab_field_tab(b, AK_TO);
+    const TValue *pn = luaH_getshortstr(b, anim_key[AK_PN]);
+    if (!to || !ttisshrstring(pn)) return 0;
+    TValue *slot = (TValue *)luaH_getshortstr(to, tsvalue(pn));
+    const TValue *v = tab_geti(buf, offset + 1);
+    if (isabstkey(slot) || !ttisnumber(slot) || !ttisnumber(v)) return 0;
+    setobj(L, slot, v);
+    if (mwnu) setbtvalue(mwnu);
+    return 1;
+}
+
+/* *rec: set to a watched target's record (Lua marks it) */
+static Table *anim_direct(lua_State *L, Table *mx, int stride, Table *buf, int offset, Table **rec, int *done,
+                          int allow_watched) {
+    *rec = NULL;
+    *done = 0;
     if (!anim_fromarray) return NULL;
     Table *b = tab_field_tab(mx, AK_BINDING);
     if (!b) return NULL;
     const TValue *sv = luaH_getshortstr(b, anim_key[AK_SETV]);
     if (!ttisLclosure(sv)) return NULL;
     const void *setter = clLvalue(sv);
+    if (stride == 1 && anim_setdirect && (setter == anim_setdirect || setter == anim_setdirect_mw)) {
+        *done = anim_direct_number(L, b, setter, buf, offset);
+        return NULL;
+    }
     TValue *mwnu = NULL;
     if (setter == anim_fromarray_mw && anim_fromarray_mw) {
         /* the flag must be a plain field of the target (a mirrored object
@@ -596,6 +638,26 @@ static Table *anim_direct(lua_State *L, Table *mx, int stride, Table *buf, int o
     Table *dst = tab_field_tab(b, AK_RP);
     if (!dst || !dst->metatable) return NULL;
     const void *mt = dst->metatable;
+    if (allow_watched && anim_wv3_mt && ((mt == anim_wv3_mt && stride == 3) || (mt == anim_wq_mt && stride == 4))) {
+        /* watched: the components in slots 1..stride (a quaternion's stale
+         * flag, slot 5, cleared: all four are written), then Lua marks */
+        /* (the slots may sit in the hash part: they were added to a table
+         * that had only string keys) */
+        TValue *sl[5];
+        int ns = stride == 4 ? 5 : 3;
+        for (int i = 0; i < ns; i++) {
+            sl[i] = tab_slot(dst, i + 1);
+            if (isabstkey(sl[i])) return NULL;
+        }
+        Table *r = tv_tab(luaH_getshortstr(dst, anim_key[AK_REC]));
+        if (!r) return NULL;
+        for (int i = 0; i < stride; i++) setobj(L, sl[i], tab_geti(buf, offset + i + 1));
+        if (stride == 4) setbfvalue(sl[4]);
+        if (mwnu) setbtvalue(mwnu);
+        *rec = r;
+        *done = 1;
+        return dst;
+    }
     if (!((mt == anim_v3_mt && stride == 3) || (mt == anim_q_mt && stride == 4))) return NULL;
     TValue *slot[4];
     for (int i = 0; i < stride; i++) {
@@ -607,14 +669,15 @@ static Table *anim_direct(lua_State *L, Table *mx, int stride, Table *buf, int o
         setobj(L, slot[i], v);
     }
     if (mwnu) setbtvalue(mwnu);
+    *done = 1;
     return dst;
 }
 
 static int l_anim_apply(lua_State *L) {
     Table *mxs = tab_at(L, 1);
     int n = I(2), accuIndex = I(3);
-    int nc = 0, no = 0, ncb = 0;
-    int have_cb = lua_istable(L, 6);
+    int nc = 0, no = 0, ncb = 0, nm = 0;
+    int have_cb = lua_istable(L, 6), have_marks = lua_istable(L, 7);
     for (int j = 1; j <= n; j++) {
         Table *mx = tv_tab(tab_geti(mxs, j));
         if (!mx) continue;
@@ -650,11 +713,20 @@ static int l_anim_apply(lua_State *L) {
         }
         for (int i = stride + 1; i <= stride + stride; i++)
             if (!luaV_rawequalobj(tab_geti(buf, i), tab_geti(buf, i + stride))) {
-                Table *dst = have_cb ? anim_direct(L, mx, stride, buf, offset) : NULL;
-                if (!dst) {
+                Table *rec = NULL;
+                int done = 0;
+                Table *dst = have_cb ? anim_direct(L, mx, stride, buf, offset, &rec, &done, have_marks) : NULL;
+                if (!done) {
                     lua_pushinteger(L, j);
                     lua_rawseti(L, 4, ++nc);
-                } else if (stride == 4 && !ttisnil(luaH_getshortstr(dst, anim_key[AK_ONCH]))) {
+                    break;
+                }
+                if (rec) {
+                    sethvalue2s(L, L->top.p, rec);
+                    L->top.p++;
+                    lua_rawseti(L, 7, ++nm);
+                }
+                if (dst && stride == 4 && !ttisnil(luaH_getshortstr(dst, anim_key[AK_ONCH]))) {
                     sethvalue2s(L, L->top.p, dst);
                     L->top.p++;
                     lua_rawseti(L, 6, ++ncb);
@@ -665,7 +737,8 @@ static int l_anim_apply(lua_State *L) {
     lua_pushinteger(L, nc);
     lua_pushinteger(L, no);
     lua_pushinteger(L, ncb);
-    return 3;
+    lua_pushinteger(L, nm);
+    return 4;
 }
 
 /* ── Matrix4 kernels for three.lua ─────────────────────────────────────
@@ -2566,7 +2639,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "deindex", l_deindex }, { "gen_sphere", l_gen_sphere }, { "gen_torus", l_gen_torus }, { "catmull_rom", l_catmull_rom }, { "bezier3", l_bezier3 }, { "gen_torus_knot", l_gen_torus_knot }, { "gen_cylinder", l_gen_cylinder }, { "gen_box", l_gen_box }, { "gen_polyhedron", l_gen_polyhedron }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "anim_register_more", l_anim_register_more }, { "deindex", l_deindex }, { "gen_sphere", l_gen_sphere }, { "gen_torus", l_gen_torus }, { "catmull_rom", l_catmull_rom }, { "bezier3", l_bezier3 }, { "gen_torus_knot", l_gen_torus_knot }, { "gen_cylinder", l_gen_cylinder }, { "gen_box", l_gen_box }, { "gen_polyhedron", l_gen_polyhedron }, { "vertex_normals", l_vertex_normals }, { "ptr", l_ptr }, { "raycast", l_raycast }, { "trs_euler", l_trs_euler }, { "quat_from_euler", l_quat_from_euler }, { "trs_many", l_trs_many }, { "flags", l_flags }, { "visible", l_visible },
     { "matrix", l_matrix },
     { "world", l_world }, { "local_matrix", l_local }, { "camera_matrices", l_camera_matrices },
     { "update_world", l_update_world }, { "update_world_matrix", l_update_world_matrix },
@@ -2608,7 +2681,7 @@ void wcl_open_three_c(lua_State *L) {
                                                   "buffer", "cumulativeWeight", "resultBuffer", "_t3mk",
                                                   "cumulativeWeightAdditive", "binding", "setValue",
                                                   "resolvedProperty", "_onChange", "x", "y", "z", "w",
-                                                  "targetObject", "matrixWorldNeedsUpdate", "n", "lo", "hi" };
+                                                  "targetObject", "matrixWorldNeedsUpdate", "n", "lo", "hi", "_rec", "propertyName" };
     for (int i = 0; i < AK_COUNT; i++) {
         lua_pushstring(L, anames[i]);
         anim_key[i] = (TString *)lua_topointer(L, -1);
