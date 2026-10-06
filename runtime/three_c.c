@@ -2628,6 +2628,7 @@ enum { TK_MAP, TK_NORMAL, TK_AO, TK_EMISSIVE, TK_ROUGH, TK_METAL, TK_ALPHA, TK_N
        TK_ENC, TK_OFFSET, TK_REPEAT, TK_CENTER, TK_ROT, TK_ANISO, TK_COUNT };
 static TString *tkey[TK_COUNT], *tkey_hidden[TK_NMAPS];
 static int sync_texture_c(Table *tex);
+static int om_fallback(lua_State *L, int up, int nargs);
 static void aim(t3_renderer *r);
 static void hand_back(t3_renderer *r);
 static const TValue *obj_get(lua_State *L, Table *o, TString *k, TString *hidden);
@@ -3093,15 +3094,11 @@ static int ellipse_eval(Table *c, double t, double out[2]) {
     out[0] = x; out[1] = y;
     return 1;
 }
-static int l_curve_getpoint(lua_State *L) {
-    int kind = (int)lua_tointeger(L, lua_upvalueindex(1));
-    lua_settop(L, 3);                               /* self, t, target */
-    num_t r[3];
+/* getPoint(t) of a curve table by its kernel: the point's components (as
+ * typed numbers), their count, 0 when the kernel declines */
+static int curve_eval(lua_State *L, int kind, Table *cv, double t, int t_int, num_t r[3]) {
     int nres = 0;
-    if (lua_istable(L, 1) && lua_isnumber(L, 2)) {
-        Table *cv = tab_at(L, 1);
-        int t_int = lua_isinteger(L, 2);
-        double t = lua_tonumber(L, 2);
+    {
         if (kind == 1) {
             Table *pts = tv_tab(luaH_getshortstr(cv, ckey[CK_POINTS]));
             const TValue *ct = luaH_getshortstr(cv, ckey[CK_CTYPE]);
@@ -3139,6 +3136,14 @@ static int l_curve_getpoint(lua_State *L) {
             if (ellipse_eval(cv, t, o)) { r[0] = nflt(o[0]); r[1] = nflt(o[1]); nres = 2; }
         }
     }
+    return nres;
+}
+static int l_curve_getpoint(lua_State *L) {
+    int kind = (int)lua_tointeger(L, lua_upvalueindex(1));
+    lua_settop(L, 3);                               /* self, t, target */
+    num_t r[3];
+    int nres = 0;
+    if (lua_istable(L, 1) && lua_isnumber(L, 2)) nres = curve_eval(L, kind, tab_at(L, 1), lua_tonumber(L, 2), lua_isinteger(L, 2), r);
     if (!nres) {
         lua_pushvalue(L, lua_upvalueindex(2));
         lua_insert(L, 1);
@@ -3164,6 +3169,160 @@ static int l_curve_getpoint(lua_State *L) {
     for (int d = 0; d < nres; d++) push_num(L, r[d]);
     lua_call(L, 1 + nres, 1);
     return 1;
+}
+/* t3.curve_methods(getLengths, getUtoTmapping, getPointAt, getPoints,
+ * getSpacedPoints) -> the same five for Curve in C: the arc-length table
+ * (cached as Lua caches it; a curve whose getPoint is a kernel sampled
+ * here, the Catmull-Rom one through t3.cr_lengths), the u -> t mapping,
+ * the point at u, the point lists (getPoint / getPointAt called as Lua
+ * calls them). Each falls back to its Lua version when something is not
+ * as expected. */
+enum { CMK_CACHE, CMK_NEEDS, CMK_DIVS, CMK_GETPOINT, CMK_GETPOINTAT, CMK_COUNT };
+static TString *cmkey[CMK_COUNT];
+static int l_cr_lengths(lua_State *L);
+static int l_u_to_t(lua_State *L);
+/* the curve's getPoint kernel kind, 0 when its getPoint is not a kernel closure */
+static int curve_kind(lua_State *L, int self) {
+    lua_getfield(L, self, getstr(cmkey[CMK_GETPOINT]));
+    int kind = 0;
+    if (lua_tocfunction(L, -1) == l_curve_getpoint && lua_getupvalue(L, -1, 1)) { kind = (int)lua_tointeger(L, -1); lua_pop(L, 1); }
+    lua_pop(L, 1);
+    return kind;
+}
+/* getLengths(self, divisions) in C: pushes the cache table and returns 1, or 0 (Lua) */
+static int cm_lengths(lua_State *L, int self, int divs_idx) {
+    if (!lua_istable(L, self)) return 0;
+    Table *cv = tab_at(L, self);
+    lua_Integer div;
+    if (divs_idx && !lua_isnoneornil(L, divs_idx)) {
+        if (!lua_isinteger(L, divs_idx)) return 0;
+        div = lua_tointeger(L, divs_idx);
+    } else {
+        const TValue *dv = obj_get(L, cv, cmkey[CMK_DIVS], NULL);
+        if (!dv || !ttisinteger(dv)) return 0;
+        div = ivalue(dv);
+    }
+    const TValue *cachev = obj_get(L, cv, cmkey[CMK_CACHE], NULL), *nu = obj_get(L, cv, cmkey[CMK_NEEDS], NULL);
+    if (!cachev || !nu) return 0;
+    Table *cache = tv_tab(cachev);
+    if (cache && (lua_Integer)luaH_getn(cache) == div + 1 && !(!isempty(nu) && tv_true(nu))) {
+        sethvalue2s(L, L->top.p, cache); L->top.p++;
+        return 1;
+    }
+    int kind = curve_kind(L, self);
+    if (!kind || div < 1 || div > (1 << 20)) return 0;
+    int base = lua_gettop(L);
+    if (!cache) { lua_newtable(L); lua_pushvalue(L, -1); lua_setfield(L, self, getstr(cmkey[CMK_CACHE])); cache = tab_at(L, -1); }
+    else { sethvalue2s(L, L->top.p, cache); L->top.p++; }
+    int ci = base + 1;                                   /* the cache on the stack */
+    if (kind == 1) {
+        lua_pushcfunction(L, l_cr_lengths);
+        setobj2s(L, L->top.p, luaH_getshortstr(cv, ckey[CK_POINTS])); L->top.p++;
+        setobj2s(L, L->top.p, luaH_getshortstr(cv, ckey[CK_CLOSED])); L->top.p++;
+        setobj2s(L, L->top.p, luaH_getshortstr(cv, ckey[CK_CTYPE])); L->top.p++;
+        setobj2s(L, L->top.p, luaH_getshortstr(cv, ckey[CK_TENSION])); L->top.p++;
+        setobj2s(L, L->top.p, luaH_getshortstr(cv, ckey[CK_ENDC])); L->top.p++;
+        lua_pushinteger(L, div);
+        lua_pushvalue(L, ci);
+        for (int i = 2; i <= 6; i++) if (lua_type(L, base + 1 + i) == LUA_TNONE) { lua_settop(L, base); return 0; }
+        lua_call(L, 7, 1);
+        int ok = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+        if (!ok) { lua_settop(L, base); return 0; }
+    } else {
+        num_t prev[3], cur[3];
+        int nres = curve_eval(L, kind, cv, 0, 1, prev);        /* getPoint(0, prev) */
+        if (!nres) { lua_settop(L, base); return 0; }
+        num_bail = 0;
+        num_t sum = nint(0);
+        double *sums = (double *)malloc(sizeof(double) * (size_t)div);
+        int *sumi = (int *)malloc(sizeof(int) * (size_t)div);
+        for (lua_Integer p = 1; p <= div; p++) {
+            if (curve_eval(L, kind, cv, (double)p / (double)div, 0, cur) != nres) { free(sums); free(sumi); lua_settop(L, base); return 0; }
+            num_t dx = nsub(cur[0], prev[0]), dy = nsub(cur[1], prev[1]);
+            num_t dz = nres == 3 ? nsub(cur[2], prev[2]) : nsub(nint(0), nint(0));
+            num_t sq = nadd(nadd(nmul(dx, dx), nmul(dy, dy)), nmul(dz, dz));
+            sum = nadd(sum, nflt(sqrt(sq.d)));
+            sums[p - 1] = sum.d; sumi[p - 1] = sum.i;
+            memcpy(prev, cur, sizeof(prev));
+        }
+        if (num_bail) { free(sums); free(sumi); lua_settop(L, base); return 0; }
+        lua_pushinteger(L, 0); lua_rawseti(L, ci, 1);
+        for (lua_Integer p = 1; p <= div; p++) { num_t v = { sums[p - 1], sumi[p - 1] }; push_num(L, v); lua_rawseti(L, ci, (int)p + 1); }
+        free(sums); free(sumi);
+    }
+    lua_pushboolean(L, 0); lua_setfield(L, self, getstr(cmkey[CMK_NEEDS]));
+    cache = tab_at(L, ci);
+    lua_Integer n = (lua_Integer)luaH_getn(cache);
+    for (lua_Integer k = div + 2; k <= n; k++) { lua_pushnil(L); lua_rawseti(L, ci, (int)k); }
+    lua_settop(L, ci);
+    return 1;
+}
+/* upvalues: 1 Lua getLengths */
+static int l_cm_get_lengths(lua_State *L) {
+    lua_settop(L, 2);
+    if (cm_lengths(L, 1, 2)) return 1;
+    return om_fallback(L, 1, 2);
+}
+/* u -> t: pushes t and returns 1, or 0 */
+static int cm_u_to_t(lua_State *L, int self, int u_idx, int d_idx) {
+    if (!cm_lengths(L, self, 0)) return 0;
+    lua_pushcfunction(L, l_u_to_t);
+    lua_pushvalue(L, -2); lua_pushvalue(L, u_idx); lua_pushvalue(L, d_idx);
+    lua_call(L, 3, 1);
+    if (lua_isnil(L, -1) || lua_isboolean(L, -1)) { lua_pop(L, 2); return 0; }
+    lua_remove(L, -2);
+    return 1;
+}
+/* upvalues: 1 Lua getUtoTmapping */
+static int l_cm_u_to_t(lua_State *L) {
+    lua_settop(L, 3);
+    if (cm_u_to_t(L, 1, 2, 3)) return 1;
+    return om_fallback(L, 1, 3);
+}
+/* upvalues: 1 Lua getPointAt */
+static int l_cm_get_point_at(lua_State *L) {
+    lua_settop(L, 3);
+    lua_pushnil(L);                                       /* 4: no distance */
+    if (!cm_u_to_t(L, 1, 2, 4)) { lua_settop(L, 3); return om_fallback(L, 1, 3); }
+    /* self:getPoint(t, target) */
+    lua_getfield(L, 1, getstr(cmkey[CMK_GETPOINT]));
+    lua_pushvalue(L, 1); lua_pushvalue(L, -3); lua_pushvalue(L, 3);
+    lua_call(L, 3, 1);
+    return 1;
+}
+/* getPoints / getSpacedPoints: divisions or 5 points from self:getPoint /
+ * self:getPointAt (d / divisions, a float) */
+static int cm_points(lua_State *L, int spaced) {
+    lua_settop(L, 2);
+    if (!lua_istable(L, 1)) return om_fallback(L, 1, 2);
+    lua_Integer div;
+    if (lua_isnoneornil(L, 2)) div = 5;
+    else if (lua_isinteger(L, 2)) div = lua_tointeger(L, 2);
+    else return om_fallback(L, 1, 2);
+    if (div < 0) return om_fallback(L, 1, 2);
+    lua_createtable(L, (int)div + 1, 0);               /* 3: points */
+    lua_getfield(L, 1, getstr(cmkey[spaced ? CMK_GETPOINTAT : CMK_GETPOINT]));   /* 4: the method */
+    for (lua_Integer d = 0; d <= div; d++) {
+        lua_pushvalue(L, 4); lua_pushvalue(L, 1); lua_pushnumber(L, (double)d / (double)div);
+        lua_call(L, 2, 1);
+        if (lua_isnil(L, -1)) { lua_pop(L, 1); continue; }
+        lua_rawseti(L, 3, (int)lua_rawlen(L, 3) + 1);
+    }
+    lua_settop(L, 3);
+    return 1;
+}
+static int l_cm_get_points(lua_State *L) { return cm_points(L, 0); }
+static int l_cm_get_spaced_points(lua_State *L) { return cm_points(L, 1); }
+static int l_curve_methods(lua_State *L) {
+    for (int i = 1; i <= 5; i++) luaL_checktype(L, i, LUA_TFUNCTION);
+    lua_settop(L, 5);
+    lua_pushvalue(L, 1); lua_pushcclosure(L, l_cm_get_lengths, 1);
+    lua_pushvalue(L, 2); lua_pushcclosure(L, l_cm_u_to_t, 1);
+    lua_pushvalue(L, 3); lua_pushcclosure(L, l_cm_get_point_at, 1);
+    lua_pushvalue(L, 4); lua_pushcclosure(L, l_cm_get_points, 1);
+    lua_pushvalue(L, 5); lua_pushcclosure(L, l_cm_get_spaced_points, 1);
+    return 5;
 }
 static int l_curve_method(lua_State *L) {
     luaL_checkinteger(L, 1);
@@ -5546,7 +5705,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "frame_setup", l_frame_setup }, { "frame", l_frame }, { "raycast_records", l_raycast_records }, { "sync_materials", l_sync_materials }, { "renderer_get", l_renderer_get }, { "scene_get", l_scene_get }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "uuid", l_uuid }, { "camera_methods", l_camera_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "curve_methods", l_curve_methods }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "frame_setup", l_frame_setup }, { "frame", l_frame }, { "raycast_records", l_raycast_records }, { "sync_materials", l_sync_materials }, { "renderer_get", l_renderer_get }, { "scene_get", l_scene_get }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "uuid", l_uuid }, { "camera_methods", l_camera_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at }, { "ray_from_camera", l_ray_from_camera },
 #endif
@@ -5699,6 +5858,12 @@ void wcl_open_three_c(lua_State *L) {
     for (int i = 0; i < XK_COUNT; i++) {
         lua_pushstring(L, cnames2[i]);
         xkey[i] = (TString *)lua_topointer(L, -1);
+        luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    static const char *const cmnames[CMK_COUNT] = { "cacheArcLengths", "needsUpdate", "arcLengthDivisions", "getPoint", "getPointAt" };
+    for (int i = 0; i < CMK_COUNT; i++) {
+        lua_pushstring(L, cmnames[i]);
+        cmkey[i] = (TString *)lua_topointer(L, -1);
         luaL_ref(L, LUA_REGISTRYINDEX);
     }
     static const char *const wnames[WK_COUNT] = { "x", "y", "z", "order", "_x", "_y", "_z", "_order", "_srcq",
