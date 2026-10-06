@@ -2605,6 +2605,70 @@ static int l_bsphere_maxsq(lua_State *L) {
     return 1;
 }
 
+/* ── watched writes in C ───────────────────────────────────────────────
+ * three.lua's _t3.lua puts a rendered object's rotation behind a metatable
+ * whose __newindex this is (t3.euler_newindex(dirty, fresh) makes it): the
+ * same steps as Euler.__newindex followed by the object's standard rotation
+ * callback, without the two Lua calls. dirty is _t3's dirty list (count in
+ * dirty.n), fresh is Euler.fresh. Anything else (a pending refresh from the
+ * quaternion, a cart's own _onChange) calls into Lua as before. */
+enum { WK_X, WK_Y, WK_Z, WK_ORDER, WK_UX, WK_UY, WK_UZ, WK_UORDER, WK_SRCQ, WK_ONCH, WK_CB, WK_Q, WK_REC, WK_N, WK_COUNT };
+static TString *wkey[WK_COUNT];
+/* rec[7] = true and onto the dirty list, unless it is there already */
+static void wk_mark(lua_State *L, Table *rec, int dirty_idx) {
+    TValue *flag = tab_slot(rec, 7);
+    if (isabstkey(flag)) return;
+    if (!l_isfalse(flag)) return;
+    setbtvalue(flag);
+    Table *d = tab_at(L, dirty_idx);
+    TValue *nv = (TValue *)luaH_getshortstr(d, wkey[WK_N]);
+    lua_Integer n = (ttisinteger(nv) ? ivalue(nv) : 0) + 1;
+    setivalue(nv, n);
+    sethvalue2s(L, L->top.p, rec);
+    L->top.p++;
+    lua_rawseti(L, dirty_idx, n);
+}
+static int l_euler_newindex(lua_State *L) {
+    /* upvalues: 1 dirty, 2 Euler.fresh */
+    Table *e = tab_at(L, 1);
+    const TValue *srcq = luaH_getshortstr(e, wkey[WK_SRCQ]);
+    if (!l_isfalse(srcq) && !isabstkey(srcq)) {
+        lua_pushvalue(L, lua_upvalueindex(2)); lua_pushvalue(L, 1); lua_call(L, 1, 0);
+        e = tab_at(L, 1);
+    }
+    TString *k = ttisshrstring(s2v(L->ci->func.p + 2)) ? tsvalue(s2v(L->ci->func.p + 2)) : NULL;
+    int f = -1;
+    if (k == wkey[WK_X]) f = WK_UX; else if (k == wkey[WK_Y]) f = WK_UY;
+    else if (k == wkey[WK_Z]) f = WK_UZ; else if (k == wkey[WK_ORDER]) f = WK_UORDER;
+    if (f < 0) { lua_settop(L, 3); lua_rawset(L, 1); return 0; }
+    TValue *slot = (TValue *)luaH_getshortstr(e, wkey[f]);
+    if (isabstkey(slot)) { lua_pushvalue(L, 1); lua_pushstring(L, getstr(wkey[f])); lua_pushvalue(L, 3); lua_rawset(L, -3); }
+    else { setobj(L, slot, s2v(L->ci->func.p + 3)); luaC_barrierback(L, obj2gco(e), slot); }
+    const TValue *cb = luaH_getshortstr(e, wkey[WK_ONCH]);
+    if (l_isfalse(cb) || isabstkey(cb)) return 0;
+    const TValue *std = luaH_getshortstr(e, wkey[WK_CB]);
+    Table *q = tv_tab(luaH_getshortstr(e, wkey[WK_Q]));
+    Table *rec = tv_tab(luaH_getshortstr(e, wkey[WK_REC]));
+    if (q && rec && ttisLclosure(cb) && ttisLclosure(std) && clLvalue(cb) == clLvalue(std)) {
+        /* the standard rotation callback: q[Q_STALE] = true, mark the record */
+        TValue *stale = tab_slot(q, 5);
+        if (!isabstkey(stale)) setbtvalue(stale);
+        wk_mark(L, rec, lua_upvalueindex(1));
+        return 0;
+    }
+    setobj2s(L, L->top.p, cb); L->top.p++;
+    lua_call(L, 0, 0);
+    return 0;
+}
+/* t3.euler_newindex(dirty, fresh) -> the __newindex function */
+static int l_make_euler_newindex(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+    lua_settop(L, 2);
+    lua_pushcclosure(L, l_euler_newindex, 2);
+    return 1;
+}
+
 /* t3.quat_from_euler(x, y, z, order) -> qx, qy, qz, qw (double precision) */
 static int l_quat_from_euler(lua_State *L) {
     double x = lua_tonumber(L, 1), y = lua_tonumber(L, 2), z = lua_tonumber(L, 3);
@@ -3593,7 +3657,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "euler_newindex", l_make_euler_newindex }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at },
 #endif
@@ -3649,6 +3713,13 @@ void wcl_open_three_c(lua_State *L) {
     for (int i = 0; i < FK_COUNT; i++) {
         lua_pushstring(L, fnames[i]);
         fkey[i] = (TString *)lua_topointer(L, -1);
+        luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    static const char *const wnames[WK_COUNT] = { "x", "y", "z", "order", "_x", "_y", "_z", "_order", "_srcq",
+                                                  "_onChange", "_t3cb", "_t3q", "_t3rec", "n" };
+    for (int i = 0; i < WK_COUNT; i++) {
+        lua_pushstring(L, wnames[i]);
+        wkey[i] = (TString *)lua_topointer(L, -1);
         luaL_ref(L, LUA_REGISTRYINDEX);
     }
     static const char *const enames[EK_COUNT] = { "aX", "aY", "xRadius", "yRadius", "aStartAngle", "aEndAngle",
