@@ -4052,12 +4052,146 @@ static int om_fallback(lua_State *L, int up, int nargs) {
     lua_call(L, nargs, LUA_MULTRET);
     return lua_gettop(L) - base;
 }
+/* Object3D:updateMatrixWorld for an object WITHOUT a twin, as the Lua
+ * method computes it: the local matrix composed from position, quaternion
+ * and scale (matrixAutoUpdate) or used as it stands, the world matrix from
+ * the parent's, the subtree. Lua's arithmetic on the fields (integer where
+ * Lua's would be); the matrices' element tables written in place. A child
+ * whose updateMatrixWorld is not this method is called as Lua would call
+ * it. 0 when something is not as expected (the Lua method runs instead). */
+enum { UK_MAU, UK_POSITION, UK_QUATERNION, UK_SCALE, UK_MATRIX, UK_MATRIXWORLD, UK_ELEMENTS, UK_PARENT, UK_MWNU,
+       UK_CHILDREN, UK_UMW, UK_COUNT };
+static TString *ukey[UK_COUNT];
+static int l_om_update_matrix_world(lua_State *L);
+static int l_m4_mul(lua_State *L);
+static int l_m4_copy(lua_State *L);
+/* the 16 slots of an elements table as typed numbers */
+static int elems_read(Table *t, num_t e[16]) {
+    for (int i = 0; i < 16; i++) if (!tv_nt(tab_geti(t, i + 1), &e[i])) return 0;
+    return 1;
+}
+static void elems_write(lua_State *L, Table *t, const num_t e[16]) {
+    for (int i = 0; i < 16; i++) {
+        TValue *s = tab_slot(t, i + 1);
+        if (!isabstkey(s)) set_tv(s, e[i]);
+        else { TValue v; set_tv(&v, e[i]); luaH_setint(L, t, i + 1, &v); }
+    }
+}
+static Table *elems_of(lua_State *L, Table *o, int mkey) {
+    const TValue *mv = obj_get(L, o, ukey[mkey], NULL);
+    Table *m = mv ? tv_tab(mv) : NULL;
+    return m ? tv_tab(luaH_getshortstr(m, ukey[UK_ELEMENTS])) : NULL;
+}
+static int tree_update(lua_State *L, int oidx, int force) {
+    oidx = lua_absindex(L, oidx);
+    Table *o = tab_at(L, oidx);
+    const TValue *mauv = obj_get(L, o, ukey[UK_MAU], NULL);
+    if (!mauv) return 0;
+    Table *me = elems_of(L, o, UK_MATRIX), *we = elems_of(L, o, UK_MATRIXWORLD);
+    if (!me || !we) return 0;
+    const TValue *pv = obj_get(L, o, ukey[UK_PARENT], NULL);
+    if (!pv) return 0;
+    Table *parent = tv_tab(pv);
+    Table *pe = NULL;
+    if (parent) { pe = elems_of(L, parent, UK_MATRIXWORLD); if (!pe) return 0; }
+    TValue *mwnu = (TValue *)obj_get(L, o, ukey[UK_MWNU], NULL);
+    if (!mwnu) return 0;
+    if (!isempty(mauv) && tv_true(mauv)) {
+        const TValue *pos = obj_get(L, o, ukey[UK_POSITION], NULL), *qua = obj_get(L, o, ukey[UK_QUATERNION], NULL),
+                     *sca = obj_get(L, o, ukey[UK_SCALE], NULL);
+        Table *p = pos ? tv_tab(pos) : NULL, *q = qua ? tv_tab(qua) : NULL, *s = sca ? tv_tab(sca) : NULL;
+        if (!p || !q || !s) return 0;
+        num_t P[3], Q[4], S[3], A[16];
+        if (!tab_fields_n(p, 3, P) || !tab_fields_n(q, 4, Q) || !tab_fields_n(s, 3, S)) return 0;
+        if (pe && !elems_read(pe, A)) return 0;
+        num_bail = 0;
+        num_t qx = Q[0], qy = Q[1], qz = Q[2], qw = Q[3], sx = S[0], sy = S[1], sz = S[2];
+        num_t x2 = nadd(qx, qx), y2 = nadd(qy, qy), z2 = nadd(qz, qz);
+        num_t xx = nmul(qx, x2), xy = nmul(qx, y2), xz = nmul(qx, z2);
+        num_t yy = nmul(qy, y2), yz = nmul(qy, z2), zz = nmul(qz, z2);
+        num_t wx = nmul(qw, x2), wy = nmul(qw, y2), wz = nmul(qw, z2);
+        num_t one = nint(1), zero = nint(0);
+        num_t m1 = nmul(nsub(one, nadd(yy, zz)), sx), m2 = nmul(nadd(xy, wz), sx), m3 = nmul(nsub(xz, wy), sx);
+        num_t m5 = nmul(nsub(xy, wz), sy), m6 = nmul(nsub(one, nadd(xx, zz)), sy), m7 = nmul(nadd(yz, wx), sy);
+        num_t m9 = nmul(nadd(xz, wy), sz), m10 = nmul(nsub(yz, wx), sz), m11 = nmul(nsub(one, nadd(xx, yy)), sz);
+        num_t M[16] = { m1, m2, m3, zero, m5, m6, m7, zero, m9, m10, m11, zero, P[0], P[1], P[2], one };
+        num_t W[16];
+        if (!parent) memcpy(W, M, sizeof(W));
+        else {
+            num_t a11 = A[0], a21 = A[1], a31 = A[2], a41 = A[3], a12 = A[4], a22 = A[5], a32 = A[6], a42 = A[7];
+            num_t a13 = A[8], a23 = A[9], a33 = A[10], a43 = A[11];
+#define ROW(r1, r2, r3, c1, c2, c3) nadd(nadd(nmul(r1, c1), nmul(r2, c2)), nmul(r3, c3))
+            W[0] = ROW(a11, a12, a13, m1, m2, m3); W[1] = ROW(a21, a22, a23, m1, m2, m3);
+            W[2] = ROW(a31, a32, a33, m1, m2, m3); W[3] = ROW(a41, a42, a43, m1, m2, m3);
+            W[4] = ROW(a11, a12, a13, m5, m6, m7); W[5] = ROW(a21, a22, a23, m5, m6, m7);
+            W[6] = ROW(a31, a32, a33, m5, m6, m7); W[7] = ROW(a41, a42, a43, m5, m6, m7);
+            W[8] = ROW(a11, a12, a13, m9, m10, m11); W[9] = ROW(a21, a22, a23, m9, m10, m11);
+            W[10] = ROW(a31, a32, a33, m9, m10, m11); W[11] = ROW(a41, a42, a43, m9, m10, m11);
+            W[12] = nadd(ROW(a11, a12, a13, P[0], P[1], P[2]), A[12]); W[13] = nadd(ROW(a21, a22, a23, P[0], P[1], P[2]), A[13]);
+            W[14] = nadd(ROW(a31, a32, a33, P[0], P[1], P[2]), A[14]); W[15] = nadd(ROW(a41, a42, a43, P[0], P[1], P[2]), A[15]);
+#undef ROW
+        }
+        if (num_bail) return 0;
+        elems_write(L, me, M);
+        elems_write(L, we, W);
+        if (!isabstkey(mwnu)) setbfvalue(mwnu);
+        force = 1;
+    } else if ((!isempty(mwnu) && tv_true(mwnu)) || force) {
+        /* the local matrix as it stands: matrixWorld = parent.matrixWorld * matrix, or a copy */
+        int ok;
+        if (!parent) {
+            lua_pushcfunction(L, l_m4_copy); sethvalue2s(L, L->top.p, we); L->top.p++; sethvalue2s(L, L->top.p, me); L->top.p++;
+            lua_call(L, 2, 1);
+        } else {
+            lua_pushcfunction(L, l_m4_mul); sethvalue2s(L, L->top.p, we); L->top.p++; sethvalue2s(L, L->top.p, pe); L->top.p++;
+            sethvalue2s(L, L->top.p, me); L->top.p++;
+            lua_call(L, 3, 1);
+        }
+        ok = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+        if (!ok) return 0;
+        mwnu = (TValue *)obj_get(L, o, ukey[UK_MWNU], NULL);
+        if (mwnu && !isabstkey(mwnu)) setbfvalue(mwnu);
+        force = 1;
+    }
+    /* the children, each by its own updateMatrixWorld */
+    const TValue *cv = obj_get(L, o, ukey[UK_CHILDREN], NULL);
+    Table *ch = cv ? tv_tab(cv) : NULL;
+    if (!ch) return 0;
+    for (lua_Integer i = 1;; i++) {
+        const TValue *c = tab_geti(ch, (int)i);
+        if (isempty(c) || ttisnil(c)) break;
+        if (!ttistable(c)) return 0;
+        setobj2s(L, L->top.p, c); L->top.p++;              /* the child */
+        lua_getfield(L, -1, getstr(ukey[UK_UMW]));
+        if (lua_tocfunction(L, -1) == l_om_update_matrix_world
+            && !tv_handle(luaH_getshortstr(hvalue(c), okey[OK_T3]))) {
+            lua_pop(L, 1);
+            if (!tree_update(L, -1, force)) {
+                /* this child by Lua, then on with the rest */
+                lua_getfield(L, -1, getstr(ukey[UK_UMW])); lua_pushvalue(L, -2); lua_pushboolean(L, force);
+                lua_call(L, 2, 0);
+            }
+            lua_pop(L, 1);
+        } else {
+            lua_pushvalue(L, -2); lua_pushboolean(L, force);
+            lua_call(L, 2, 0);
+            lua_pop(L, 1);
+        }
+        ch = tv_tab(obj_get(L, tab_at(L, oidx), ukey[UK_CHILDREN], NULL));
+        if (!ch) return 1;
+    }
+    return 1;
+}
 /* upvalues: 1 dirty, 2 filled, 3 flushDirty, 4 Lua updateMatrixWorld */
 static int l_om_update_matrix_world(lua_State *L) {
     lua_settop(L, 2);
     Table *o = lua_istable(L, 1) ? tab_at(L, 1) : NULL;
     t3_object *h = o ? (t3_object *)tv_handle(luaH_getshortstr(o, okey[OK_T3])) : NULL;
-    if (!h) return om_fallback(L, 4, 2);
+    if (!h) {
+        if (o && tree_update(L, 1, B(2))) { lua_settop(L, 1); return 1; }
+        return om_fallback(L, 4, 2);
+    }
     om_flush(L, hvalue(UPV(1)), UPV(3));
     uint32_t before = t3_world_recompute_count();
     t3_object_update_matrix_world(h, B(2));
@@ -4193,6 +4327,29 @@ static int l_camera_methods(lua_State *L) {
     luaL_checktype(L, 4, LUA_TFUNCTION);
     lua_settop(L, 4);
     lua_pushcclosure(L, l_cm_update_matrix_world, 4);
+    return 1;
+}
+/* t3.uuid(random) -> three.js r128's generateUUID: four draws of random()
+ * (Lua's, so the sequence is the same), the 36 characters upper case */
+static int l_uuid(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    unsigned long long d[4];
+    for (int i = 0; i < 4; i++) {
+        lua_pushvalue(L, 1);
+        lua_call(L, 0, 1);
+        d[i] = (unsigned long long)(long long)floor(lua_tonumber(L, -1) * 4294967295.0);
+        lua_pop(L, 1);
+    }
+    static const char hex[] = "0123456789ABCDEF";
+    char out[37];
+    int n = 0;
+#define HX(v) do { unsigned b = (unsigned)((v) & 0xff); out[n++] = hex[b >> 4]; out[n++] = hex[b & 15]; } while (0)
+    HX(d[0]); HX(d[0] >> 8); HX(d[0] >> 16); HX(d[0] >> 24); out[n++] = '-';
+    HX(d[1]); HX(d[1] >> 8); out[n++] = '-'; HX((d[1] >> 16 & 0x0f) | 0x40); HX(d[1] >> 24); out[n++] = '-';
+    HX((d[2] & 0x3f) | 0x80); HX(d[2] >> 8); out[n++] = '-'; HX(d[2] >> 16); HX(d[2] >> 24);
+    HX(d[3]); HX(d[3] >> 8); HX(d[3] >> 16); HX(d[3] >> 24);
+#undef HX
+    lua_pushlstring(L, out, (size_t)n);
     return 1;
 }
 static int l_object_methods(lua_State *L) {
@@ -5270,7 +5427,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "frame_setup", l_frame_setup }, { "raycast_records", l_raycast_records }, { "sync_materials", l_sync_materials }, { "renderer_get", l_renderer_get }, { "scene_get", l_scene_get }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "camera_methods", l_camera_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "frame_setup", l_frame_setup }, { "raycast_records", l_raycast_records }, { "sync_materials", l_sync_materials }, { "renderer_get", l_renderer_get }, { "scene_get", l_scene_get }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "uuid", l_uuid }, { "camera_methods", l_camera_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at }, { "ray_from_camera", l_ray_from_camera },
 #endif
@@ -5345,6 +5502,13 @@ void wcl_open_three_c(lua_State *L) {
     }
     lua_pushstring(L, "matrixWorldInverse"); rkey_mwi = (TString *)lua_topointer(L, -1); luaL_ref(L, LUA_REGISTRYINDEX);
     lua_pushstring(L, "elements"); rkey_elements = (TString *)lua_topointer(L, -1); luaL_ref(L, LUA_REGISTRYINDEX);
+    static const char *const unames[UK_COUNT] = { "matrixAutoUpdate", "position", "quaternion", "scale", "matrix", "matrixWorld",
+                                                  "elements", "parent", "matrixWorldNeedsUpdate", "children", "updateMatrixWorld" };
+    for (int i = 0; i < UK_COUNT; i++) {
+        lua_pushstring(L, unames[i]);
+        ukey[i] = (TString *)lua_topointer(L, -1);
+        luaL_ref(L, LUA_REGISTRYINDEX);
+    }
     static const char *const onames[OK_COUNT] = { "_t3", "quaternion", "_t3std", "_t3lookEye", "up", "isCamera", "isLight", "rotation", "gen" };
     for (int i = 0; i < OK_COUNT; i++) {
         lua_pushstring(L, onames[i]);
