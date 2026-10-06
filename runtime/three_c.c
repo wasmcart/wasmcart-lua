@@ -4607,7 +4607,15 @@ static int l_instance_colors(lua_State *L) {
 
 /* ── renderer ────────────────────────────────────────────────────────── */
 
-typedef struct { t3_renderer *r; } rbox_t;
+/* what three.lua last pushed for a renderer and a scene (frame_setup pushes
+ * a value only when it changed, as the Lua applyRenderer did) */
+typedef struct {
+    int valid;
+    double cr, cg, cb, ca; int ac, se, st, oe, aa, pcl;
+    int size_valid; double fw, fh;
+    int vp_valid; double vx, vy, vw, vh; int sct; double sx, sy, sw, sh;
+} rcache_t;
+typedef struct { t3_renderer *r; rcache_t k; } rbox_t;
 static int renderer_gc(lua_State *L) {
     rbox_t *b = (rbox_t *)lua_touserdata(L, 1);
     if (b && b->r) { t3_renderer_destroy(b->r); b->r = NULL; }
@@ -4615,6 +4623,177 @@ static int renderer_gc(lua_State *L) {
 }
 
 /* t3.renderer(w, h) -> renderer | nil, why */
+/* t3.frame_setup(renderer, r, scene | nil, sceneH | nil, W, H) -> bgtexWarn:
+ * three.lua's applyRenderer and the scene settings before a render or a
+ * clear, read from the Lua tables and pushed when changed: clear colour and
+ * alpha, autoClear, shadows, encoding, antialias, physicallyCorrectLights,
+ * the drawing-buffer size, the viewport and scissor (WebGLRenderer's
+ * _drawRegion arithmetic), the scene's background, fog and autoUpdate.
+ * Returns true when scene.background is a texture (not drawn: Lua warns). */
+enum { RK_CLEARCOLOR, RK_CLEARALPHA, RK_AUTOCLEAR, RK_SHADOWMAP, RK_ENABLED, RK_TYPE, RK_ENCODING, RK_AA, RK_PCL,
+       RK_VIEWPORT, RK_PR, RK_WIDTH, RK_HEIGHT, RK_SCT, RK_SCISSOR, RK_BG, RK_FOG, RK_ISCOLOR, RK_ISEXP2, RK_NEAR,
+       RK_FAR, RK_DENSITY, RK_AUTOUPDATE, RK_COUNT };
+static TString *rkey[RK_COUNT];
+static const TValue *rk(Table *t, int k) { const TValue *v = luaH_getshortstr(t, rkey[k]); return (isempty(v) || ttisnil(v)) ? NULL : v; }
+/* t[k] as Lua indexing resolves it (the class chain, or the metamethod
+ * through the API), as a truth value */
+static int rk_truthy(lua_State *L, Table *t, int k) {
+    const TValue *v = obj_get(L, t, rkey[k], NULL);
+    if (v) return !isempty(v) && tv_true(v);
+    sethvalue2s(L, L->top.p, t); L->top.p++;
+    lua_getfield(L, -1, getstr(rkey[k]));
+    int r = lua_toboolean(L, -1);
+    lua_pop(L, 2);
+    return r;
+}
+static double rk_num(Table *t, int k, double def) { const TValue *v = rk(t, k); return (v && !l_isfalse(v)) ? tv_num(v) : def; }
+/* math.floor as Lua's (an integer-valued float / integer) */
+static double lfloor(double d) { return floor(d); }
+static int l_frame_setup(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    rbox_t *box = (rbox_t *)lua_touserdata(L, 2);
+    if (!box || !box->r) return luaL_error(L, "frame_setup: not a renderer");
+    t3_renderer *r = box->r;
+    rcache_t *k = &box->k;
+    Table *rt = tab_at(L, 1);
+    double fw = luaL_checknumber(L, 5), fh = luaL_checknumber(L, 6);
+    /* clear colour, autoClear, shadows, encoding, antialias, lights */
+    const TValue *ccv = rk(rt, RK_CLEARCOLOR);
+    Table *cc = ccv ? tv_tab(ccv) : NULL;
+    if (!cc) return luaL_error(L, "frame_setup: renderer without _clearColor");
+    double cr = tv_num(luaH_getshortstr(cc, lkey[LK_R])), cg = tv_num(luaH_getshortstr(cc, lkey[LK_G])),
+           cb = tv_num(luaH_getshortstr(cc, lkey[LK_B]));
+    double ca = rk_num(rt, RK_CLEARALPHA, 1);
+    const TValue *acv = rk(rt, RK_AUTOCLEAR);
+    int ac = !(acv && ttisboolean(acv) && l_isfalse(acv));
+    const TValue *smv = rk(rt, RK_SHADOWMAP);
+    Table *sm = smv ? tv_tab(smv) : NULL;
+    int se = 0, st = 1;
+    if (sm) {
+        const TValue *e = rk(sm, RK_ENABLED), *t = rk(sm, RK_TYPE);
+        se = e ? tv_true(e) : 0;
+        st = t ? lk_int(tv_num(t)) : 1;
+    } else if (smv) { se = tv_true(smv); }
+    int oe = lk_int(rk_num(rt, RK_ENCODING, 3000));
+    const TValue *aav = rk(rt, RK_AA);
+    int aa = (aav && tv_true(aav)) ? 4 : 0;
+    const TValue *pclv = rk(rt, RK_PCL);
+    int pcl = pclv && ttisboolean(pclv) && !l_isfalse(pclv);
+    if (!k->valid || k->cr != cr || k->cg != cg || k->cb != cb || k->ca != ca || k->ac != ac || k->se != se || k->st != st
+        || k->oe != oe || k->aa != aa || k->pcl != pcl) {
+        double hex = lfloor(cr * 255 + 0.5) * 65536 + lfloor(cg * 255 + 0.5) * 256 + lfloor(cb * 255 + 0.5);
+        t3_renderer_set_clear_color(r, (uint32_t)(long long)hex, (float)ca);
+        t3_renderer_set_auto_clear(r, ac);
+        t3_renderer_set_shadow_map(r, se, (t3_shadow_map_type)st);
+        t3_renderer_set_output_encoding(r, (t3_encoding)oe);
+        t3_renderer_set_antialias(r, aa);
+        t3_renderer_set_physically_correct_lights(r, pcl);
+        k->valid = 1; k->cr = cr; k->cg = cg; k->cb = cb; k->ca = ca; k->ac = ac; k->se = se; k->st = st;
+        k->oe = oe; k->aa = aa; k->pcl = pcl;
+    }
+    /* _drawRegion(rect): the viewport / scissor in drawing-buffer pixels */
+    double vx = 0, vy = 0, vw = fw, vh = fh;
+    const TValue *vpv = rk(rt, RK_VIEWPORT);
+    Table *vp = vpv ? tv_tab(vpv) : NULL;
+    double pr = rk_num(rt, RK_PR, 1), rw = rk_num(rt, RK_WIDTH, 0), rh = rk_num(rt, RK_HEIGHT, 0);
+    double kx = fw / (rw * pr), ky = fh / (rh * pr);
+    if (vp) {
+        vx = lfloor(tab_num(vp, 1) * pr) * kx; vy = lfloor(tab_num(vp, 2) * pr) * ky;
+        vw = lfloor(tab_num(vp, 3) * pr) * kx; vh = lfloor(tab_num(vp, 4) * pr) * ky;
+    }
+    if (!k->size_valid || k->fw != fw || k->fh != fh) {
+        t3_renderer_set_size(r, lk_int(fw), lk_int(fh));
+        k->size_valid = 1; k->fw = fw; k->fh = fh;
+    }
+    const TValue *sctv = rk(rt, RK_SCT);
+    int sct = sctv && tv_true(sctv);
+    double sx = 0, sy = 0, sw = 0, sh = 0;
+    if (sct) {
+        const TValue *scv = rk(rt, RK_SCISSOR);
+        Table *sc = scv ? tv_tab(scv) : NULL;
+        if (sc) {
+            sx = lfloor(tab_num(sc, 1) * pr) * kx; sy = lfloor(tab_num(sc, 2) * pr) * ky;
+            sw = lfloor(tab_num(sc, 3) * pr) * kx; sh = lfloor(tab_num(sc, 4) * pr) * ky;
+        } else { sx = 0; sy = 0; sw = fw; sh = fh; }
+    }
+    if (!k->vp_valid || k->vx != vx || k->vy != vy || k->vw != vw || k->vh != vh || k->sct != sct
+        || (sct && (k->sx != sx || k->sy != sy || k->sw != sw || k->sh != sh))) {
+        t3_renderer_set_viewport(r, lk_int(vx), lk_int(vy), lk_int(vw), lk_int(vh));
+        if (sct) { t3_renderer_set_scissor(r, lk_int(sx), lk_int(sy), lk_int(sw), lk_int(sh)); t3_renderer_set_scissor_test(r, true); }
+        else t3_renderer_set_scissor_test(r, false);
+        k->vp_valid = 1; k->vx = vx; k->vy = vy; k->vw = vw; k->vh = vh; k->sct = sct;
+        k->sx = sx; k->sy = sy; k->sw = sw; k->sh = sh;
+    }
+    /* the scene: background, fog, autoUpdate (pushed every time: plain stores) */
+    int warn = 0;
+    if (lua_istable(L, 3)) {
+        Table *sc = tab_at(L, 3);
+        t3_scene *sh3 = (t3_scene *)P(L, 4);
+        if (sh3) {
+            const TValue *bgv = rk(sc, RK_BG);
+            Table *bg = bgv ? tv_tab(bgv) : NULL;
+            int hasbg = bg && rk_truthy(L, bg, RK_ISCOLOR);
+            sh3->has_background = hasbg;
+            if (hasbg) {
+                t3_color c = { (float)tv_num(luaH_getshortstr(bg, lkey[LK_R])), (float)tv_num(luaH_getshortstr(bg, lkey[LK_G])),
+                               (float)tv_num(luaH_getshortstr(bg, lkey[LK_B])) };
+                sh3->background = c;
+            }
+            if (bgv && !hasbg) warn = 1;
+            const TValue *fogv = rk(sc, RK_FOG);
+            Table *fog = fogv ? tv_tab(fogv) : NULL;
+            if (fog) {
+                sh3->fog.type = rk_truthy(L, fog, RK_ISEXP2) ? (t3_fog_type)2 : (t3_fog_type)1;
+                Table *fc = tv_tab(luaH_getshortstr(fog, lkey[LK_COLOR]));
+                t3_color c = { 0, 0, 0 };
+                if (fc) { c.r = (float)tv_num(luaH_getshortstr(fc, lkey[LK_R])); c.g = (float)tv_num(luaH_getshortstr(fc, lkey[LK_G])); c.b = (float)tv_num(luaH_getshortstr(fc, lkey[LK_B])); }
+                sh3->fog.color = c;
+                sh3->fog.near = (float)rk_num(fog, RK_NEAR, 1); sh3->fog.far = (float)rk_num(fog, RK_FAR, 1000);
+                sh3->fog.density = (float)rk_num(fog, RK_DENSITY, 0.00025);
+            } else sh3->fog.type = T3_FOG_NONE;
+            const TValue *auv = rk(sc, RK_AUTOUPDATE);
+            sh3->auto_update = !(auv && ttisboolean(auv) && l_isfalse(auv));
+        }
+    }
+    lua_pushboolean(L, warn);
+    return 1;
+}
+/* t3.renderer_get(r): clear r g b alpha, autoClear, outputEncoding,
+ * physicallyCorrectLights, shadow enabled, shadow type, antialias, width,
+ * height, viewport x y w h, scissor test, scissor x y w h (for checking) */
+static int l_renderer_get(lua_State *L) {
+    rbox_t *box = (rbox_t *)lua_touserdata(L, 1);
+    if (!box || !box->r) return luaL_error(L, "renderer_get: not a renderer");
+    const t3_renderer *r = box->r;
+    float a; t3_color c = t3_renderer_get_clear_color(r, &a);
+    lua_pushnumber(L, c.r); lua_pushnumber(L, c.g); lua_pushnumber(L, c.b); lua_pushnumber(L, a);
+    lua_pushboolean(L, t3_renderer_get_auto_clear(r));
+    lua_pushinteger(L, t3_renderer_get_output_encoding(r));
+    lua_pushboolean(L, t3_renderer_get_physically_correct_lights(r));
+    t3_shadow_map_type st; bool se = t3_renderer_get_shadow_map(r, &st);
+    lua_pushboolean(L, se); lua_pushinteger(L, st);
+    lua_pushinteger(L, t3_renderer_get_antialias(r));
+    int w, h, x, y, vw, vh; t3_renderer_get_size(r, &w, &h);
+    lua_pushinteger(L, w); lua_pushinteger(L, h);
+    t3_renderer_get_viewport(r, &x, &y, &vw, &vh);
+    lua_pushinteger(L, x); lua_pushinteger(L, y); lua_pushinteger(L, vw); lua_pushinteger(L, vh);
+    bool sct = t3_renderer_get_scissor(r, &x, &y, &vw, &vh);
+    lua_pushboolean(L, sct);
+    lua_pushinteger(L, x); lua_pushinteger(L, y); lua_pushinteger(L, vw); lua_pushinteger(L, vh);
+    return 21;
+}
+/* t3.scene_get(h): hasBackground, r g b, fog type, r g b, near, far,
+ * density, autoUpdate (for checking) */
+static int l_scene_get(lua_State *L) {
+    t3_scene *s = (t3_scene *)P(L, 1);
+    lua_pushboolean(L, s->has_background);
+    lua_pushnumber(L, s->background.r); lua_pushnumber(L, s->background.g); lua_pushnumber(L, s->background.b);
+    lua_pushinteger(L, s->fog.type);
+    lua_pushnumber(L, s->fog.color.r); lua_pushnumber(L, s->fog.color.g); lua_pushnumber(L, s->fog.color.b);
+    lua_pushnumber(L, s->fog.near); lua_pushnumber(L, s->fog.far); lua_pushnumber(L, s->fog.density);
+    lua_pushboolean(L, s->auto_update);
+    return 12;
+}
 static int l_renderer(lua_State *L) {
     /* no GL this frame (a headless host, the CPU path): nil, and three.lua
      * renders with its Lua renderer as it did before three.c */
@@ -4624,6 +4803,7 @@ static int l_renderer(lua_State *L) {
     wcl_r2d__after_external_gl();
     if (!r) { lua_pushnil(L); return 1; }
     rbox_t *b = (rbox_t *)lua_newuserdatauv(L, sizeof(rbox_t), 0);
+    memset(b, 0, sizeof(*b));
     b->r = r;
     luaL_setmetatable(L, "t3.renderer");
     return 1;
@@ -4723,7 +4903,7 @@ static int l_release(lua_State *L) { return handle_gc(L); }
 static const luaL_Reg t3_lib[] = {
     { "object", l_object }, { "mesh", l_mesh }, { "instanced", l_instanced }, { "mesh_set", l_mesh_set },
     { "add", l_add }, { "remove", l_remove },
-    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
+    { "trs", l_trs }, { "flush", l_flush }, { "anim_step", l_anim_step }, { "m4_copy", l_m4_copy }, { "m4_compose", l_m4_compose }, { "v3_apply_m4", l_v3_apply_m4 }, { "v3_apply_q", l_v3_apply_q }, { "q_from_euler", l_q_from_euler }, { "q_slerp", l_q_slerp }, { "m4_mul", l_m4_mul }, { "m4_invert", l_m4_invert }, { "anim_apply", l_anim_apply }, { "anim_register", l_anim_register }, { "world_position_into", l_world_position_into }, { "curve_method", l_curve_method }, { "euler_newindex", l_make_euler_newindex }, { "watched_mm", l_watched_mm }, { "sync_lights", l_sync_lights }, { "frame_setup", l_frame_setup }, { "renderer_get", l_renderer_get }, { "scene_get", l_scene_get }, { "proxy_mm", l_proxy_mm }, { "proxy_elements_mm", l_proxy_elements_mm }, { "sync_textures", l_sync_textures }, { "tex_get", l_tex_get }, { "mat_get", l_mat_get }, { "euler_index", l_make_euler_index }, { "object_methods", l_object_methods }, { "watched_vector_mm", l_watched_vector_mm }, { "bbox", l_bbox }, { "bsphere_maxsq", l_bsphere_maxsq },
 #ifdef T3_F64_MATH
     { "look_at", l_look_at }, { "ray_from_camera", l_ray_from_camera },
 #endif
@@ -4820,6 +5000,15 @@ void wcl_open_three_c(lua_State *L) {
     for (int i = 0; i < MK_COUNT; i++) {
         lua_pushstring(L, mnames[i]);
         mkey[i] = (TString *)lua_topointer(L, -1);
+        luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    static const char *const rnames[RK_COUNT] = { "_clearColor", "_clearAlpha", "autoClear", "shadowMap", "enabled", "type",
+                                                  "outputEncoding", "_antialias", "physicallyCorrectLights", "_viewport",
+                                                  "_pixelRatio", "_width", "_height", "_scissorTest", "_scissor", "background",
+                                                  "fog", "isColor", "isFogExp2", "near", "far", "density", "autoUpdate" };
+    for (int i = 0; i < RK_COUNT; i++) {
+        lua_pushstring(L, rnames[i]);
+        rkey[i] = (TString *)lua_topointer(L, -1);
         luaL_ref(L, LUA_REGISTRYINDEX);
     }
     static const char *const wnames[WK_COUNT] = { "x", "y", "z", "order", "_x", "_y", "_z", "_order", "_srcq",
