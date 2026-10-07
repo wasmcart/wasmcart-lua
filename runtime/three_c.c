@@ -1436,7 +1436,8 @@ static int l_gen_cylinder(lua_State *L) {
     int top = !openEnded && rt > 0, bottom = !openEnded && rb > 0;
     lua_Integer ncap = rs + rs + 1;
     lua_Integer nv = (rs + 1) * (hs + 1) + (top ? ncap : 0) + (bottom ? ncap : 0);
-    lua_Integer ni = rs * hs * 6 + (top ? rs * 3 : 0) + (bottom ? rs * 3 : 0);
+    /* the apex / tip row of a cone has one triangle per segment, as three.js r186 */
+    lua_Integer ni = rs * hs * 6 - (rt > 0 ? 0 : rs * 3) - (rb > 0 ? 0 : rs * 3) + (top ? rs * 3 : 0) + (bottom ? rs * 3 : 0);
     double halfHeight = height / 2;
     double slope = (rb - rt) / height;
     Table *ti = new_array(L, ni);
@@ -1464,9 +1465,8 @@ static int l_gen_cylinder(lua_State *L) {
             /* indexArray[y][x] = (y - 1) * (rs + 1) + x - 1 */
             lua_Integer a = (y - 1) * (rs + 1) + x - 1, b = y * (rs + 1) + x - 1;
             lua_Integer c = y * (rs + 1) + x, d = (y - 1) * (rs + 1) + x;
-            setivalue(I, a); setivalue(I + 1, b); setivalue(I + 2, d);
-            setivalue(I + 3, b); setivalue(I + 4, c); setivalue(I + 5, d);
-            I += 6;
+            if (rt > 0 || y != 1) { setivalue(I, a); setivalue(I + 1, b); setivalue(I + 2, d); I += 3; }
+            if (rb > 0 || y != hs) { setivalue(I, b); setivalue(I + 1, c); setivalue(I + 2, d); I += 3; }
         }
     lua_Integer index = (rs + 1) * (hs + 1);
     for (int cap = 0; cap < 2; cap++) {
