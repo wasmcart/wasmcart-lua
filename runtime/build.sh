@@ -199,7 +199,7 @@ else
   echo "Opus: disabled (WCL_OPUS=1 ./build.sh to fetch and enable)"
 fi
 
-# ── three.c (the three.js r128 API in C), bound as the global `t3` ──
+# ── three.c (the three.js r186 API in C), bound as the global `t3` ──
 # three.lua renders through it when the engine has it: the scene graph,
 # matrices, culling and drawing run in C behind three.lua's Lua API. A
 # sibling checkout by default ($THREE_C overrides). Rebuilt whenever a three.c

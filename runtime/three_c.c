@@ -1266,8 +1266,9 @@ static int l_gen_sphere(lua_State *L) {
         if (iy == 0 && thetaStart == 0) uOffset = 0.5 / (double)ws;
         else if (iy == hs && thetaEnd == L_PI) uOffset = -0.5 / (double)ws;
         double theta = thetaStart + v * thetaLength;
-        double sinTheta = sin(theta), cosTheta = cos(theta);
-        double rSinTheta = radius * sinTheta, rCosTheta = radius * cosTheta;
+        /* r186: the ring radius from the height (exact zeros at the poles) */
+        double rCosTheta = radius * cos(theta);
+        double rSinTheta = sqrt(radius * radius - rCosTheta * rCosTheta);
         double oneMinusV = 1 - v;
         for (lua_Integer ix = 0; ix <= ws; ix++) {
             double u = (double)ix / (double)ws;
