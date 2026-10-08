@@ -2629,7 +2629,7 @@ static TString *okey[OK_COUNT];
 static TString *rkey_mwi, *rkey_elements;
 enum { TK_MAP, TK_NORMAL, TK_AO, TK_EMISSIVE, TK_ROUGH, TK_METAL, TK_ALPHA, TK_NMAPS,
        TK_T3 = TK_NMAPS, TK_VERSION, TK_T3VER, TK_WRAPS, TK_WRAPT, TK_MAG, TK_MIN, TK_FLIPY, TK_ISDATA, TK_MIPS,
-       TK_ENC, TK_OFFSET, TK_REPEAT, TK_CENTER, TK_ROT, TK_ANISO, TK_COUNT };
+       TK_CS, TK_ENC, TK_OFFSET, TK_REPEAT, TK_CENTER, TK_ROT, TK_ANISO, TK_COUNT };
 static TString *tkey[TK_COUNT], *tkey_hidden[TK_NMAPS];
 static int sync_texture_c(Table *tex);
 static int om_fallback(lua_State *L, int up, int nargs);
@@ -5206,14 +5206,12 @@ static void mat_apply(t3_material *m, const mat_args_t *a) {
     m->normal_scale.y = a->ns_y;
     bool tr = fl & MF_TRANSPARENT, dt = fl & MF_DEPTH_TEST, dw = fl & MF_DEPTH_WRITE, vc = fl & MF_VERTEX_COLORS;
     bool fs = fl & MF_FLAT, wf = fl & MF_WIREFRAME, vis = fl & MF_VISIBLE, fog = fl & MF_FOG;
-    bool sk = fl & MF_SKINNING, mt = fl & MF_MORPH, mn = fl & MF_MORPH_NORMALS;
     if ((int)m->side != side || m->transparent != tr || m->depth_test != dt || m->depth_write != dw ||
         m->vertex_colors != vc || m->flat_shading != fs || m->wireframe != wf || m->fog != fog ||
-        m->skinning != sk || m->morph_targets != mt || m->morph_normals != mn || m->alpha_test != alpha_test) {
+        m->alpha_test != alpha_test) {
         m->side = (t3_side)side;
         m->transparent = tr; m->depth_test = dt; m->depth_write = dw; m->vertex_colors = vc;
         m->flat_shading = fs; m->wireframe = wf; m->fog = fog;
-        m->skinning = sk; m->morph_targets = mt; m->morph_normals = mn;
         m->alpha_test = alpha_test;
         m->version++;
     }
@@ -5287,9 +5285,6 @@ static int sync_material_c(lua_State *L, Table *m, int mapped_idx, int synctex_i
     if ((t = mq_truthy(L, m, QK_WIREFRAME)) < 0) return 0; if (t) fl |= MF_WIREFRAME;
     if ((t = mq_notfalse(L, m, QK_VISIBLE)) < 0) return 0; if (t) fl |= MF_VISIBLE;
     if ((t = mq_notfalse(L, m, QK_FOG)) < 0) return 0; if (t) fl |= MF_FOG;
-    if ((t = mq_truthy(L, m, QK_SKINNING)) < 0) return 0; if (t) fl |= MF_SKINNING;
-    if ((t = mq_truthy(L, m, QK_MORPH)) < 0) return 0; if (t) fl |= MF_MORPH;
-    if ((t = mq_truthy(L, m, QK_MORPH_NORMALS)) < 0) return 0; if (t) fl |= MF_MORPH_NORMALS;
     a.fl = fl;
     if (!mq_num(L, m, QK_OPACITY, 1, &a.opacity) || !mq_num(L, m, QK_SHININESS, 30, &a.shininess)
         || !mq_num(L, m, QK_ROUGHNESS, 1, &a.roughness) || !mq_num(L, m, QK_METALNESS, 0, &a.metalness)
@@ -5429,13 +5424,14 @@ static int l_tex_update_image(lua_State *L) {
 }
 
 /* t3.tex_set(h, wrapS, wrapT, magFilter, minFilter, flipY, generateMipmaps,
- *            encoding, offx, offy, repx, repy, cx, cy, rotation, anisotropy) */
-static void tex_apply(t3_texture *t, int ws, int wt, int mag, int min, bool fy, bool gm, int enc,
+ *            colorSpace, offx, offy, repx, repy, cx, cy, rotation, anisotropy): colorSpace
+ *            is t3_color_space's number (texture_cs: from r186's colorSpace, or r128's encoding) */
+static void tex_apply(t3_texture *t, int ws, int wt, int mag, int min, bool fy, bool gm, int cs,
                       float ox, float oy, float rx, float ry, float cx, float cy, float rot, float aniso, int has_aniso) {
     if (t->wrap_s != (t3_wrapping)ws || t->wrap_t != (t3_wrapping)wt || t->mag_filter != (t3_filter)mag
-        || t->min_filter != (t3_filter)min || t->flip_y != fy || t->generate_mipmaps != gm || t->encoding != (t3_encoding)enc) {
+        || t->min_filter != (t3_filter)min || t->flip_y != fy || t->generate_mipmaps != gm || t->color_space != (t3_color_space)cs) {
         t->wrap_s = (t3_wrapping)ws; t->wrap_t = (t3_wrapping)wt; t->mag_filter = (t3_filter)mag; t->min_filter = (t3_filter)min;
-        t->flip_y = fy; t->generate_mipmaps = gm; t->encoding = (t3_encoding)enc;
+        t->flip_y = fy; t->generate_mipmaps = gm; t->color_space = (t3_color_space)cs;
         t->version++;
     }
     t->offset.x = ox; t->offset.y = oy;
@@ -5461,12 +5457,12 @@ static int l_mat_get(lua_State *L) {
     return 14;
 }
 /* t3.tex_get(h): wrapS, wrapT, magFilter, minFilter, flipY, generateMipmaps,
- * encoding, offset x y, repeat x y, center x y, rotation, anisotropy,
+ * colorSpace (t3_color_space's number), offset x y, repeat x y, center x y, rotation, anisotropy,
  * version (for checking a sync) */
 static int l_tex_get(lua_State *L) {
     t3_texture *t = (t3_texture *)P(L, 1);
     lua_pushinteger(L, t->wrap_s); lua_pushinteger(L, t->wrap_t); lua_pushinteger(L, t->mag_filter); lua_pushinteger(L, t->min_filter);
-    lua_pushboolean(L, t->flip_y); lua_pushboolean(L, t->generate_mipmaps); lua_pushinteger(L, t->encoding);
+    lua_pushboolean(L, t->flip_y); lua_pushboolean(L, t->generate_mipmaps); lua_pushinteger(L, t->color_space);
     lua_pushnumber(L, t->offset.x); lua_pushnumber(L, t->offset.y); lua_pushnumber(L, t->repeat.x); lua_pushnumber(L, t->repeat.y);
     lua_pushnumber(L, t->center.x); lua_pushnumber(L, t->center.y); lua_pushnumber(L, t->rotation); lua_pushnumber(L, t->anisotropy);
     lua_pushinteger(L, t->version);
@@ -5477,6 +5473,24 @@ static int l_tex_get(lua_State *L) {
  * parameters and the transform to the twin), reading the texture's fields
  * as Lua does; a texture without a twin, with a new version, or with a
  * field missing goes to viaLua(tex). */
+/* r186's colour space names as t3_color_space: "srgb", "srgb-linear", else none */
+static int cs_of_name(const char *n) {
+    if (!n) return T3_NO_COLOR_SPACE;
+    if (!strcmp(n, "srgb")) return T3_SRGB_COLOR_SPACE;
+    if (!strcmp(n, "srgb-linear")) return T3_LINEAR_SRGB_COLOR_SPACE;
+    return T3_NO_COLOR_SPACE;
+}
+/* a texture's colour space: texture.colorSpace, or (when that is NoColorSpace)
+ * r128's texture.encoding, sRGBEncoding (3001) being sRGB */
+static int texture_cs(Table *tex) {
+    const TValue *c = luaH_getshortstr(tex, tkey[TK_CS]);
+    int cs = ttisstring(c) ? cs_of_name(getstr(tsvalue(c))) : T3_NO_COLOR_SPACE;
+    if (cs == T3_NO_COLOR_SPACE) {
+        const TValue *e = luaH_getshortstr(tex, tkey[TK_ENC]);
+        if (ttisnumber(e) && tv_num(e) == 3001) cs = T3_SRGB_COLOR_SPACE;
+    }
+    return cs;
+}
 /* a field: 1 and its number (`v or def` when nil / false), 0 when missing */
 static int tk_num(Table *t, int k, double def, double *out) {
     const TValue *v = luaH_getshortstr(t, tkey[k]);
@@ -5499,9 +5513,9 @@ static int sync_texture_c(Table *tex) {
     double v = (isempty(vv) || l_isfalse(vv)) ? 0 : tv_num(vv);
     const TValue *sv = luaH_getshortstr(tex, tkey[TK_T3VER]);
     if (isempty(sv) || !(ttisnumber(sv)) || tv_num(sv) != v) return 0;
-    double ws, wt, mag, min, enc, rot, aniso, ox, oy, rx, ry, cx, cy;
+    double ws, wt, mag, min, rot, aniso, ox, oy, rx, ry, cx, cy;
     if (!tk_num(tex, TK_WRAPS, 1001, &ws) || !tk_num(tex, TK_WRAPT, 1001, &wt) || !tk_num(tex, TK_MAG, 1006, &mag)
-        || !tk_num(tex, TK_MIN, 1008, &min) || !tk_num(tex, TK_ENC, 3000, &enc) || !tk_num(tex, TK_ROT, 0, &rot)
+        || !tk_num(tex, TK_MIN, 1008, &min) || !tk_num(tex, TK_ROT, 0, &rot)
         || !tk_num(tex, TK_ANISO, 1, &aniso)) return 0;
     if (!tk_vec2(tex, TK_OFFSET, 0, 0, &ox, &oy) || !tk_vec2(tex, TK_REPEAT, 1, 1, &rx, &ry)
         || !tk_vec2(tex, TK_CENTER, 0, 0, &cx, &cy)) return 0;
@@ -5509,7 +5523,7 @@ static int sync_texture_c(Table *tex) {
     if (isempty(fy) || isempty(gm)) return 0;
     int isdata = tv_true(luaH_getshortstr(tex, tkey[TK_ISDATA]));
     tex_apply(t, lk_int(ws), lk_int(wt), lk_int(mag), lk_int(min), !(ttisboolean(fy) && l_isfalse(fy)) && !isdata,
-              !(ttisboolean(gm) && l_isfalse(gm)) && !isdata, lk_int(enc), (float)ox, (float)oy, (float)rx, (float)ry,
+              !(ttisboolean(gm) && l_isfalse(gm)) && !isdata, texture_cs(tex), (float)ox, (float)oy, (float)rx, (float)ry,
               (float)cx, (float)cy, (float)rot, (float)aniso, 1);
     return 1;
 }
@@ -5731,7 +5745,7 @@ static int l_instance_colors(lua_State *L) {
  * a value only when it changed, as the Lua applyRenderer did) */
 typedef struct {
     int valid;
-    double cr, cg, cb, ca; int ac, se, st, oe, aa, pcl;
+    double cr, cg, cb, ca; int ac, se, st, oe, aa;
     int size_valid; double fw, fh;
     int vp_valid; double vx, vy, vw, vh; int sct; double sx, sy, sw, sh;
 } rcache_t;
@@ -5750,7 +5764,7 @@ static int renderer_gc(lua_State *L) {
  * the drawing-buffer size, the viewport and scissor (WebGLRenderer's
  * _drawRegion arithmetic), the scene's background, fog and autoUpdate.
  * Returns true when scene.background is a texture (not drawn: Lua warns). */
-enum { RK_CLEARCOLOR, RK_CLEARALPHA, RK_AUTOCLEAR, RK_SHADOWMAP, RK_ENABLED, RK_TYPE, RK_ENCODING, RK_AA, RK_PCL,
+enum { RK_CLEARCOLOR, RK_CLEARALPHA, RK_AUTOCLEAR, RK_SHADOWMAP, RK_ENABLED, RK_TYPE, RK_ENCODING, RK_AA, RK_OCS,
        RK_VIEWPORT, RK_PR, RK_WIDTH, RK_HEIGHT, RK_SCT, RK_SCISSOR, RK_BG, RK_FOG, RK_ISCOLOR, RK_ISEXP2, RK_NEAR,
        RK_FAR, RK_DENSITY, RK_AUTOUPDATE, RK_COUNT };
 static TString *rkey[RK_COUNT];
@@ -5769,6 +5783,11 @@ static int rk_truthy(lua_State *L, Table *t, int k) {
 static double rk_num(Table *t, int k, double def) { const TValue *v = rk(t, k); return (v && !l_isfalse(v)) ? tv_num(v) : def; }
 /* math.floor as Lua's (an integer-valued float / integer) */
 static double lfloor(double d) { return floor(d); }
+/* a working-space (linear) channel as sRGB, clamped, when colour management is on */
+static double srgb_of(double c) {
+    if (c < 0) c = 0; else if (c > 1) c = 1;
+    return t3_get_color_management() ? t3_linear_to_srgb((float)c) : c;
+}
 static int l_frame_setup(lua_State *L) {
     luaL_checktype(L, 1, LUA_TTABLE);
     rbox_t *box = (rbox_t *)lua_touserdata(L, 2);
@@ -5794,22 +5813,26 @@ static int l_frame_setup(lua_State *L) {
         se = e ? tv_true(e) : 0;
         st = t ? lk_int(tv_num(t)) : 1;
     } else if (smv) { se = tv_true(smv); }
-    int oe = lk_int(rk_num(rt, RK_ENCODING, 3000));
+    /* renderer.outputColorSpace (r186, SRGBColorSpace by default); r128's
+     * outputEncoding when that is set and outputColorSpace is not */
+    const TValue *ocs = rk(rt, RK_OCS);
+    int oe = T3_SRGB_COLOR_SPACE;
+    if (ocs && ttisstring(ocs)) oe = cs_of_name(getstr(tsvalue(ocs)));
+    else if (rk(rt, RK_ENCODING)) oe = rk_num(rt, RK_ENCODING, 3000) == 3001 ? T3_SRGB_COLOR_SPACE : T3_LINEAR_SRGB_COLOR_SPACE;
     const TValue *aav = rk(rt, RK_AA);
     int aa = (aav && tv_true(aav)) ? 4 : 0;
-    const TValue *pclv = rk(rt, RK_PCL);
-    int pcl = pclv && ttisboolean(pclv) && !l_isfalse(pclv);
     if (!k->valid || k->cr != cr || k->cg != cg || k->cb != cb || k->ca != ca || k->ac != ac || k->se != se || k->st != st
-        || k->oe != oe || k->aa != aa || k->pcl != pcl) {
-        double hex = lfloor(cr * 255 + 0.5) * 65536 + lfloor(cg * 255 + 0.5) * 256 + lfloor(cb * 255 + 0.5);
+        || k->oe != oe || k->aa != aa) {
+        /* the clear colour is a Color in the working space (linear); three.c
+         * takes it as hex, read as sRGB (r186's Color.getHex) */
+        double hex = lfloor(srgb_of(cr) * 255 + 0.5) * 65536 + lfloor(srgb_of(cg) * 255 + 0.5) * 256 + lfloor(srgb_of(cb) * 255 + 0.5);
         t3_renderer_set_clear_color(r, (uint32_t)(long long)hex, (float)ca);
         t3_renderer_set_auto_clear(r, ac);
         t3_renderer_set_shadow_map(r, se, (t3_shadow_map_type)st);
-        t3_renderer_set_output_encoding(r, (t3_encoding)oe);
+        t3_renderer_set_output_color_space(r, (t3_color_space)oe);
         t3_renderer_set_antialias(r, aa);
-        t3_renderer_set_physically_correct_lights(r, pcl);
         k->valid = 1; k->cr = cr; k->cg = cg; k->cb = cb; k->ca = ca; k->ac = ac; k->se = se; k->st = st;
-        k->oe = oe; k->aa = aa; k->pcl = pcl;
+        k->oe = oe; k->aa = aa;
     }
     /* _drawRegion(rect): the viewport / scissor in drawing-buffer pixels */
     double vx = 0, vy = 0, vw = fw, vh = fh;
@@ -5878,8 +5901,8 @@ static int l_frame_setup(lua_State *L) {
     lua_pushboolean(L, warn);
     return 1;
 }
-/* t3.renderer_get(r): clear r g b alpha, autoClear, outputEncoding,
- * physicallyCorrectLights, shadow enabled, shadow type, antialias, width,
+/* t3.renderer_get(r): clear r g b alpha, autoClear, outputColorSpace
+ * (t3_color_space's number), shadow enabled, shadow type, antialias, width,
  * height, viewport x y w h, scissor test, scissor x y w h (for checking) */
 static int l_renderer_get(lua_State *L) {
     rbox_t *box = (rbox_t *)lua_touserdata(L, 1);
@@ -5888,8 +5911,7 @@ static int l_renderer_get(lua_State *L) {
     float a; t3_color c = t3_renderer_get_clear_color(r, &a);
     lua_pushnumber(L, c.r); lua_pushnumber(L, c.g); lua_pushnumber(L, c.b); lua_pushnumber(L, a);
     lua_pushboolean(L, t3_renderer_get_auto_clear(r));
-    lua_pushinteger(L, t3_renderer_get_output_encoding(r));
-    lua_pushboolean(L, t3_renderer_get_physically_correct_lights(r));
+    lua_pushinteger(L, t3_renderer_get_output_color_space(r));
     t3_shadow_map_type st; bool se = t3_renderer_get_shadow_map(r, &st);
     lua_pushboolean(L, se); lua_pushinteger(L, st);
     lua_pushinteger(L, t3_renderer_get_antialias(r));
@@ -5900,7 +5922,7 @@ static int l_renderer_get(lua_State *L) {
     bool sct = t3_renderer_get_scissor(r, &x, &y, &vw, &vh);
     lua_pushboolean(L, sct);
     lua_pushinteger(L, x); lua_pushinteger(L, y); lua_pushinteger(L, vw); lua_pushinteger(L, vh);
-    return 21;
+    return 20;
 }
 /* t3.scene_get(h): hasBackground, r g b, fog type, r g b, near, far,
  * density, autoUpdate (for checking) */
@@ -6051,15 +6073,14 @@ static t3_renderer *R(lua_State *L, int i) {
 }
 
 /* t3.renderer_set(r, clearHex, clearAlpha, autoClear, shadowsOn, shadowType,
- *                 outputEncoding, antialiasSamples [, physicallyCorrectLights]) */
+ *                 outputColorSpace (t3_color_space's number), antialiasSamples) */
 static int l_renderer_set(lua_State *L) {
     t3_renderer *r = R(L, 1);
     t3_renderer_set_clear_color(r, (uint32_t)lua_tointeger(L, 2), F(3));
     t3_renderer_set_auto_clear(r, B(4));
     t3_renderer_set_shadow_map(r, B(5), (t3_shadow_map_type)I(6));
-    t3_renderer_set_output_encoding(r, (t3_encoding)I(7));
+    t3_renderer_set_output_color_space(r, (t3_color_space)I(7));
     if (!lua_isnoneornil(L, 8)) t3_renderer_set_antialias(r, I(8));
-    if (!lua_isnoneornil(L, 9)) t3_renderer_set_physically_correct_lights(r, B(9));
     return 0;
 }
 
@@ -6230,7 +6251,7 @@ void wcl_open_three_c(lua_State *L) {
     }
     static const char *const tnames[TK_COUNT] = { "map", "normalMap", "aoMap", "emissiveMap", "roughnessMap", "metalnessMap",
                                                   "alphaMap", "_t3", "version", "_t3ver", "wrapS", "wrapT", "magFilter", "minFilter",
-                                                  "flipY", "isDataTexture", "generateMipmaps", "encoding", "offset", "repeat_",
+                                                  "flipY", "isDataTexture", "generateMipmaps", "colorSpace", "encoding", "offset", "repeat_",
                                                   "center", "rotation", "anisotropy" };
     for (int i = 0; i < TK_COUNT; i++) {
         lua_pushstring(L, tnames[i]);
@@ -6249,7 +6270,7 @@ void wcl_open_three_c(lua_State *L) {
         luaL_ref(L, LUA_REGISTRYINDEX);
     }
     static const char *const rnames[RK_COUNT] = { "_clearColor", "_clearAlpha", "autoClear", "shadowMap", "enabled", "type",
-                                                  "outputEncoding", "_antialias", "physicallyCorrectLights", "_viewport",
+                                                  "outputEncoding", "_antialias", "outputColorSpace", "_viewport",
                                                   "_pixelRatio", "_width", "_height", "_scissorTest", "_scissor", "background",
                                                   "fog", "isColor", "isFogExp2", "near", "far", "density", "autoUpdate" };
     for (int i = 0; i < RK_COUNT; i++) {
