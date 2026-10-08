@@ -5767,7 +5767,7 @@ static int renderer_gc(lua_State *L) {
  * Returns true when scene.background is a texture (not drawn: Lua warns). */
 enum { RK_CLEARCOLOR, RK_CLEARALPHA, RK_AUTOCLEAR, RK_SHADOWMAP, RK_ENABLED, RK_TYPE, RK_ENCODING, RK_AA, RK_OCS,
        RK_VIEWPORT, RK_PR, RK_WIDTH, RK_HEIGHT, RK_SCT, RK_SCISSOR, RK_BG, RK_FOG, RK_ISCOLOR, RK_ISEXP2, RK_NEAR,
-       RK_FAR, RK_DENSITY, RK_AUTOUPDATE, RK_COUNT };
+       RK_FAR, RK_DENSITY, RK_AUTOUPDATE, RK_MWAUTOUPDATE, RK_COUNT };
 static TString *rkey[RK_COUNT];
 static const TValue *rk(Table *t, int k) { const TValue *v = luaH_getshortstr(t, rkey[k]); return (isempty(v) || ttisnil(v)) ? NULL : v; }
 /* t[k] as Lua indexing resolves it (the class chain, or the metamethod
@@ -5895,8 +5895,9 @@ static int l_frame_setup(lua_State *L) {
                 sh3->fog.near = (float)rk_num(fog, RK_NEAR, 1); sh3->fog.far = (float)rk_num(fog, RK_FAR, 1000);
                 sh3->fog.density = (float)rk_num(fog, RK_DENSITY, 0.00025);
             } else sh3->fog.type = T3_FOG_NONE;
-            const TValue *auv = rk(sc, RK_AUTOUPDATE);
-            sh3->auto_update = !(auv && ttisboolean(auv) && l_isfalse(auv));
+            /* r186's scene.matrixWorldAutoUpdate, and r128's autoUpdate: off when either is false */
+            const TValue *auv = rk(sc, RK_AUTOUPDATE), *mwv = rk(sc, RK_MWAUTOUPDATE);
+            sh3->auto_update = !(auv && ttisboolean(auv) && l_isfalse(auv)) && !(mwv && ttisboolean(mwv) && l_isfalse(mwv));
         }
     }
     lua_pushboolean(L, warn);
@@ -6273,7 +6274,8 @@ void wcl_open_three_c(lua_State *L) {
     static const char *const rnames[RK_COUNT] = { "_clearColor", "_clearAlpha", "autoClear", "shadowMap", "enabled", "type",
                                                   "outputEncoding", "_antialias", "outputColorSpace", "_viewport",
                                                   "_pixelRatio", "_width", "_height", "_scissorTest", "_scissor", "background",
-                                                  "fog", "isColor", "isFogExp2", "near", "far", "density", "autoUpdate" };
+                                                  "fog", "isColor", "isFogExp2", "near", "far", "density", "autoUpdate",
+                                                  "matrixWorldAutoUpdate" };
     for (int i = 0; i < RK_COUNT; i++) {
         lua_pushstring(L, rnames[i]);
         rkey[i] = (TString *)lua_topointer(L, -1);
