@@ -63,6 +63,7 @@ extern int wcl_decode_opus(const unsigned char *data, int size,
 #include "lauxlib.h"
 #include "lualib.h"
 int luaopen_wcljit(lua_State *L);  /* jit/ljit.c */
+void luaJ_checkrestore(lua_State *L);  /* jit/ljit.c: forget JIT slots after a state restore */
 
 /* physics.c: Box2D v3 bound as the global `b2` */
 void wcl_open_physics(lua_State *L);
@@ -3640,6 +3641,7 @@ WC_EXPORT_INIT void wc_init(void) {
 
 WC_EXPORT_RENDER void wc_render(void) {
     dbg_draw_calls = 0;
+    if (L) luaJ_checkrestore(L);
 
 #ifdef WCL_ENABLE_GL2D
     wcl_r2d_init(scr_w, scr_h);   /* no-op after the first */
