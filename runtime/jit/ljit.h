@@ -48,6 +48,7 @@ LUAI_FUNC int luaJ_hot (lua_State *L, Proto *p, const Instruction *pc);
 LUAI_FUNC int luaJ_enter (lua_State *L, CallInfo *ci, const Instruction *pc);
 LUAI_FUNC int luaJ_trap (lua_State *L, CallInfo *ci, const Instruction *pc);
 LUAI_FUNC void luaJ_freeproto (lua_State *L, Proto *p);
+LUAI_FUNC void luaJ_checkrestore (lua_State *L);
 LUAI_FUNC int luaopen_wcljit (lua_State *L);
 
 /* lvm.c internals exported for the helpers */

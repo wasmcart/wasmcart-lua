@@ -74,9 +74,12 @@ int luaJ_on = 1;
 
 static int jit_state = 0;  /* 0 = not initialized, 1 = on, -1 = off */
 static int jit_userthreshold = -1;  /* threshold set from Lua, if any */
+/* the host's restore generation (wc_jit_config key 7) when this memory last
+   saw it; a save state carries it, so after a restore it differs */
+static int jit_restoregen = 0;
 
 static struct {
-  lu_mem compiled, failed, modules, bytes, rejected, bails, pending;
+  lu_mem compiled, failed, modules, bytes, rejected, bails, pending, restores;
   lu_mem specialized, specbails, despecialized, specrejected;
   const char *lasterr;
 } jst;
@@ -149,6 +152,7 @@ static int cell_alloc (Proto *p) {
 static void jit_init (void) {
   int v;
   jit_state = 1;
+  jit_restoregen = wc_jit_config(7);
   if (wc_jit_config(1) == 1) jit_state = -1, luaJ_on = 0;
   v = wc_jit_config(0);
   if (v >= 0 && jit_userthreshold < 0) luaJ_threshold = v;
@@ -3001,6 +3005,41 @@ int luaJ_trap (lua_State *L, CallInfo *ci, const Instruction *pc) {
   return 1;
 }
 
+/*
+** Once per frame: if the host restored a save state since the last check
+** (wc_jit_config key 7 changed), every slot and pending cell this memory
+** remembers is gone. Forget them all; hot functions re-link on their next
+** call (their counts are kept).
+*/
+void luaJ_checkrestore (lua_State *L) {
+  int g;
+  GCObject *o;
+  if (jit_state <= 0) return;  /* nothing was ever linked */
+  g = wc_jit_config(7);
+  if (g == jit_restoregen) return;
+  jit_restoregen = g;
+  for (o = G(L)->allgc; o != NULL; o = o->next) {
+    Proto *p;
+    JitInfo *info;
+    if (o->tt != LUA_VPROTO) continue;
+    p = gco2p(o);
+    if (p->jitslot > 0 || p->jitslot == LUAJ_PENDING) p->jitslot = LUAJ_COLD;
+    p->jitcell = -1;
+    info = (JitInfo *)p->jitinfo;
+    if (info) {
+      info->genslot = info->specslot = 0;
+      info->state = SPEC_NONE;
+      info->cell = -1;
+      info->bails = info->respecs = 0;
+      info->count = 0;
+    }
+  }
+  memset(jit_cellused, 0, sizeof(jit_cellused));
+  memset(jit_cellowner, 0, sizeof(jit_cellowner));
+  jst.pending = 0;
+  jst.restores++;
+}
+
 void luaJ_freeproto (lua_State *L, Proto *p) {
   JitInfo *info = (JitInfo *)p->jitinfo;
   (void)L;
@@ -3065,6 +3104,7 @@ static int jl_stats (lua_State *L) {
   F("bytes", jst.bytes);
   F("bails", jst.bails);
   F("pending", jst.pending);
+  F("restores", jst.restores);
   F("threshold", luaJ_threshold);
   F("specialized", jst.specialized);
   F("specbails", jst.specbails);
