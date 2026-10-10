@@ -1,0 +1,196 @@
+--- a/src/lobject.h
++++ b/src/lobject.h
+@@ -570,6 +570,11 @@
+   LocVar *locvars;  /* information about local variables (debug information) */
+   TString  *source;  /* used for debug information */
+   GCObject *gclist;
++  /* LUA_JIT: runtime compilation state (see ljit.h) */
++  int jitslot;  /* >0: table slot of compiled code; 0: none yet; <0: LUAJ_* */
++  int jitcount;  /* hotness: calls + loop back-edges */
++  int jitcell;  /* pending asynchronous compile, or -1 */
++  void *jitinfo;  /* type feedback and specialization state */
+ } Proto;
+ 
+ /* }================================================================== */
+--- a/src/lstate.h
++++ b/src/lstate.h
+@@ -329,6 +329,7 @@
+   int basehookcount;
+   int hookcount;
+   volatile l_signalT hookmask;
++  const Instruction *jitbail;  /* LUA_JIT: pc the compiled code bailed at */
+ };
+ 
+ 
+--- a/src/lstate.c
++++ b/src/lstate.c
+@@ -263,6 +263,7 @@
+   L->status = LUA_OK;
+   L->errfunc = 0;
+   L->oldpc = 0;
++  L->jitbail = NULL;
+ }
+ 
+ 
+--- a/src/lfunc.c
++++ b/src/lfunc.c
+@@ -18,6 +18,7 @@
+ #include "ldo.h"
+ #include "lfunc.h"
+ #include "lgc.h"
++#include "ljit.h"
+ #include "lmem.h"
+ #include "lobject.h"
+ #include "lstate.h"
+@@ -260,11 +261,16 @@
+   f->linedefined = 0;
+   f->lastlinedefined = 0;
+   f->source = NULL;
++  f->jitslot = 0;
++  f->jitcount = 0;
++  f->jitcell = -1;
++  f->jitinfo = NULL;
+   return f;
+ }
+ 
+ 
+ void luaF_freeproto (lua_State *L, Proto *f) {
++  luaJ_freeproto(L, f);
+   luaM_freearray(L, f->code, f->sizecode);
+   luaM_freearray(L, f->p, f->sizep);
+   luaM_freearray(L, f->k, f->sizek);
+--- a/src/ldo.c
++++ b/src/ldo.c
+@@ -19,6 +19,7 @@
+ #include "lapi.h"
+ #include "ldebug.h"
+ #include "ldo.h"
++#include "ljit.h"
+ #include "lfunc.h"
+ #include "lgc.h"
+ #include "lmem.h"
+@@ -137,6 +138,7 @@
+ 
+ int luaD_rawrunprotected (lua_State *L, Pfunc f, void *ud) {
+   l_uint32 oldnCcalls = L->nCcalls;
++  int oldjitdepth = luaJ_depth;  /* LUA_JIT: compiled frames on the wasm stack */
+   struct lua_longjmp lj;
+   lj.status = LUA_OK;
+   lj.previous = L->errorJmp;  /* chain new error handler */
+@@ -146,6 +148,7 @@
+   );
+   L->errorJmp = lj.previous;  /* restore old error handler */
+   L->nCcalls = oldnCcalls;
++  luaJ_depth = oldjitdepth;  /* an error or yield unwound compiled frames */
+   return lj.status;
+ }
+ 
+--- a/src/lvm.c
++++ b/src/lvm.c
+@@ -29,6 +29,7 @@
+ #include "ltable.h"
+ #include "ltm.h"
+ #include "lvm.h"
++#include "ljit.h"
+ 
+ 
+ /*
+@@ -1137,12 +1138,29 @@
+ /* fetch an instruction and prepare its execution */
+ #define vmfetch()	{ \
+   if (l_unlikely(trap)) {  /* stack reallocation or hooks? */ \
++    if (!L->hookmask) {  /* LUA_JIT: (re)enter compiled code? */ \
++      int jt_ = luaJ_trap(L, ci, pc); \
++      updatebase(ci); \
++      trap = (jt_ == 2); \
++      if (jt_ == 1) goto jitenter; \
++    } \
++    else { \
+     trap = luaG_traceexec(L, pc);  /* handle hooks */ \
+     updatebase(ci);  /* correct stack */ \
++    } \
+   } \
+   i = *(pc++); \
+ }
+ 
++/*
++** LUA_JIT: count a loop back-edge. When the function has compiled code (or
++** just became hot), raise 'trap' so the next fetch enters it. Must follow
++** any 'updatetrap', which would overwrite the local 'trap'.
++*/
++#define jitbackedge()	{ Proto *jp_ = cl->p; \
++  if (luaJ_on && jp_->jitslot >= 0 && !L->hookmask && \
++      (jp_->jitslot > 0 || ++jp_->jitcount > luaJ_threshold)) trap = 1; }
++
+ #define vmdispatch(o)	switch(o)
+ #define vmcase(l)	case l:
+ #define vmbreak		break
+@@ -1166,6 +1184,23 @@
+   if (l_unlikely(trap))
+     trap = luaG_tracecall(L);
+   base = ci->func.p + 1;
++  if (luaJ_ready(L, cl->p, pc)) {  /* LUA_JIT: compiled code for this pc? */
++    int jr;
++   jitenter:
++    jr = luaJ_enter(L, ci, pc);
++    if (jr == LUAJ_CALL) {  /* compiled code set up a Lua call */
++      ci = L->ci;
++      goto startfunc;
++    }
++    else if (jr == LUAJ_RETURN)  /* compiled code returned */
++      goto ret;
++    else if (jr == LUAJ_BAIL) {  /* interpret from 'savedpc', then re-enter */
++      pc = ci->u.l.savedpc;
++      L->jitbail = pc;
++      trap = ci->u.l.trap = 1;
++    }
++    base = ci->func.p + 1;
++  }
+   /* main loop of interpreter */
+   for (;;) {
+     Instruction i;  /* instruction being executed */
+@@ -1598,6 +1633,7 @@
+       }
+       vmcase(OP_JMP) {
+         dojump(ci, i, 0);
++        if (GETARG_sJ(i) < 0) jitbackedge();
+         vmbreak;
+       }
+       vmcase(OP_EQ) {
+@@ -1798,6 +1834,7 @@
+         else if (floatforloop(ra))  /* float loop */
+           pc -= GETARG_Bx(i);  /* jump back */
+         updatetrap(ci);  /* allows a signal to break the loop */
++        jitbackedge();
+         vmbreak;
+       }
+       vmcase(OP_FORPREP) {
+@@ -1839,6 +1876,7 @@
+         if (!ttisnil(s2v(ra + 4))) {  /* continue loop? */
+           setobjs2s(L, ra + 2, ra + 4);  /* save control variable */
+           pc -= GETARG_Bx(i);  /* jump back */
++          jitbackedge();
+         }
+         vmbreak;
+       }}
+@@ -1897,3 +1935,20 @@
+ }
+ 
+ /* }================================================================== */
++
++
++/*
++** LUA_JIT: lvm.c internals the compiled code's helpers need.
++*/
++int luaV_forprep (lua_State *L, StkId ra) {
++  return forprep(L, ra);
++}
++
++int luaV_floatforloop (StkId ra) {
++  return floatforloop(ra);
++}
++
++void luaV_pushclosure (lua_State *L, Proto *p, UpVal **encup, StkId base,
++                       StkId ra) {
++  pushclosure(L, p, encup, base, ra);
++}

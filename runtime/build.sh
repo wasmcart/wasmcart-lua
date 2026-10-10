@@ -38,6 +38,12 @@ BOX3D_SHA=29bf523ce7bc4590aba9f17c9db791cdc5c4397e
 RUNTIME_DIR="$(pwd)"
 
 # ── fetch + build the Lua VM (pinned, fetched not vendored) ──────────
+# The runtime JIT (runtime/jit/) adds ljit.c to the VM and hooks five core
+# files (jit/lua-5.4.7-jit.patch, applied once; the marker is ljit.h in
+# lvm.c). The library is rebuilt whenever a JIT source is newer than it.
+if [ -f vendor/liblua54.a ] && [ -n "$(find jit -newer vendor/liblua54.a -type f 2>/dev/null)" ]; then
+  rm -f vendor/liblua54.a
+fi
 if [ ! -f vendor/liblua54.a ]; then
   mkdir -p vendor
   if [ ! -d vendor/lua ]; then
@@ -60,14 +66,17 @@ if [ ! -f vendor/liblua54.a ]; then
   # patch-lua.py is idempotent per file (it checks for its own marker)
   python3 ../patch-lua.py vendor/lua/src/lauxlib.c
   python3 ../patch-lua.py vendor/lua/src/lmathlib.c
+  if ! grep -q '"ljit.h"' vendor/lua/src/lvm.c; then
+    ( cd vendor/lua && patch -p1 --forward < ../../jit/lua-5.4.7-jit.patch )
+  fi
   # -include cartconf.h lands before lauxlib.h's `#if !defined(lua_writestring)`
   # guards, so Lua's stdout/stderr hooks resolve to wc_log instead of stdio.
   # -flto: the VM's calls into the table code (luaH_getshortstr on every
   # field read) are inlined at link time; 14-cpu-math -9% (2026-10-05).
   ( cd vendor/lua/src && \
-    emcc -O2 -flto -c $CORE -DLUA_CART_NOFILES -sSUPPORT_LONGJMP=wasm \
-      -I "$RUNTIME_DIR" -include "$RUNTIME_DIR/cartconf.h" && \
-    emar rcs ../../liblua54.a ${CORE//.c/.o} && rm -f ${CORE//.c/.o} )
+    emcc -O2 -flto -c $CORE "$RUNTIME_DIR/jit/ljit.c" -DLUA_CART_NOFILES -sSUPPORT_LONGJMP=wasm \
+      -I . -I "$RUNTIME_DIR" -I "$RUNTIME_DIR/jit" -include "$RUNTIME_DIR/cartconf.h" && \
+    emar rcs ../../liblua54.a ${CORE//.c/.o} ljit.o && rm -f ${CORE//.c/.o} ljit.o )
 fi
 
 
@@ -274,12 +283,13 @@ build_engine() {   # $1 = output, $2... = extra flags
     vendor/liblua54.a vendor/libbox2d.a vendor/libbox3d.a \
     -O2 -msimd128 -msse2 -DWC_USE_NET_PEER -DWC_PHYSICS_SIMD='"wasm-simd128"' \
     $OPUS_FLAGS "$@" \
-    -I vendor/lua/src -I vendor/box2d/include -I vendor/box3d/include \
+    -I vendor/lua/src -I jit -I vendor/box2d/include -I vendor/box3d/include \
     -I "$WASMCART_REPO/include" -I . \
     -s STANDALONE_WASM=1 --no-entry -sSUPPORT_LONGJMP=wasm \
     -s EXPORTED_FUNCTIONS='["_wc_init","_wc_render","_wc_get_info","_wc_debug_state","_wc_set_seed","_wc_peer_on_connect","_wc_peer_on_message","_wc_peer_on_disconnect","_wc_peer_on_error"]' \
     -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
     -s ALLOW_MEMORY_GROWTH=1 -s INITIAL_MEMORY=67108864 -s STACK_SIZE=4194304 \
+    -s ALLOW_TABLE_GROWTH=1 -s EXPORTED_RUNTIME_METHODS=[] \
     -o "$out"
   echo "built $out ($(wc -c < "$out") bytes)"
 }

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+let __jit = null;  // set in the first async function before imports are built
 /*
  * test/bench.js - measure where a cart's frame time actually goes.
  *
@@ -65,6 +66,8 @@ async function main() {
   const dec = new TextDecoder();
   let pending = null, count = 0, done = false;
 
+  __jit = await require('./jit-host.js')();  // wc_jit_link (runtime JIT)
+
   const imports = {
     env: {
       wc_log: (p, l) => {
@@ -102,11 +105,13 @@ async function main() {
       wc_peer_transport: () => 0,
       wc_debug_mark: () => {},
       emscripten_notify_memory_growth: () => {},
+      ...__jit.imports,
     },
     wasi_snapshot_preview1: new Proxy({}, { get: () => () => 0 }),
   };
 
   const { instance } = await WebAssembly.instantiate(fs.readFileSync(ENGINE), imports);
+__jit.bind(instance);
   const e = instance.exports;
   mem = e.memory;
   e.wc_get_info();
@@ -122,6 +127,7 @@ async function main() {
   for (let rep = 0; rep < REPEATS; rep++) {
     // fresh instance per repeat so table/particle state starts identical
     const { instance: inst } = await WebAssembly.instantiate(fs.readFileSync(ENGINE), imports);
+__jit.bind(inst);
     const ex = inst.exports;
     mem = ex.memory;
     ex.wc_get_info();
