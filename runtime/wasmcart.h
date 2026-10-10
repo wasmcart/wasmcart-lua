@@ -3,6 +3,62 @@
 
 #include <stdint.h>
 
+/* wc_alloc / wc_free - the allocator a host writes into your cart through.
+ *
+ * Some host calls hand your cart bytes at an address the host has to pick:
+ * glGetString / glGetStringi / glMapBufferRange return pointers, the WebGPU
+ * glue passes adapter info, mapped ranges and error messages, and text and
+ * network payloads arrive as (ptr, len). The host owns none of your memory,
+ * so it asks your cart to allocate, through two optional exports:
+ *
+ *     void *wc_alloc(size_t size, size_t align);   // NULL on failure
+ *     void  wc_free(void *ptr);
+ *
+ * A C/C++ cart that includes wasmcart.h defines and exports both (over aligned_alloc/free), for Emscripten
+ * and wasi-sdk alike. You never call them yourself.
+ *
+ * - They are WEAK: define your own wc_alloc/wc_free (exported under those
+ *   names) and yours win.
+ * - Define WASMCART_NO_ALLOC before including wasmcart.h to leave them out
+ *   (a cart with no libc, or one that exports its own).
+ * - They are only emitted when <stdlib.h> exists, so a -nostdlib cart with no
+ *   sysroot still compiles; such a cart exports its own if it needs them.
+ * - They must be thread-safe in a threaded cart: aligned_alloc is.
+ * - In a WebGPU cart, the cart's own webgpu.cpp releases some of these blocks
+ *   with free(), so wc_alloc must return memory free() accepts. This one does.
+ *
+ * See SPEC.md, "Cart memory the host writes". */
+#if defined(__wasm__) && !defined(WASMCART_NO_ALLOC) && defined(__has_include)
+#if __has_include(<stdlib.h>)
+#include <stdlib.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+__attribute__((weak, used, export_name("wc_alloc")))
+void *wc_alloc(size_t size, size_t align) {
+    if (align < sizeof(void *)) align = sizeof(void *);
+    if (align & (align - 1)) return 0;         /* not a power of two */
+    if (size > (size_t)-1 - align) return 0;   /* rounding up would wrap */
+    /* aligned_alloc wants a size that is a multiple of the alignment */
+    size = size ? (size + align - 1) & ~(align - 1) : align;
+    return aligned_alloc(align, size);
+}
+
+__attribute__((weak, used, export_name("wc_free")))
+void wc_free(void *ptr) {
+    free(ptr);
+}
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __has_include(<stdlib.h>) */
+#endif /* __wasm__ && !WASMCART_NO_ALLOC */
+
+
 // ABI version
 #define WC_ABI_VERSION 4
 
@@ -75,18 +131,6 @@ typedef struct {
     uint8_t  _pad[3];
 } wc_pad_t;
 
-// The size is part of the ABI, not a comment: the host writes PAD_SIZE bytes
-// per pad into a flat array, so a struct one byte off here reads pad 1 at the
-// wrong offset and every pad after it is garbage. Several vendored copies of
-// this header carried a comment claiming a size that did not match the struct
-// below it, which is exactly the failure an assertion catches at compile time
-// instead of at runtime as mysteriously-moving input.
-#ifdef __cplusplus
-static_assert(sizeof(wc_pad_t) == 20, "wc_pad_t must be 20 bytes (wasmcart ABI v4)");
-#else
-_Static_assert(sizeof(wc_pad_t) == 20, "wc_pad_t must be 20 bytes (wasmcart ABI v4)");
-#endif
-
 // Time struct (20 bytes, 8-byte aligned)
 //
 // delta_ms is CLAMPED by the host (250ms in the reference hosts). Any stall
@@ -110,8 +154,15 @@ typedef struct {
     uint32_t preferred_height;  // host's preferred/native height (0 = no preference)
     uint32_t _reserved0;        // (was host_fps — unused, carts use wc_time.delta_ms instead)
     uint32_t audio_sample_rate; // host audio rate (e.g. 48000)
-    uint32_t flags;             // reserved for future use
+    uint32_t flags;             // WC_HOST_FLAG_* (wc_cart.h has DETERMINISTIC); read once at wc_init
 } wc_host_info_t;
+
+// Host-info flag: the host selected WebGPU for a cart that imports BOTH the
+// `gl` module and WebGPU functions (SPEC.md, "WebGPU"). 0 means GL. A cart
+// importing only one API never needs to read it.
+#ifndef WC_HOST_FLAG_GPU_WGPU
+#define WC_HOST_FLAG_GPU_WGPU (1u << 1)
+#endif
 
 // Pointer struct (8 bytes — unified mouse/touch, ABI v3)
 typedef struct {
@@ -288,16 +339,14 @@ typedef struct {
     uint32_t audio_sample_rate; // ring buffer sample rate (0 = host decides, typically 48000)
     uint32_t pointer_ptr;      // → wc_pointer_t[10], 0 = not used (ABI v3)
     uint32_t keys_ptr;         // → uint8_t[32] key state bitmask, 0 = not used (ABI v3)
-    uint32_t gpu_api;          // 0=2D framebuffer, 1=WebGL2/GLES3, 2=WebGPU, 3=Vulkan
+    uint32_t gpu_api;          // 0=2D framebuffer, 1=WebGL2/GLES3, 2=WebGPU (SPEC.md);
+                               // anything else is refused at load
     uint32_t wheel_ptr;        // → wc_wheel_t, 0 = not used (ABI v3.1)
 } wc_info_t;
 
 // Optional host import: debug logging
 #ifdef __wasm__
 __attribute__((import_module("env"), import_name("wc_log")))
-extern void wc_log(const char* ptr, unsigned int len);
-#elif defined(WC_NATIVE_HOST)
-/* native host links these in (see wc_native.h) */
 extern void wc_log(const char* ptr, unsigned int len);
 #else
 static inline void wc_log(const char* ptr, unsigned int len) { (void)ptr; (void)len; }
@@ -314,9 +363,6 @@ static inline void wc_log(const char* ptr, unsigned int len) { (void)ptr; (void)
 #ifdef __wasm__
 __attribute__((import_module("env"), import_name("wc_debug_mark")))
 extern void wc_debug_mark(unsigned int id);
-#elif defined(WC_NATIVE_HOST)
-/* native host links these in (see wc_native.h) */
-extern void wc_debug_mark(unsigned int id);
 #else
 static inline void wc_debug_mark(unsigned int id) { (void)id; }
 #endif
@@ -326,9 +372,6 @@ static inline void wc_debug_mark(unsigned int id) { (void)id; }
 // The host provides the SDL controller name, Gamepad API id, or "Keyboard".
 #ifdef __wasm__
 __attribute__((import_module("env"), import_name("wc_pad_name")))
-extern int wc_pad_name(unsigned int pad_id, char* buf, unsigned int buf_len);
-#elif defined(WC_NATIVE_HOST)
-/* native host links these in (see wc_native.h) */
 extern int wc_pad_name(unsigned int pad_id, char* buf, unsigned int buf_len);
 #else
 static inline int wc_pad_name(unsigned int pad_id, char* buf, unsigned int buf_len) {
@@ -373,11 +416,6 @@ extern void wc_text_input_begin(void);
 __attribute__((import_module("env"), import_name("wc_text_input_end")))
 extern void wc_text_input_end(void);
 __attribute__((import_module("env"), import_name("wc_text_input_active")))
-extern unsigned int wc_text_input_active(void);
-#elif defined(WC_NATIVE_HOST)
-/* native host links these in (see wc_native.h) */
-extern void wc_text_input_begin(void);
-extern void wc_text_input_end(void);
 extern unsigned int wc_text_input_active(void);
 #else
 static inline void wc_text_input_begin(void) {}
@@ -446,9 +484,6 @@ static inline unsigned int wc_text_input_active(void) { return 0; }
 #ifdef __wasm__
 __attribute__((import_module("env"), import_name("wc_frame_yield")))
 extern void wc_frame_yield(void);
-#elif defined(WC_NATIVE_HOST)
-/* native host links these in (see wc_native.h) */
-extern void wc_frame_yield(void);
 #else
 static inline void wc_frame_yield(void) {}
 #endif
@@ -480,12 +515,6 @@ extern void wc_pad_rumble(unsigned int pad_id, float low, float high,
 
 __attribute__((import_module("env"), import_name("wc_pad_rumble_stop")))
 extern void wc_pad_rumble_stop(unsigned int pad_id);
-#elif defined(WC_NATIVE_HOST)
-/* native host links these in (see wc_native.h) */
-extern unsigned int wc_pad_has_rumble(unsigned int pad_id);
-extern void wc_pad_rumble(unsigned int pad_id, float low, float high,
-                          unsigned int duration_ms);
-extern void wc_pad_rumble_stop(unsigned int pad_id);
 #else
 static inline unsigned int wc_pad_has_rumble(unsigned int pad_id) {
     (void)pad_id; return 0;
@@ -496,6 +525,154 @@ static inline void wc_pad_rumble(unsigned int pad_id, float low, float high,
 }
 static inline void wc_pad_rumble_stop(unsigned int pad_id) { (void)pad_id; }
 #endif
+
+// --- Runtime code generation (SPEC.md, "Runtime code generation") ---
+// Hand the host a wasm module generated at runtime; its exported functions land
+// in consecutive slots of the cart's __indirect_function_table. The module may
+// import only from namespace "cart" (the cart's own exports). Returns the first
+// slot, or WC_JIT_REFUSED / WC_JIT_PENDING (poll *result) / WC_JIT_BUSY.
+#define WC_JIT_REFUSED  (-1)
+#define WC_JIT_PENDING  (-2)
+#define WC_JIT_BUSY     (-3)
+// wc_jit_config keys (-1 = no opinion)
+#define WC_JIT_CFG_THRESHOLD      0
+#define WC_JIT_CFG_OFF            1
+#define WC_JIT_CFG_TIERUP         2
+#define WC_JIT_CFG_MAX_MODULE     3
+#define WC_JIT_CFG_MAX_TOTAL      4
+#define WC_JIT_CFG_MAX_FUNCTIONS  5
+#define WC_JIT_CFG_MAX_IN_FLIGHT  6
+// Restore generation: changes every time the host restores a save state or
+// rewinds. Read it at frame (or dispatch) entry; when it differs from the value
+// you stored, forget every slot and pending *result cell and re-link lazily.
+#define WC_JIT_CFG_RESTORE_GEN    7
+
+#ifdef __wasm__
+__attribute__((import_module("env"), import_name("wc_jit_link")))
+extern int wc_jit_link(const unsigned char *bytes, unsigned int len, int *result);
+
+__attribute__((import_module("env"), import_name("wc_jit_unlink")))
+extern void wc_jit_unlink(int first_slot);
+
+__attribute__((import_module("env"), import_name("wc_jit_config")))
+extern int wc_jit_config(int key);
+#else
+static inline int wc_jit_link(const unsigned char *bytes, unsigned int len, int *result) {
+    (void)bytes; (void)len; if (result) *result = -1; return -1;
+}
+static inline void wc_jit_unlink(int first_slot) { (void)first_slot; }
+static inline int wc_jit_config(int key) { (void)key; return -1; }
+#endif
+
+// --- Input actions (SPEC.md, "Input actions") ---
+// Steam Input style: declare named actions in action sets, each with a DEFAULT
+// binding to a logical pad input; the host owns the binding (remaps, devices)
+// and says what each action is on, so prompts read "Press [Cross] to Jump".
+// Optional: a cart that never calls these keeps reading wc_pad_t as before.
+#define WC_ACTION_DIGITAL 0
+#define WC_ACTION_ANALOG  1
+// Logical inputs: 0-20 are WC_BTN_* bit indexes, then the analog ones.
+#define WC_IN_NONE     (-1)
+#define WC_IN_A        0
+#define WC_IN_B        1
+#define WC_IN_X        2
+#define WC_IN_Y        3
+#define WC_IN_L        4
+#define WC_IN_R        5
+#define WC_IN_START    6
+#define WC_IN_SELECT   7
+#define WC_IN_UP       8
+#define WC_IN_DOWN     9
+#define WC_IN_LEFT     10
+#define WC_IN_RIGHT    11
+#define WC_IN_L3       12
+#define WC_IN_R3       13
+#define WC_IN_LSTICK   32
+#define WC_IN_RSTICK   33
+#define WC_IN_LTRIGGER 34
+#define WC_IN_RTRIGGER 35
+#define WC_IN_DPAD     36
+// wc_input_device
+#define WC_DEVICE_UNKNOWN        0
+#define WC_DEVICE_KEYBOARD_MOUSE 1
+#define WC_DEVICE_GAMEPAD        2
+#define WC_DEVICE_TOUCH          3
+#define WC_DEVICE_REMOTE         4
+// wc_action_glyph: (family << 8) | element; 0 = none (draw the label).
+// Pad families: element = WC_IN_* position. KEY: HID scancode. MOUSE: 0 left
+// 1 right 2 middle 3 wheel 4 motion. TOUCH: 0 tap 1 drag 2 on-screen button.
+#define WC_GLYPH_XBOX        1
+#define WC_GLYPH_PLAYSTATION 2
+#define WC_GLYPH_NINTENDO    3
+#define WC_GLYPH_GAMEPAD     4
+#define WC_GLYPH_KEY         5
+#define WC_GLYPH_MOUSE       6
+#define WC_GLYPH_TOUCH       7
+#define WC_GLYPH_FAMILY(g)   (((g) >> 8) & 0xff)
+#define WC_GLYPH_ELEMENT(g)  ((g) & 0xff)
+
+#ifdef __wasm__
+__attribute__((import_module("env"), import_name("wc_action_set_add")))
+extern int wc_action_set_add(const char *name, unsigned int len);
+__attribute__((import_module("env"), import_name("wc_action_add")))
+extern int wc_action_add(int set, int kind, int default_input, const char *name, unsigned int len);
+__attribute__((import_module("env"), import_name("wc_action_set_activate")))
+extern void wc_action_set_activate(int player, int set);
+__attribute__((import_module("env"), import_name("wc_action_digital")))
+extern int wc_action_digital(int player, int action);
+__attribute__((import_module("env"), import_name("wc_action_analog")))
+extern int wc_action_analog(int player, int action, float *xy);
+__attribute__((import_module("env"), import_name("wc_action_origin")))
+extern int wc_action_origin(int player, int action, char *buf, unsigned int cap);
+__attribute__((import_module("env"), import_name("wc_action_glyph")))
+extern int wc_action_glyph(int player, int action);
+__attribute__((import_module("env"), import_name("wc_input_device")))
+extern int wc_input_device(int player);
+__attribute__((import_module("env"), import_name("wc_input_revision")))
+extern unsigned int wc_input_revision(void);
+#else
+static inline int wc_action_set_add(const char *n, unsigned int l) { (void)n; (void)l; return 0; }
+static inline int wc_action_add(int s, int k, int i, const char *n, unsigned int l) {
+    (void)s; (void)k; (void)i; (void)n; (void)l; return -1;
+}
+static inline void wc_action_set_activate(int p, int s) { (void)p; (void)s; }
+static inline int wc_action_digital(int p, int a) { (void)p; (void)a; return 0; }
+static inline int wc_action_analog(int p, int a, float *xy) { (void)p; (void)a; xy[0] = xy[1] = 0; return 0; }
+static inline int wc_action_origin(int p, int a, char *b, unsigned int c) { (void)p; (void)a; (void)b; (void)c; return -1; }
+static inline int wc_action_glyph(int p, int a) { (void)p; (void)a; return 0; }
+static inline int wc_input_device(int p) { (void)p; return 0; }
+static inline unsigned int wc_input_revision(void) { return 1; }
+#endif
+
+// One-call helpers. wc_action_new(set, kind, default_input, "Jump") declares
+// an action; wc_action_set_new("menu") a set. wc_action_label(player, action)
+// returns a printable label: the host's answer, or the logical input's name
+// when the host does not know, or "" when the action is unbound on the
+// player's device (hide that prompt). The string lives in one of 4 rotating
+// static buffers, so up to 4 labels can be used in one printf. Re-read labels
+// when wc_input_revision() changes, not every frame.
+static inline unsigned int wc__strlen(const char *s) { unsigned int n = 0; while (s[n]) n++; return n; }
+static inline int wc_action_set_new(const char *name) { return wc_action_set_add(name, wc__strlen(name)); }
+static inline int wc_action_new(int set, int kind, int default_input, const char *name) {
+    return wc_action_add(set, kind, default_input, name, wc__strlen(name));
+}
+static inline const char *wc_input_name(int input) {
+    static const char *const btn[] = { "A", "B", "X", "Y", "L", "R", "Start", "Select", "Up", "Down",
+        "Left", "Right", "L3", "R3", "Guide", "Misc", "P1", "P2", "P3", "P4", "Touchpad" };
+    static const char *const axis[] = { "Left Stick", "Right Stick", "LT", "RT", "D-pad" };
+    if (input >= 0 && input <= 20) return btn[input];
+    if (input >= 32 && input <= 36) return axis[input - 32];
+    return "";
+}
+static inline const char *wc_action_label(int player, int action, int default_input) {
+    static char bufs[4][32];
+    static unsigned int next = 0;
+    char *b = bufs[next++ & 3];
+    int n = wc_action_origin(player, action, b, sizeof bufs[0]);
+    if (n > 0) return b;
+    if (n == 0) return "";
+    return wc_input_name(default_input);
+}
 
 // --- Asset API (ABI v2) ---
 // For .wasc carts: load assets from the archive at runtime instead of embedding.
@@ -508,11 +685,6 @@ extern int wc_asset_size(const char* path, unsigned int path_len);
 
 // Load an asset into cart memory at dest. Returns bytes loaded, or -1 on error.
 __attribute__((import_module("env"), import_name("wc_load_asset")))
-extern int wc_load_asset(const char* path, unsigned int path_len,
-                         void* dest, unsigned int max_size);
-#elif defined(WC_NATIVE_HOST)
-/* native host links these in (see wc_native.h) */
-extern int wc_asset_size(const char* path, unsigned int path_len);
 extern int wc_load_asset(const char* path, unsigned int path_len,
                          void* dest, unsigned int max_size);
 #else
@@ -586,17 +758,6 @@ __attribute__((import_module("env"), import_name("wc_peer_name")))
 extern int wc_peer_name(int peer_id, char* dest, unsigned int max_len);
 
 __attribute__((import_module("env"), import_name("wc_peer_transport")))
-extern int wc_peer_transport(int peer_id);
-#elif defined(WC_NATIVE_HOST)
-/* native host links these in (see wc_native.h) */
-extern int wc_peer_open(const char* addr, unsigned int addr_len);
-extern void wc_peer_close(int peer_id);
-extern int wc_peer_send(int peer_id, const void* data, unsigned int len);
-extern int wc_peer_broadcast(const void* data, unsigned int len);
-extern int wc_peer_state(int peer_id);
-extern int wc_peer_count(void);
-extern int wc_peer_id(unsigned int index);
-extern int wc_peer_name(int peer_id, char* dest, unsigned int max_len);
 extern int wc_peer_transport(int peer_id);
 #else
 static inline int wc_peer_open(const char* addr, unsigned int addr_len) {
@@ -710,10 +871,6 @@ typedef signed long int GLintptr;
 #define GL_FUNC_ADD                       0x8006
 #define GL_FUNC_SUBTRACT                  0x800A
 #define GL_FUNC_REVERSE_SUBTRACT          0x800B
-/* GLES3/WebGL2 blend equations, for love.graphics.setBlendMode's
- * "lighten"/"darken" -- both are equation modes, not factor pairs. */
-#define GL_MIN                            0x8007
-#define GL_MAX                            0x8008
 
 // Depth / Stencil
 #define GL_NEVER                          0x0200

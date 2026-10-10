@@ -31,6 +31,13 @@
 #define WC_USE_GL
 #include "wasmcart.h"
 #include "gl_hooks.h"   /* the engine's GL calls, noted (after the GL declarations) */
+/* GLES 3.0's MIN/MAX blend equations (the "lighten"/"darken" blend modes); wasmcart.h does not define them */
+#ifndef GL_MIN
+#define GL_MIN 0x8007
+#endif
+#ifndef GL_MAX
+#define GL_MAX 0x8008
+#endif
 #define WC_GL_BLIT_IMPLEMENTATION
 #include "wc_gl_blit.h"
 #include <string.h>
