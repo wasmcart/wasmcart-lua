@@ -383,8 +383,8 @@ cd runtime && ./build.sh      # needs emcc + `npm install` (headers + packer
 ```
 
 The build fetches and pins Lua 5.4.7, applies two small source guards
-(documented in `patch-lua.py`), builds Box2D 3.2.0 with wasm SIMD, and links
-two artifacts:
+(documented in `patch-lua.py`) and the runtime JIT's core hooks, builds Box2D
+3.2.0 with wasm SIMD, and links two artifacts:
 
 | artifact | what it is |
 |---|---|
@@ -392,6 +392,16 @@ two artifacts:
 | `build/engine-cpu.wasm` | software only, imports nothing from `gl`. **A test artifact, not a shipped runtime**: it is the oracle the GL build is diffed against. Carts ship `engine.wasm`. |
 
 ## Performance
+
+The engine carries a runtime JIT: hot Lua functions are compiled to WebAssembly
+inside the cart and linked by the host through wasmcart's `wc_jit_link`, so
+numeric and method-heavy Lua runs 2 to 11x faster than the interpreter and
+faster than native PUC Lua on most benchmarks. The compiler lives in its own
+repository, [lua-wasm-jit](https://github.com/monteslu/lua-wasm-jit), pulled in
+as a dev dependency by `npm install` and compiled into the VM by `build.sh`.
+A host without the import, or with it switched off (`WASMCART_JIT=0`), runs the
+same cart on the interpreter. `wc.jit.stats()` and `wc.jit.status(fn)` report
+what was compiled.
 
 GL2D against the software rasterizer, same cart, same frames, on an AMD 890M:
 

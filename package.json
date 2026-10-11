@@ -27,6 +27,7 @@
     "LICENSE"
   ],
   "devDependencies": {
-    "wasmcart": "^0.32.0"
+    "wasmcart": "^0.32.0",
+    "lua-wasm-jit": "github:monteslu/lua-wasm-jit#ff2d244db1e838310d682713e3bca6bd472a0113"
   }
 }

@@ -62,8 +62,8 @@ extern int wcl_decode_opus(const unsigned char *data, int size,
 #include "lua.h"
 #include "lauxlib.h"
 #include "lualib.h"
-int luaopen_wcljit(lua_State *L);  /* jit/ljit.c */
-void luaJ_checkrestore(lua_State *L);  /* jit/ljit.c: forget JIT slots after a state restore */
+int luaopen_wcljit(lua_State *L);  /* lua-wasm-jit: runtime/jit/ljit.c */
+void luaJ_checkrestore(lua_State *L);  /* lua-wasm-jit: forget JIT slots after a state restore */
 
 /* physics.c: Box2D v3 bound as the global `b2` */
 void wcl_open_physics(lua_State *L);
