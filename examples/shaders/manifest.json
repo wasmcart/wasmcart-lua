@@ -1,6 +1,5 @@
 {
   "name": "shaders",
-  "version": "1.0.0",
   "abi": 3,
   "entry": "main.wasm",
   "width": 1280,

@@ -277,6 +277,11 @@ cp ../build/engine.wasm ../template/main.wasm
 # cavern is 1152x768 from its conf.lua; everything else is the 1280x720
 # default. A cart with a conf.lua still overrides this at boot, but the
 # manifest is what the host has to go on BEFORE boot.
+#
+# No --version: wasmcart-pack (0.39.0 or later) takes it from this checkout's
+# git tags, so a build at the v0.6.2 tag packs 0.6.2 carts and any other build
+# <last tag>-dev.g<commit>. The dev manifests in examples/ and template/ carry
+# no version for the same reason.
 RELEASE_CARTS="
 ping:../examples/ping/app:1280x720
 breakout:../examples/breakout/app:1280x720
