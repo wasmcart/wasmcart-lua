@@ -66,7 +66,7 @@ local function scene(ox)
 end
 
 function love.draw()
-  t = t + 1 / 60
+  t = t + love.timer.getDelta()   -- seconds, at any display rate
 
   -- left: the default program
   love.graphics.setColor(1, 1, 1)

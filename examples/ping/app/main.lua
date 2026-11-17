@@ -25,26 +25,29 @@ function love.load()
   reset_ball(1)
 end
 
-local function move_paddle(p, up, down)
-  if up   then p.y = p.y - PADDLE_SPEED end
-  if down then p.y = p.y + PADDLE_SPEED end
+local function move_paddle(p, up, down, k)
+  if up   then p.y = p.y - PADDLE_SPEED * k end
+  if down then p.y = p.y + PADDLE_SPEED * k end
   p.y = math.max(0, math.min(H - PADDLE_H, p.y))
 end
 
 function love.update(dt)
-  move_paddle(left,  love.pad.isDown(1, "up"),   love.pad.isDown(1, "down"))
-  move_paddle(right, love.pad.isDown(2, "up"),   love.pad.isDown(2, "down"))
+  -- Speeds below are pixels per 1/60 s. k scales them by the real frame
+  -- time, so the game runs at the same speed on a 60, 120 or 144 Hz display.
+  local k = dt * 60
+  move_paddle(left,  love.pad.isDown(1, "up"),   love.pad.isDown(1, "down"), k)
+  move_paddle(right, love.pad.isDown(2, "up"),   love.pad.isDown(2, "down"), k)
 
   -- analog sticks too
   local a1 = love.pad.axis(1, "lefty")
-  if math.abs(a1) > 0.2 then left.y = left.y + a1 * PADDLE_SPEED end
+  if math.abs(a1) > 0.2 then left.y = left.y + a1 * PADDLE_SPEED * k end
   local a2 = love.pad.axis(2, "lefty")
-  if math.abs(a2) > 0.2 then right.y = right.y + a2 * PADDLE_SPEED end
+  if math.abs(a2) > 0.2 then right.y = right.y + a2 * PADDLE_SPEED * k end
   left.y  = math.max(0, math.min(H - PADDLE_H, left.y))
   right.y = math.max(0, math.min(H - PADDLE_H, right.y))
 
-  ball.x = ball.x + ball.vx
-  ball.y = ball.y + ball.vy
+  ball.x = ball.x + ball.vx * k
+  ball.y = ball.y + ball.vy * k
 
   -- top/bottom walls
   if ball.y - BALL_R < 0 then ball.y = BALL_R; ball.vy = -ball.vy; love.audio.beep(500) end

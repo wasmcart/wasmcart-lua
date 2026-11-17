@@ -52,7 +52,8 @@ is. See "Performance" below.
 1. Copies the four pads' buttons + sticks into Lua as 20 numbers.
 2. Calls `__wasmcart_frame(...)` in the prelude, which:
    - updates pad state and fires `keypressed`/`gamepadpressed` edges
-   - calls `love.update(1/60)`
+   - reads the host frame clock (`wc.clock()` -> `wc_time.time_ms`,
+     `delta_ms`) and calls `love.update(delta_ms / 1000)`
    - resets the transform stack and clears to the background color
    - calls `love.draw()`
 3. Runs one budgeted GC step (`lua_gc(LUA_GCSTEP, 4)`).
@@ -69,7 +70,7 @@ imports too, so the fixes paid twice:
 
 | Source of nondeterminism | Fix |
 |---|---|
-| wall-clock `dt` | fixed 1/60, `love.timer.getTime()` derived from the frame counter |
+| wall-clock `dt` | `dt` and `love.timer.getTime()` come from the host's `wc_time`; a deterministic host (`--seed`) hands every frame the same fixed step |
 | `math.random` seeding from `time()` | `patch-lua.py` fixes lmathlib's seed; prelude replaces `math.random` with the host-seeded xorshift |
 | Lua's string-hash seed (ASLR + time) | `luai_makeseed` overridden in `cartconf.h` — this is what makes `pairs()` order stable |
 | host clock reaching Lua | `os` is never opened |

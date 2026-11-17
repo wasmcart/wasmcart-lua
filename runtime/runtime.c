@@ -1606,6 +1606,17 @@ static int l_wheel(lua_State *S) {
     return 2;
 }
 
+/* The host's frame clock: time_ms, delta_ms (both milliseconds, as the ABI
+ * carries them). delta_ms is already clamped by the host (250 ms in the
+ * reference hosts) and is the fixed step under a deterministic replay, so
+ * the prelude hands it to love.update unchanged. A host that never fills
+ * wc_time leaves both at 0; the prelude handles that case. */
+static int l_clock(lua_State *S) {
+    lua_pushnumber(S, (lua_Number)wc_time.time_ms);
+    lua_pushnumber(S, (lua_Number)wc_time.delta_ms);
+    return 2;
+}
+
 /* Rumble. pad_id is 0-based at the ABI boundary; the prelude does the
  * 1-based -> 0-based conversion so love.pad numbering stays uniform. */
 static int l_pad_has_rumble(lua_State *S) {
@@ -2840,6 +2851,7 @@ static const luaL_Reg wc_lib[] = {
     {"asset_exists", l_asset_exists},
     {"pointer",     l_pointer},
     {"wheel",       l_wheel},
+    {"clock",       l_clock},
     {"shader_new",  l_shader_new},
     {"shader_use",  l_shader_use},
     {"shader_send", l_shader_send},

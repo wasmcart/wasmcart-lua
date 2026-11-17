@@ -30,7 +30,7 @@ function love.load()
 end
 
 function love.update(dt)
-  t = t + 1
+  t = t + 1   -- a frame counter, reported to tests through debug slot 0
   local ok, v = coroutine.resume(coro)
   coro_state = ok and v or -1
   love.debugValue(0, t)
@@ -75,11 +75,14 @@ function love.draw()
   panel(350, 40, 280, 200, "transform stack")
   love.graphics.push()
   love.graphics.translate(490, 145)
-  love.graphics.rotate(t * 0.02)
+  -- by time, not by frame count, so it spins at the same rate at any
+  -- display rate (1.2 rad/s is the old 0.02 rad per 1/60 s frame)
+  local secs = love.timer.getTime()
+  love.graphics.rotate(secs * 1.2)
   love.graphics.setColor(0.4, 1, 0.75)
   love.graphics.rectangle("fill", -45, -45, 90, 90)
   love.graphics.push()
-  love.graphics.rotate(t * 0.05)
+  love.graphics.rotate(secs * 3)
   love.graphics.setColor(1, 0.4, 0.6)
   love.graphics.rectangle("fill", -18, -18, 36, 36)
   love.graphics.pop()
@@ -117,7 +120,7 @@ function love.draw()
   love.graphics.setScissor(690, 310, 220, 100)
   love.graphics.setColor(0.9, 0.5, 1)
   for i = 0, 14 do
-    love.graphics.circle("fill", 690 + i * 22, 340 + math.sin(t * 0.05 + i) * 40, 16)
+    love.graphics.circle("fill", 690 + i * 22, 340 + math.sin(love.timer.getTime() * 3 + i) * 40, 16)
   end
   love.graphics.setScissor()
 
@@ -157,7 +160,7 @@ function love.draw()
   panel(660, 480, 580, 200, "deterministic RNG + love.math.noise")
   love.graphics.setColor(0.5, 0.8, 1)
   for i = 0, 55 do
-    local n = love.math.noise(i * 0.15, t * 0.01)
+    local n = love.math.noise(i * 0.15, love.timer.getTime() * 0.6)
     love.graphics.rectangle("fill", 690 + i * 10, 640 - n * 90, 8, n * 90)
   end
 end

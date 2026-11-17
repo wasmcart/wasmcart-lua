@@ -23,7 +23,7 @@ accepted-and-ignored.
 
 ```lua
 function love.load() end             -- once, after the cart boots
-function love.update(dt) end         -- dt is ALWAYS 1/60
+function love.update(dt) end         -- dt = seconds since the last frame
 function love.draw() end             -- after the automatic background clear
 function love.keypressed(key) end    -- pad 1 edges, mapped to key names
 function love.keyreleased(key) end
@@ -1251,10 +1251,21 @@ casino carts for the pattern.
 ## love.timer
 
 ```lua
-love.timer.getTime()    -- seconds, derived from the frame counter
-love.timer.getDelta()   -- always 1/60
-love.timer.getFPS()     -- always 60
+love.timer.getTime()    -- seconds, the host frame clock (wc_time.time_ms)
+love.timer.getDelta()   -- this frame's dt, the same value love.update got
+love.timer.getFPS()     -- frames counted over the last second (integer)
 ```
+
+`love.update` runs once per frame the host shows: 60 times a second on a
+60 Hz display, 120 on a 120 Hz one. `dt` is the host's `delta_ms` in seconds,
+already clamped by the host (250 ms in the reference hosts). Under a
+deterministic replay (`--seed`) every frame gets the host's fixed step
+(16.667 ms unless the harness picks another), so replays stay bit-identical.
+A host that never fills `wc_time` gets a 1/60 fallback rather than a zero dt.
+
+All three are read once per frame, so `getTime` cannot time work inside a
+frame. `os.clock()` returns the same value as `getTime()`, and `os.time()` is
+a fixed epoch plus whole seconds of it.
 
 ## love.filesystem
 

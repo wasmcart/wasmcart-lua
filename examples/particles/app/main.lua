@@ -6,6 +6,7 @@ local W, H = 1280, 720
 local MAX = 900
 
 local parts, n, mode, trail, t
+local spawn_acc = 0   -- fractional particles owed, so the rate is per second
 
 local MODES = { "fountain", "spiral", "burst" }
 
@@ -47,7 +48,10 @@ local function emit(i)
 end
 
 function love.update(dt)
-  t = t + 1
+  -- Rates below are per 1/60 s. k scales them by the real frame time, so the
+  -- fountain looks the same on a 60, 120 or 144 Hz display.
+  local k = dt * 60
+  t = t + k
 
   if love.pad.wasPressed("a") then
     mode = mode % #MODES + 1
@@ -55,7 +59,10 @@ function love.update(dt)
   end
 
   -- spawn
-  for _ = 1, 14 do
+  -- 14 per 1/60 s (840 a second), carried over between frames
+  spawn_acc = spawn_acc + 14 * k
+  while spawn_acc >= 1 do
+    spawn_acc = spawn_acc - 1
     n = n % MAX + 1
     emit(n)
   end
@@ -63,10 +70,10 @@ function love.update(dt)
   for i = 1, MAX do
     local p = parts[i]
     if p.life > 0 then
-      p.x = p.x + p.vx
-      p.y = p.y + p.vy
-      p.vy = p.vy + 0.22
-      p.life = p.life - 0.012
+      p.x = p.x + p.vx * k
+      p.y = p.y + p.vy * k
+      p.vy = p.vy + 0.22 * k
+      p.life = p.life - 0.012 * k
       if p.y > H - 10 then p.vy = -p.vy * 0.5; p.y = H - 10 end
     end
   end

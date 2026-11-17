@@ -67,6 +67,9 @@ end
 
 function love.update(dt)
   local p = player
+  -- Speeds below are pixels per 1/60 s. k scales them by the real frame
+  -- time, so the game runs at the same speed on a 60, 120 or 144 Hz display.
+  local k = dt * 60
 
   local dx = 0
   if love.pad.isDown("left")  then dx = -MOVE end
@@ -81,13 +84,13 @@ function love.update(dt)
     love.audio.beep(660)
   end
 
-  p.vel.y = math.min(p.vel.y + GRAVITY, 20)
+  p.vel.y = math.min(p.vel.y + GRAVITY * k, 20)
 
   -- axis-separated collision: move X, resolve; move Y, resolve.
-  local nx = p.pos.x + p.vel.x
+  local nx = p.pos.x + p.vel.x * k
   if not rect_hits_map(nx, p.pos.y, p.w, p.h) then p.pos.x = nx else p.vel.x = 0 end
 
-  local ny = p.pos.y + p.vel.y
+  local ny = p.pos.y + p.vel.y * k
   if not rect_hits_map(p.pos.x, ny, p.w, p.h) then
     p.pos.y = ny
     p.grounded = false
@@ -107,7 +110,9 @@ function love.update(dt)
 
   -- camera follows with a dead zone, clamped to the level
   local target = p.pos.x - W / 2
-  cam.x = cam.x + (target - cam.x) * 0.12
+  -- 12% of the gap per 1/60 s, compounded per frame so the follow feels the
+  -- same at any display rate (a plain 0.12 * k overshoots on long frames).
+  cam.x = cam.x + (target - cam.x) * (1 - (1 - 0.12) ^ k)
   cam.x = math.max(0, math.min(#MAP[1] * TILE - W, cam.x))
 
   love.debugValue(0, collected)

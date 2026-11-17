@@ -6,7 +6,7 @@
 
   NOT LOVE: this is an unaffiliated engine with a LOVE-STYLE api. Source
   familiarity is the goal; compatibility is not claimed. Where behavior
-  deliberately differs (fixed dt, no real filesystem, no threads/shaders in
+  deliberately differs (no real filesystem, no threads/shaders in
   v1) the stub fails loudly with what to use instead.
 
   Coordinates are top-left origin, y grows DOWN, like LOVE.
@@ -30,8 +30,41 @@ love = love or {}
 local love = love
 
 -- ── internal state ─────────────────────────────────────────────────
-local FIXED_DT = 1 / 60
+-- The frame clock. love.update(dt) gets the HOST's delta_ms, so a game
+-- that integrates by dt runs at the same speed at 60, 120 or 144 Hz. The
+-- host clamps the delta (250 ms in the reference hosts) and, under a
+-- deterministic replay (--seed), hands every frame the same fixed step, so
+-- replays stay bit-identical. FALLBACK_DT is only for a host that never
+-- fills wc_time (delta 0): a zero dt would freeze every dt-driven game and
+-- divide-by-dt code would blow up, so such a host gets the old 1/60 step.
+local FALLBACK_DT = 1 / 60
 local frame_n = 0
+local clock_dt = FALLBACK_DT   -- seconds, this frame's dt
+local clock_t = 0              -- seconds since the cart started
+local fps_value = 60           -- love.timer.getFPS
+local fps_frames, fps_accum, fps_settled = 0, 0, false
+
+-- Called once per frame by the frame driver, before anything reads time.
+local function update_clock()
+  local t_ms, d_ms = wc.clock()
+  if d_ms > 0 then
+    clock_dt = d_ms / 1000
+    clock_t = t_ms / 1000
+  else
+    clock_dt = FALLBACK_DT
+    clock_t = frame_n * FALLBACK_DT
+  end
+  -- LOVE's getFPS is frames counted over the last whole second. Until the
+  -- first second has elapsed it reports this frame's rate instead of 0.
+  fps_frames = fps_frames + 1
+  fps_accum = fps_accum + clock_dt
+  if fps_accum >= 1 then
+    fps_value = math.floor(fps_frames / fps_accum + 0.5)
+    fps_frames, fps_accum, fps_settled = 0, 0, true
+  elseif not fps_settled then
+    fps_value = math.floor(1 / clock_dt + 0.5)
+  end
+end
 
 -- transform stack (Lua-side; C is a dumb rasterizer in world coords)
 local tx, ty, tsx, tsy, trot = 0, 0, 1, 1, 0
@@ -3384,8 +3417,11 @@ local function update_vcursor()
   local p = pads[1]
   if not p then return end
   local ax, ay = p.rx / 32767, p.ry / 32767
-  if math.abs(ax) > 0.15 then vcursor_x = vcursor_x + ax * VCURSOR_SPEED end
-  if math.abs(ay) > 0.15 then vcursor_y = vcursor_y + ay * VCURSOR_SPEED end
+  -- VCURSOR_SPEED is pixels per 1/60 s; scaled by dt so the cursor moves
+  -- at the same speed on any display rate.
+  local step = VCURSOR_SPEED * clock_dt * 60
+  if math.abs(ax) > 0.15 then vcursor_x = vcursor_x + ax * step end
+  if math.abs(ay) > 0.15 then vcursor_y = vcursor_y + ay * step end
   vcursor_x = math.max(0, math.min(W, vcursor_x))
   vcursor_y = math.max(0, math.min(H, vcursor_y))
 end
@@ -3713,9 +3749,13 @@ math.randomseed = function() end
 -- ── love.timer ─────────────────────────────────────────────────────
 local timer = {}
 love.timer = timer
-function timer.getTime() return frame_n * FIXED_DT end
-function timer.getDelta() return FIXED_DT end
-function timer.getFPS() return 60 end
+-- All three follow the host frame clock (see update_clock). getTime is the
+-- host's time_ms, so it is wall time in a normal run and frame * step under
+-- a deterministic replay; it is still quantized to frames, so it cannot time
+-- work INSIDE a frame.
+function timer.getTime() return clock_t end
+function timer.getDelta() return clock_dt end
+function timer.getFPS() return fps_value end
 function timer.step() end
 function timer.sleep() end
 
@@ -5214,11 +5254,14 @@ end
 -- The real `os` table is never opened (no wall clock, no processes, and it
 -- would drag WASI imports). But libraries routinely call os.time() to seed
 -- an RNG or os.clock() to profile, and dying on that is worse than
--- answering. These are frame-derived, so they stay reproducible: a cart
--- that seeds from os.time() still replays identically.
+-- answering. These follow the host frame clock (love.timer.getTime), so they
+-- stay reproducible: under a deterministic replay a cart that seeds from
+-- os.time() still replays identically. os.time counts whole seconds from a
+-- fixed epoch, like the real one; it used to count frames, which ran it 60
+-- "seconds" per second.
 os = {
-  time = function() return 1700000000 + frame_n end,
-  clock = function() return frame_n * FIXED_DT end,
+  time = function() return 1700000000 + math.floor(clock_t) end,
+  clock = function() return clock_t end,
   date = function(fmt)
     -- fixed date; games use this for save-slot labels
     if fmt and fmt:sub(1, 1) == "*" then
@@ -6132,6 +6175,7 @@ function __wasmcart_frame(b1, lx1, ly1, rx1, ry1,
   end
 
   frame_n = frame_n + 1
+  update_clock()
   update_vcursor()
 
   dispatch_net()
@@ -6172,7 +6216,7 @@ function __wasmcart_frame(b1, lx1, ly1, rx1, ry1,
     if wdx ~= 0 or wdy ~= 0 then love.wheelmoved(wdx, wdy) end
   end
 
-  if love.update then love.update(FIXED_DT) end
+  if love.update then love.update(clock_dt) end
 
   -- reset per-frame graphics state, then clear to the background color
   tx, ty, tsx, tsy, trot = 0, 0, 1, 1, 0

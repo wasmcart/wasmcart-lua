@@ -59,15 +59,19 @@ function love.update(dt)
     return
   end
 
+  -- Speeds below are pixels per 1/60 s. k scales them by the real frame
+  -- time, so the game runs at the same speed on a 60, 120 or 144 Hz display.
+  local k = dt * 60
+
   local dx = 0
   if love.pad.isDown("left")  then dx = -11 end
   if love.pad.isDown("right") then dx =  11 end
   local ax = love.pad.axis("leftx")
   if math.abs(ax) > 0.2 then dx = ax * 11 end
-  paddle.x = math.max(0, math.min(W - paddle.w, paddle.x + dx))
+  paddle.x = math.max(0, math.min(W - paddle.w, paddle.x + dx * k))
 
-  ball.x = ball.x + ball.vx
-  ball.y = ball.y + ball.vy
+  ball.x = ball.x + ball.vx * k
+  ball.y = ball.y + ball.vy * k
 
   if ball.x - ball.r < 0 then ball.x = ball.r; ball.vx = -ball.vx; love.audio.beep(500) end
   if ball.x + ball.r > W then ball.x = W - ball.r; ball.vx = -ball.vx; love.audio.beep(500) end

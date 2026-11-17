@@ -121,8 +121,12 @@ Anything that transpiles to Lua rides along for free: **Teal**, **Fennel**,
 > that contains none of LÖVE's code and doesn't claim compatibility; it exists
 > because Lua-games-as-open-cartridges is a good idea.
 
-Everything happens in `love.update(dt)` and `love.draw()`, 60 times a second,
-on a **top-left origin** canvas -- 1280x720 by default, or up to 1920x1080 if
+Everything happens in `love.update(dt)` and `love.draw()`, once per frame the
+host shows. That is 60 times a second on a 60 Hz display and 120 or 144 on a
+faster one, so **move things by `dt`** (seconds since the last frame):
+`x = x + speed * dt` runs at the same speed everywhere, while `x = x + 6`
+runs twice as fast on a 120 Hz screen. It all draws on a **top-left origin**
+canvas -- 1280x720 by default, or up to 1920x1080 if
 the game ships a `conf.lua` (`love.conf(t)` sets `t.window.width/height`).
 Colors are 0..1 floats.
 
@@ -308,7 +312,7 @@ key on it. Full detail in [docs/api.md](docs/api.md#lovenet-networking).
 love.math.random()          -- deterministic, host-seeded
 love.math.random(1, 6)
 love.math.noise(x, y)
-love.timer.getTime()        -- frame-derived, not wall clock
+love.timer.getTime()        -- the host frame clock, in seconds
 love.filesystem.read("data/level1.txt")   -- cart assets
 love.filesystem.write(nil, "high=1200")   -- persisted save region
 love.filesystem.load_save()
@@ -322,10 +326,14 @@ replay is bit-identical.
 Same seed + same inputs → the same frames, on every host. That is a design
 guarantee, not a side effect:
 
-- `dt` is **fixed at 1/60**. There is no variable timestep (LÖVE devs: this is
-  the one habit to unlearn).
+- `dt` is the host's frame time, and a deterministic replay (`--seed`, or
+  `load(cart, {deterministic: {seed}})`) fixes it: every frame gets the same
+  step (16.667 ms by default), so the run is bit-identical however fast the
+  machine is. In a normal run `dt` is the real time since the last frame,
+  clamped by the host to 250 ms so a stall cannot teleport anything.
 - RNG comes only from the host seed (`wc_set_seed`), never a clock.
-- `love.timer.getTime()` is derived from the frame counter.
+- `love.timer.getTime()`, `os.clock()` and `os.time()` read the same host
+  frame clock, so they replay identically too.
 - The Lua string-hash seed is fixed, so `pairs()` iteration order is stable.
 - One pinned VM in wasm behaves identically everywhere.
 

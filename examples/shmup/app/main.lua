@@ -18,7 +18,12 @@ end
 
 -- the wave script as a coroutine: linear code for a timeline
 local function wave_script()
-  local function wait(frames) for _ = 1, frames do coroutine.yield() end end
+  -- wait(n) waits n/60 SECONDS, not n frames: love.update resumes the
+  -- script with dt, so the timeline keeps its pace at any display rate.
+  local function wait(frames)
+    local left = frames / 60
+    while left > 0 do left = left - coroutine.yield() end
+  end
   while true do
     for row = 1, 3 do
       for i = 1, 8 do spawn_enemy(180 + i * 120, -40 - row * 70, "small") end
@@ -50,10 +55,14 @@ local function burst(x, y, n, r, g, b)
 end
 
 function love.update(dt)
-  t = t + 1
+  -- Speeds and timers below are per 1/60 s. k scales them by the real
+  -- frame time, so the game runs at the same speed on a 60, 120 or 144 Hz
+  -- display.
+  local k = dt * 60
+  t = t + k
 
   if coroutine.status(wave_co) == "suspended" then
-    local ok, err = coroutine.resume(wave_co)
+    local ok, err = coroutine.resume(wave_co, dt)
     if not ok then love.log("wave error:", err) end
   end
 
@@ -63,9 +72,9 @@ function love.update(dt)
   if love.pad.isDown("right") then dx =  8 end
   local ax = love.pad.axis("leftx")
   if math.abs(ax) > 0.2 then dx = ax * 8 end
-  player.x = math.max(30, math.min(W - 30, player.x + dx))
+  player.x = math.max(30, math.min(W - 30, player.x + dx * k))
 
-  player.cool = player.cool - 1
+  player.cool = player.cool - k
   if love.pad.isDown("a") and player.cool <= 0 then
     bullets[#bullets + 1] = { x = player.x, y = player.y - 26, vy = -14 }
     player.cool = 8
@@ -75,15 +84,15 @@ function love.update(dt)
   -- bullets
   for i = #bullets, 1, -1 do
     local b = bullets[i]
-    b.y = b.y + b.vy
+    b.y = b.y + b.vy * k
     if b.y < -20 then table.remove(bullets, i) end
   end
 
   -- enemies
   for i = #enemies, 1, -1 do
     local e = enemies[i]
-    e.y = e.y + e.vy
-    e.x = e.x + math.sin((t + e.phase * 20) * 0.03) * 2
+    e.y = e.y + e.vy * k
+    e.x = e.x + math.sin((t + e.phase * 20) * 0.03) * 2 * k
     if e.y > H + 60 then
       table.remove(enemies, i)
     else
@@ -109,9 +118,9 @@ function love.update(dt)
   -- particles
   for i = #particles, 1, -1 do
     local p = particles[i]
-    p.x = p.x + p.vx; p.y = p.y + p.vy
-    p.vy = p.vy + 0.15
-    p.life = p.life - 0.025
+    p.x = p.x + p.vx * k; p.y = p.y + p.vy * k
+    p.vy = p.vy + 0.15 * k
+    p.life = p.life - 0.025 * k
     if p.life <= 0 then table.remove(particles, i) end
   end
 

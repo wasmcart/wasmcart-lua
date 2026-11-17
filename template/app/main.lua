@@ -2,7 +2,9 @@
 
 local x, y = 640, 360
 local vx, vy = 0, 0
-local SPEED = 6
+-- Pixels per SECOND. Multiply by dt when moving, so the game runs at the
+-- same speed on a 60, 120 or 144 Hz display (dt is the real frame time).
+local SPEED = 360
 
 function love.load()
   love.graphics.setBackgroundColor(0.08, 0.09, 0.13)
@@ -20,8 +22,8 @@ function love.update(dt)
   if math.abs(ax) > 0.2 then vx = ax * SPEED end
   if math.abs(ay) > 0.2 then vy = ay * SPEED end
 
-  x = math.max(40, math.min(1240, x + vx))
-  y = math.max(40, math.min(680, y + vy))
+  x = math.max(40, math.min(1240, x + vx * dt))
+  y = math.max(40, math.min(680, y + vy * dt))
 end
 
 function love.draw()

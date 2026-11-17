@@ -115,7 +115,7 @@ local function label(s, x, y)
 end
 
 function love.draw()
-  t = t + 1 / 60
+  t = t + love.timer.getDelta()   -- seconds, at any display rate
 
   love.graphics.setColor(1, 1, 1)
 

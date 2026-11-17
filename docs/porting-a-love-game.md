@@ -7,27 +7,27 @@ you'll hit it.
 > Not affiliated with LÖVE. This engine shares none of its code and does not
 > claim compatibility. "Source-familiar" is the goal, not a drop-in swap.
 
-## 1. `dt` is fixed at 1/60
+## 1. `dt` works like LÖVE's
 
-The single biggest change. LÖVE gives you a variable timestep; this engine
-always passes `1/60`.
+`love.update(dt)` runs once per frame the host shows and `dt` is the real
+frame time in seconds, so code written the LÖVE way keeps working:
 
 ```lua
--- LÖVE (frame-rate independent)
-x = x + speed * dt
-
--- here: dt is always 1/60, so a per-frame constant is equivalent
-x = x + speed * dt        -- still correct, dt just never varies
-x = x + 6                 -- also fine, and what most cart code ends up doing
+x = x + speed * dt        -- same speed at 60, 120 or 144 Hz
+x = x + 6                 -- per FRAME: twice as fast on a 120 Hz display
 ```
 
-Code written the LÖVE way keeps working. What breaks is code that *depends*
-on dt varying — frame-time smoothing, `dt`-based interpolation of a laggy
-frame, or accumulator loops that subtract a variable dt. Delete the
-accumulator; the engine already gives you a fixed step.
+Two differences from LÖVE. The host clamps `dt` (250 ms in the reference
+hosts), so a stall never turns into one giant step. And a deterministic
+replay (`--seed`) hands every frame the same fixed step (16.667 ms by
+default), which is what makes replays and lockstep netplay bit-identical.
+A fixed-timestep accumulator in the game keeps working too. See
+"Determinism" in the README.
 
-This is deliberate: a fixed step is what makes replays and lockstep netplay
-possible. See "Determinism" in the README.
+Before 0.7.0 `dt` was always 1/60, so a game that moved by per-frame
+constants looked right only on a 60 Hz display. Multiply those by `dt * 60`
+(or convert them to per-second speeds) and the game runs at the same speed
+everywhere.
 
 ## 2. Coordinates and colors match LÖVE 11
 
@@ -224,7 +224,8 @@ Check `gc_kb` and `draw_calls` in the debug state if a port feels slow.
 
 1. Copy the game's `.lua` files into `app/`, dependencies into `app/lib/`.
 2. Convert colors to 0..1 if the game predates LÖVE 11.
-3. Delete any fixed-timestep accumulator; keep using `dt`.
+3. Keep using `dt`; anything that moves by a per-frame constant should be
+   scaled by it.
 4. Map keyboard actions onto pad buttons.
 5. Collapse save files into one blob.
 6. Run it; the loud errors will point at anything left.

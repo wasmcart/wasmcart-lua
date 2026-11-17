@@ -1,6 +1,6 @@
 {
   "name": "samplerupdate",
-  "abi": 3,
+  "abi": 4,
   "entry": "../../build/engine.wasm",
   "assets": "./",
   "width": 640,

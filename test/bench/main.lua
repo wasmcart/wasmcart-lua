@@ -11,8 +11,8 @@
 --   macro  - what games actually do (entity updates, collision, particles)
 --   draw   - each raster primitive on its own, so a slow one is visible
 --
--- IMPORTANT: love.timer.getTime() is frame-quantized by design (it is
--- frame_n * 1/60, so replays stay deterministic). It therefore CANNOT time
+-- IMPORTANT: love.timer.getTime() is frame-quantized by design (it is the
+-- host's time_ms, read once per frame). It therefore CANNOT time
 -- work inside a frame -- every delta would read exactly zero. So the cart
 -- runs exactly ONE workload per frame and announces which one; the HOST
 -- (test/bench.js) times each wc_render call with a real clock.

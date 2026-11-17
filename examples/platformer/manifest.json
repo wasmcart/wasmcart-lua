@@ -1,6 +1,6 @@
 {
   "name": "platformer",
-  "abi": 3,
+  "abi": 4,
   "entry": "main.wasm",
   "width": 1280,
   "height": 720,

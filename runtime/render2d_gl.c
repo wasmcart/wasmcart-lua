@@ -32,6 +32,17 @@
 #include "wasmcart.h"
 #define WC_GL_BLIT_IMPLEMENTATION
 #include "wc_gl_blit.h"
+
+/* GLES 3.0 blend equations for the lighten/darken modes. wasmcart.h does not
+ * define them (the old vendored copy carried them as a local addition, which
+ * the header sync to the spec dropped), so they live here, beside their only
+ * user. The values are the core GLES 3.0 / WebGL2 ones. */
+#ifndef GL_MIN
+#define GL_MIN 0x8007
+#endif
+#ifndef GL_MAX
+#define GL_MAX 0x8008
+#endif
 #include <string.h>
 #include <stdio.h>
 #include <math.h>

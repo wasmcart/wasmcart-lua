@@ -108,7 +108,9 @@ end
 
 -- ── determinism ────────────────────────────────────────────────────
 local function test_determinism()
-  eq(love.timer.getDelta(), 1 / 60, "fixed dt")
+  -- This harness never fills wc_time (delta_ms 0), so dt is the fallback
+  -- step. A real host's clock is covered by test/clock.mjs.
+  eq(love.timer.getDelta(), 1 / 60, "dt falls back to 1/60 with no host clock")
   -- love.math.random must be in range and reproducible across identical seeds
   local seen = {}
   for _ = 1, 200 do
