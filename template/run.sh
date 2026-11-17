@@ -3,4 +3,4 @@
 set -e
 cd "$(dirname "$0")"
 [ -f main.wasm ] || cp ../build/engine.wasm main.wasm
-npx wasmcart .
+npx wasmcart . "$@"

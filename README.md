@@ -44,17 +44,20 @@ including Cavern, a complete LÖVE adventure game. Download one and run it:
 npx wasmcart cavern.wasc
 ```
 
-**The engine wasm ships in this repo.** You never build or install a
-toolchain — add your Lua and assets, and pack.
+To write your own:
 
 ```bash
+git clone https://github.com/wasmcart/wasmcart-lua
 cp -r wasmcart-lua/template my-game
 cd my-game && ./run.sh          # opens a window; edit app/main.lua, rerun
 ```
 
-That's the whole loop: edit Lua, run. `template/` already contains
-`main.wasm` (the prebuilt engine) and a `manifest.json`, so `run.sh` just
-plays the directory as a dev-mode cart via `npx wasmcart`.
+That's the whole loop: edit Lua, run. No compiler, no toolchain: the engine
+wasm ships in this repo. `template/` already contains `main.wasm` (the
+prebuilt engine) and a `manifest.json`, so `run.sh` just plays the directory
+as a dev-mode cart via [`npx wasmcart`](https://www.npmjs.com/package/wasmcart).
+Options pass through: `./run.sh --frames 60 --shot shot.png` runs headless and
+saves a screenshot.
 
 Your game is the `app/` directory:
 
